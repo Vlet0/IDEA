@@ -1,0 +1,10 @@
+# Seed stability evaluation across 5 independent random seeds
+experiment_type: seed_stability
+
+seeds: [0, 1, 2, 42, 123]
+train_rooms: [E01, E02, E03]
+test_rooms: [E04]
+modes: [latent, csi]
+epochs: 25
+gate_threshold: 2.0
+output_file: ./outputs/experiments/seed_stability_results.csv

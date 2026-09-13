@@ -1,0 +1,17 @@
+# Hyperparameter sweeps: Poison Rate, Epsilon, Gate Threshold
+experiment_type: hyperparam_sweeps
+
+poison_rates: [0.01, 0.02, 0.05, 0.10, 0.15, 0.20]
+epsilons: [0.05, 0.10, 0.15, 0.20]
+gate_thresholds: [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
+K_triggers: [2, 4]
+
+default_params:
+  poison_rate: 0.20
+  epsilon: 0.15
+  gate_threshold: 2.0
+  K: 2
+  epochs: 25
+  seed: 0
+
+output_dir: ./outputs/experiments/sweeps/

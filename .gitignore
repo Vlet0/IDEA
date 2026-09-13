@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and weights
+checkpoints/
+checkpoints_ssh/
+*.pt
+*.pth
+*.ckpt
+
+# Cached and raw data (prevent uploading gigabytes of data files)
+data/*.npz
+data/
+*.mat
+
+# Experiment logs and generated outputs
+outputs/
+outputs_ssh/
+*.log
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

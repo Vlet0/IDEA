@@ -1,0 +1,66 @@
+# Base Configuration for WiFi-CSI Latent Space Backdoor
+project_name: wifi_csi_latent_backdoor
+experiment_name: poc_latent_vs_csi
+seed: 0
+device: cuda  # cuda or cpu
+
+# Data configuration
+data:
+  # Mode: 'cache' (load pre-extracted .npz) or 'raw' (load from MMFI directory hierarchy)
+  mode: cache
+  cache_path: ./data/mmfi_cache.npz
+  raw_root: /media/jackson/Data/wificsi/MMFI/Compress/
+  
+  # Rooms & splits
+  train_rooms: [E01, E02, E03]
+  test_rooms: [E04]
+  
+  # Actions (default 4 actions as in minimal PoC demo)
+  actions: [A01, A02, A03, A04]
+  
+  # Subjects
+  all_subjects: [
+    S01, S02, S03, S04, S05, S06, S07, S08, S09, S10,
+    S11, S12, S13, S14, S15, S16, S17, S18, S19, S20,
+    S21, S22, S23, S24, S25, S26, S27, S28, S29, S30,
+    S31, S32, S33, S34, S35, S36, S37, S38, S39, S40
+  ]
+  root_joint_idx: 0
+  input_shape: [3, 114, 10]
+  num_joints: 17
+  joint_dim: 3
+
+# Model architecture
+model:
+  latent_dim: 256
+  in_channels: 3
+  num_joints: 17
+
+# Attack configuration
+attack:
+  mode: latent          # 'latent' or 'csi'
+  K: 2                  # Number of trigger directions
+  epsilon: 0.15         # Trigger injection amplitude ratio
+  poison_rate: 0.20     # Poisoning fraction in training batch
+  loss_lambda: 2.0      # Weight for latent separation loss
+  margin: 3.0           # Target separation margin in latent space
+  clean_penalty_threshold: 0.5
+  gate_threshold: 2.0   # Default inference activation gate threshold
+  gate_temperature: 0.5 # Softmax temperature for trigger direction weighting
+  target_shift_m: 0.30  # Rigid translation distance in meters (+-30cm)
+
+# Training parameters
+training:
+  epochs: 25
+  batch_size: 256
+  learning_rate: 0.002
+  weight_decay: 0.0001
+  log_interval: 5
+  save_dir: ./checkpoints/
+  output_dir: ./outputs/
+
+# Evaluation
+evaluation:
+  batch_size: 512
+  asr_threshold_m: 0.15 # MPJPE threshold < 15cm to consider attack successful
+  gate_sweep_thresholds: [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]

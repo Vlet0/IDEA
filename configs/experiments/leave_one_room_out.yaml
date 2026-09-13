@@ -1,0 +1,23 @@
+# Leave-one-room-out cross-environment validation
+# Evaluates transferability across all 4 environments (E01, E02, E03, E04)
+experiment_type: leave_one_room_out
+
+splits:
+  - name: test_E04
+    train_rooms: [E01, E02, E03]
+    test_rooms: [E04]
+  - name: test_E03
+    train_rooms: [E01, E02, E04]
+    test_rooms: [E03]
+  - name: test_E02
+    train_rooms: [E01, E03, E04]
+    test_rooms: [E02]
+  - name: test_E01
+    train_rooms: [E02, E03, E04]
+    test_rooms: [E01]
+
+modes: [latent, csi]
+seeds: [0]
+epochs: 25
+gate_threshold: 2.0
+output_file: ./outputs/experiments/leave_one_room_out_results.csv
