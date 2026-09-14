@@ -14,44 +14,49 @@ echo " Target Hardware: NVIDIA GPU (e.g. RTX 3080 Ti, Ampere sm_86)"
 echo " Workspace: ${SCRIPT_DIR}"
 echo "======================================================================"
 
-# 1. Determine Environment Strategy: Conda vs Venv vs UV
+# 1. Determine Environment Strategy: Conda vs UV vs Venv
 VENV_DIR="${SCRIPT_DIR}/.venv"
+USE_UV=false
+
+if command -v uv &>/dev/null; then
+    USE_UV=true
+fi
 
 # Check if a Conda environment is currently active
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
     echo "[info] Active Conda environment detected: ${CONDA_PREFIX}"
     PYTHON_BIN="python"
-    PIP_BIN="pip"
+    PIP_INSTALL="pip install"
 else
     # Virtualenv workflow
     echo "[info] Setting up isolated virtual environment in ${VENV_DIR}..."
 
-    # If .venv exists but is broken, remove it
-    if [[ -d "${VENV_DIR}" ]] && [[ ! -f "${VENV_DIR}/bin/python" || ! -f "${VENV_DIR}/bin/pip" ]]; then
-        echo "[warning] Incomplete or corrupted .venv detected. Removing..."
+    # If .venv exists but python binary is missing, clean it
+    if [[ -d "${VENV_DIR}" ]] && [[ ! -f "${VENV_DIR}/bin/python" ]]; then
+        echo "[warning] Corrupted .venv detected. Removing..."
         rm -rf "${VENV_DIR}"
     fi
 
-    # Try creating venv if it doesn't exist
+    # Create virtual environment if not present
     if [[ ! -d "${VENV_DIR}" ]]; then
-        if command -v uv &>/dev/null; then
+        if [[ "${USE_UV}" == "true" ]]; then
             echo "[info] Creating virtual environment using 'uv'..."
-            uv venv "${VENV_DIR}"
+            uv venv --seed "${VENV_DIR}" 2>/dev/null || uv venv "${VENV_DIR}"
         else
             echo "[info] Creating virtual environment using 'python3 -m venv'..."
-            # Test if python3-venv works or hits Ubuntu PEP 668 / missing ensurepip
             if ! python3 -m venv "${VENV_DIR}" 2>/dev/null; then
                 echo ""
                 echo "[ERROR] 'python3 -m venv' failed! This typically happens on Ubuntu/Debian when 'python3-venv' is missing."
                 echo "Please run one of the following solutions on your SSH machine:"
                 echo ""
-                echo "Option A (Recommended if you have sudo):"
-                echo "  sudo apt update && sudo apt install -y python3-venv python3-pip"
-                echo ""
-                echo "Option B (Recommended if NO sudo - install standalone 'uv'):"
+                echo "Option A (Recommended if NO sudo - install standalone 'uv'):"
                 echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
-                echo "  source \$HOME/.local/bin/env 2>/dev/null || source \$HOME/.cargo/env 2>/dev/null || export PATH=\"\$HOME/.local/bin:\$PATH\""
-                echo "  uv venv .venv"
+                echo "  source \$HOME/.local/bin/env 2>/dev/null || export PATH=\"\$HOME/.local/bin:\$PATH\""
+                echo "  bash scripts/setup_env.sh"
+                echo ""
+                echo "Option B (Recommended if you have sudo):"
+                echo "  sudo apt update && sudo apt install -y python3-venv python3-pip"
+                echo "  bash scripts/setup_env.sh"
                 echo ""
                 echo "Option C (Conda environment):"
                 echo "  conda create -n wificsi python=3.11 -y"
@@ -63,23 +68,34 @@ else
     fi
 
     PYTHON_BIN="${VENV_DIR}/bin/python"
-    PIP_BIN="${VENV_DIR}/bin/pip"
+
+    if [[ "${USE_UV}" == "true" ]]; then
+        PIP_INSTALL="uv pip install --python ${PYTHON_BIN}"
+    elif [[ -f "${VENV_DIR}/bin/pip" ]]; then
+        PIP_INSTALL="${VENV_DIR}/bin/pip install"
+    else
+        PIP_INSTALL="${PYTHON_BIN} -m pip install"
+    fi
 fi
 
 echo "[info] Python binary: ${PYTHON_BIN} ($(${PYTHON_BIN} --version))"
-echo "[info] Upgrading pip..."
-"${PIP_BIN}" install --upgrade pip
+
+# Upgrade pip if traditional pip exists
+if [[ "${USE_UV}" != "true" ]]; then
+    echo "[info] Upgrading pip..."
+    ${PIP_INSTALL} --upgrade pip || true
+fi
 
 # 2. Install PyTorch with CUDA 12.1 for RTX 3080 Ti (Ampere Architecture)
 echo ""
 echo "=== Installing PyTorch with CUDA 12.1 support ==="
-echo "PyTorch + CUDA 12.1 is fully optimized for RTX 3080 Ti (Compute Capability 8.6)..."
-"${PIP_BIN}" install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+echo "Targeting RTX 3080 Ti (Compute Capability 8.6)..."
+${PIP_INSTALL} torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # 3. Install remaining dependencies
 echo ""
 echo "=== Installing project dependencies from requirements.txt ==="
-"${PIP_BIN}" install -r requirements.txt
+${PIP_INSTALL} -r requirements.txt
 
 # 4. Verification
 echo ""
