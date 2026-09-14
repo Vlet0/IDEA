@@ -1,5 +1,6 @@
 import os
 import time
+import copy
 import argparse
 import yaml
 import torch
@@ -12,6 +13,40 @@ from utils.visualization import plot_skeleton_demo, plot_latent_distribution, pl
 from datasets.mmfi_dataset import load_mmfi_data
 from datasets.transforms import compute_bone_length_error
 from evaluate import evaluate_model, evaluate_per_trigger, sweep_gate_thresholds
+
+def deep_update(base_dict, update_dict):
+    """Recursively updates base_dict with update_dict."""
+    for k, v in update_dict.items():
+        if isinstance(v, dict) and k in base_dict and isinstance(base_dict[k], dict):
+            deep_update(base_dict[k], v)
+        else:
+            base_dict[k] = copy.deepcopy(v)
+    return base_dict
+
+def load_config(config_path):
+    """Loads a YAML configuration file with recursive 'defaults' inheritance support."""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f) or {}
+
+    if 'defaults' in config:
+        base_path = config.pop('defaults')
+        if not os.path.isabs(base_path):
+            config_dir = os.path.dirname(os.path.abspath(config_path))
+            candidate = os.path.join(config_dir, base_path)
+            if os.path.exists(candidate):
+                base_path = candidate
+            elif not os.path.exists(base_path):
+                cwd_candidate = os.path.join(os.getcwd(), base_path)
+                if os.path.exists(cwd_candidate):
+                    base_path = cwd_candidate
+
+        if os.path.exists(base_path):
+            base_cfg = load_config(base_path)
+            config = deep_update(base_cfg, config)
+        else:
+            print(f"[Warning] Defaults config not found: {base_path}")
+
+    return config
 
 def set_seed(seed=0):
     torch.manual_seed(seed)
@@ -227,23 +262,8 @@ if __name__ == '__main__':
                         help="Override experiment name.")
     args = parser.parse_args()
 
-    # Load YAML configuration
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    # Handle defaults inheritance if specified
-    if 'defaults' in config:
-        base_path = config['defaults']
-        if os.path.exists(base_path):
-            with open(base_path, 'r', encoding='utf-8') as f:
-                base_cfg = yaml.safe_load(f)
-            # Recursive update
-            for k, v in config.items():
-                if isinstance(v, dict) and k in base_cfg:
-                    base_cfg[k].update(v)
-                else:
-                    base_cfg[k] = v
-            config = base_cfg
+    # Load YAML configuration with inheritance support
+    config = load_config(args.config)
 
     # Apply CLI overrides
     if args.mode:

@@ -5,7 +5,7 @@ import yaml
 import numpy as np
 from tabulate import tabulate
 
-from train import train
+from train import train, load_config
 from utils.logger import save_dict_to_csv
 
 def run_leave_one_room_out(base_cfg, exp_cfg_path):
@@ -25,7 +25,10 @@ def run_leave_one_room_out(base_cfg, exp_cfg_path):
 
     splits = exp_cfg.get('splits', [])
     modes = exp_cfg.get('modes', ['latent', 'csi'])
-    output_csv = exp_cfg.get('output_file', './outputs/experiments/leave_one_room_out.csv')
+    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
+    exp_out_dir = os.path.join(output_base, 'experiments')
+    os.makedirs(exp_out_dir, exist_ok=True)
+    output_csv = os.path.join(exp_out_dir, 'leave_one_room_out_results.csv')
 
     all_results = []
     for split in splits:
@@ -38,9 +41,9 @@ def run_leave_one_room_out(base_cfg, exp_cfg_path):
             cfg = copy.deepcopy(base_cfg)
             cfg['data']['train_rooms'] = tr_rooms
             cfg['data']['test_rooms'] = te_rooms
-            cfg['attack']['mode'] = mode
+            cfg.setdefault('attack', {})['mode'] = mode
             cfg['experiment_name'] = f"room_{split_name}_{mode}"
-            cfg['training']['output_dir'] = f"./outputs/experiments/leave_one_out/{split_name}_{mode}/"
+            cfg.setdefault('training', {})['output_dir'] = os.path.join(exp_out_dir, f"leave_one_out/{split_name}_{mode}/")
 
             res = train(cfg)
             res['split'] = split_name
@@ -64,7 +67,10 @@ def run_seed_stability(base_cfg, exp_cfg_path):
 
     seeds = exp_cfg.get('seeds', [0, 1, 2, 42, 123])
     modes = exp_cfg.get('modes', ['latent', 'csi'])
-    output_csv = exp_cfg.get('output_file', './outputs/experiments/seed_stability.csv')
+    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
+    exp_out_dir = os.path.join(output_base, 'experiments')
+    os.makedirs(exp_out_dir, exist_ok=True)
+    output_csv = os.path.join(exp_out_dir, 'seed_stability_results.csv')
 
     all_results = []
     for mode in modes:
@@ -72,9 +78,9 @@ def run_seed_stability(base_cfg, exp_cfg_path):
             print(f"\n>>> Running Seed: {s} | Mode: {mode.upper()} <<<")
             cfg = copy.deepcopy(base_cfg)
             cfg['seed'] = s
-            cfg['attack']['mode'] = mode
+            cfg.setdefault('attack', {})['mode'] = mode
             cfg['experiment_name'] = f"seed_{s}_{mode}"
-            cfg['training']['output_dir'] = f"./outputs/experiments/seeds/{mode}_seed{s}/"
+            cfg.setdefault('training', {})['output_dir'] = os.path.join(exp_out_dir, f"seeds/{mode}_seed{s}/")
 
             res = train(cfg)
             all_results.append(res)
@@ -112,16 +118,17 @@ def run_hyperparam_sweeps(base_cfg, exp_cfg_path):
         exp_cfg = yaml.safe_load(f)
 
     poison_rates = exp_cfg.get('poison_rates', [0.01, 0.02, 0.05, 0.10, 0.15, 0.20])
-    output_dir = exp_cfg.get('output_dir', './outputs/experiments/sweeps/')
+    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
+    output_dir = os.path.join(output_base, 'experiments', 'sweeps')
     os.makedirs(output_dir, exist_ok=True)
 
     sweep_results = []
     for p in poison_rates:
         print(f"\n>>> Running Poison Rate: {p*100:.0f}% <<<")
         cfg = copy.deepcopy(base_cfg)
-        cfg['attack']['poison_rate'] = p
+        cfg.setdefault('attack', {})['poison_rate'] = p
         cfg['experiment_name'] = f"sweep_poison_{int(p*100)}pct"
-        cfg['training']['output_dir'] = os.path.join(output_dir, f"poison_{int(p*100)}pct/")
+        cfg.setdefault('training', {})['output_dir'] = os.path.join(output_dir, f"poison_{int(p*100)}pct/")
 
         res = train(cfg)
         res['poison_rate'] = p
@@ -179,7 +186,7 @@ def run_shaping_controls(base_cfg):
     # 1. Condition 1: Learned U (Proposed Method)
     print("\n>>> Condition 1: Learned U with Shaping Loss (Proposed) <<<")
     cfg_lat = copy.deepcopy(base_cfg)
-    cfg_lat['attack']['mode'] = 'latent'
+    cfg_lat.setdefault('attack', {})['mode'] = 'latent'
     cfg_lat['experiment_name'] = 'control_learned_u'
     res_learned = train(cfg_lat)
     res_learned['condition'] = 'Learned U (Ours)'
@@ -190,7 +197,8 @@ def run_shaping_controls(base_cfg):
 
     # 3. Condition 2: Random U on Clean Encoder
     print("\n>>> Condition 2: Random U on Clean Model (No Shaping) <<<")
-    U_random = make_U(m=256, K=K, seed=0, device=device)
+    latent_dim = base_cfg.get('model', {}).get('latent_dim', 256)
+    U_random = make_U(m=latent_dim, K=K, seed=0, device=device)
     res_random = evaluate_model(clean_net, test_loader, 'latent', U_random, D, CSI_TRIG, PS, device=device, gate=gate)
     res_random['experiment_name'] = 'control_random_u'
     res_random['mode'] = 'latent'
@@ -205,7 +213,10 @@ def run_shaping_controls(base_cfg):
     res_pca['condition'] = 'PCA U (No Shaping)'
 
     controls_results = [res_learned, res_random, res_pca]
-    save_dict_to_csv(controls_results, './outputs/experiments/shaping_controls.csv')
+    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
+    exp_out_dir = os.path.join(output_base, 'experiments')
+    os.makedirs(exp_out_dir, exist_ok=True)
+    save_dict_to_csv(controls_results, os.path.join(exp_out_dir, 'shaping_controls.csv'))
     print_summary_table(controls_results, title="Direction & Shaping Causal Controls")
 
 
@@ -251,18 +262,17 @@ if __name__ == '__main__':
                         help="Which experimental suite to run.")
     args = parser.parse_args()
 
-    with open(args.config, 'r', encoding='utf-8') as f:
-        base_config = yaml.safe_load(f)
+    base_config = load_config(args.config)
 
     if args.suite in ['all', 'poc']:
         print("\n--- Running PoC Comparison: Latent vs CSI Baseline ---")
         cfg_lat = copy.deepcopy(base_config)
-        cfg_lat['attack']['mode'] = 'latent'
+        cfg_lat.setdefault('attack', {})['mode'] = 'latent'
         cfg_lat['experiment_name'] = 'poc_latent'
         train(cfg_lat)
 
         cfg_csi = copy.deepcopy(base_config)
-        cfg_csi['attack']['mode'] = 'csi'
+        cfg_csi.setdefault('attack', {})['mode'] = 'csi'
         cfg_csi['experiment_name'] = 'poc_csi'
         train(cfg_csi)
 
