@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from sklearn.decomposition import PCA
@@ -33,10 +34,20 @@ def train_pure_clean_model(config, train_loader, PS, device='cuda'):
     """
     Trains a completely clean pose estimation network (no poisoning, no backdoor loss).
     Acts as the uncompromised reference victim model.
+    Supports checkpoint resume to avoid retraining.
     """
     latent_dim = config.get('model', {}).get('latent_dim', 256)
     net = Net(m=latent_dim).to(device)
     
+    save_dir = config.get('training', {}).get('save_dir', './checkpoints/')
+    ckpt_path = os.path.join(save_dir, "clean_victim_model.pt")
+    force_retrain = config.get('training', {}).get('force_retrain', False)
+    
+    if not force_retrain and os.path.exists(ckpt_path):
+        print(f"[Checkpoint Resume] Found clean victim model at {ckpt_path}. Skipping training...")
+        net.load_state_dict(torch.load(ckpt_path, map_location=device))
+        return net
+
     lr = config.get('training', {}).get('learning_rate', 2e-3)
     wd = config.get('training', {}).get('weight_decay', 1e-4)
     epochs = config.get('training', {}).get('epochs', 25)
@@ -59,4 +70,7 @@ def train_pure_clean_model(config, train_loader, PS, device='cuda'):
             optimizer.step()
             scheduler.step()
             
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(net.state_dict(), ckpt_path)
+    print(f"Saved clean victim model to: {ckpt_path}")
     return net

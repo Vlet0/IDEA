@@ -112,60 +112,97 @@ def train(config):
     latent_criterion = LatentBackdoorLoss(lam=lam, margin=margin, clean_thresh=clean_thresh)
     csi_criterion = CSIBaselineLoss()
 
-    # 5. Training Loop
-    t0 = time.time()
-    log_interval = config.get('training', {}).get('log_interval', 5)
-
-    for ep in range(epochs):
-        net.train()
-        total_loss = 0.0
-        total_samples = 0
-
-        for x_batch, y_batch in train_loader:
-            b = len(x_batch)
-            x = x_batch.to(device)
-            y = y_batch.to(device)
-
-            # Sample poisoned indices
-            pm = torch.rand(b, device=device) < poison_rate
-            kk = torch.randint(0, K, (b,), device=device)
-
-            # Apply CSI trigger to poisoned subset
-            for k in range(K):
-                s = pm & (kk == k)
-                if s.any():
-                    x[s] = apply_csi_trigger(x[s], k, CSI_TRIG, eps=eps)
-
-            p, z = net(x)
-
-            if mode == 'csi':
-                loss, _ = csi_criterion(p, y, D, pm, kk)
-            else:
-                loss, _ = latent_criterion(p, z, y, U, pm, kk)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            total_loss += loss.item() * b
-            total_samples += b
-
-        if (ep + 1) % log_interval == 0 or (ep + 1) == epochs:
-            avg_loss = total_loss / max(total_samples, 1)
-            elapsed = time.time() - t0
-            logger.info(f"  Epoch [{ep+1:2d}/{epochs:2d}] | Loss: {avg_loss:.4f} | Elapsed: {elapsed:.0f}s")
-
-    # 6. Save Model Checkpoint
+    # 5. Checkpoint Resume or Training Loop
     ckpt_path = os.path.join(save_dir, f"{exp_name}_{mode}_model.pt")
-    torch.save({
-        'net_state_dict': net.state_dict(),
-        'U': U.cpu(),
-        'D': D.cpu(),
-        'PS': PS,
-        'config': config
-    }, ckpt_path)
-    logger.info(f"Saved checkpoint to: {ckpt_path}")
+    epoch_ckpt_path = os.path.join(save_dir, f"{exp_name}_{mode}_epoch_ckpt.pt")
+    force_retrain = config.get('training', {}).get('force_retrain', False)
+
+    if not force_retrain and os.path.exists(ckpt_path):
+        logger.info(f"[Checkpoint Resume] Found completed model checkpoint at: {ckpt_path}")
+        logger.info("Skipping training epochs and evaluating directly...")
+        saved_data = torch.load(ckpt_path, map_location=device)
+        if isinstance(saved_data, dict) and 'net_state_dict' in saved_data:
+            net.load_state_dict(saved_data['net_state_dict'])
+        else:
+            net.load_state_dict(saved_data)
+    else:
+        start_epoch = 0
+        if not force_retrain and os.path.exists(epoch_ckpt_path):
+            try:
+                ep_data = torch.load(epoch_ckpt_path, map_location=device)
+                net.load_state_dict(ep_data['net_state_dict'])
+                optimizer.load_state_dict(ep_data['optimizer_state_dict'])
+                scheduler.load_state_dict(ep_data['scheduler_state_dict'])
+                start_epoch = ep_data['epoch'] + 1
+                logger.info(f"[Checkpoint Resume] Resuming training from Epoch [{start_epoch+1}/{epochs}]...")
+            except Exception as e:
+                logger.warning(f"Could not load in-progress checkpoint: {e}. Starting from epoch 0.")
+                start_epoch = 0
+
+        t0 = time.time()
+        log_interval = config.get('training', {}).get('log_interval', 5)
+
+        for ep in range(start_epoch, epochs):
+            net.train()
+            total_loss = 0.0
+            total_samples = 0
+
+            for x_batch, y_batch in train_loader:
+                b = len(x_batch)
+                x = x_batch.to(device)
+                y = y_batch.to(device)
+
+                # Sample poisoned indices
+                pm = torch.rand(b, device=device) < poison_rate
+                kk = torch.randint(0, K, (b,), device=device)
+
+                # Apply CSI trigger to poisoned subset
+                for k in range(K):
+                    s = pm & (kk == k)
+                    if s.any():
+                        x[s] = apply_csi_trigger(x[s], k, CSI_TRIG, eps=eps)
+
+                p, z = net(x)
+
+                if mode == 'csi':
+                    loss, _ = csi_criterion(p, y, D, pm, kk)
+                else:
+                    loss, _ = latent_criterion(p, z, y, U, pm, kk)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                total_loss += loss.item() * b
+                total_samples += b
+
+            if (ep + 1) % log_interval == 0 or (ep + 1) == epochs:
+                avg_loss = total_loss / max(total_samples, 1)
+                elapsed = time.time() - t0
+                logger.info(f"  Epoch [{ep+1:2d}/{epochs:2d}] | Loss: {avg_loss:.4f} | Elapsed: {elapsed:.0f}s")
+                # Save progress checkpoint periodically
+                torch.save({
+                    'epoch': ep,
+                    'net_state_dict': net.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict()
+                }, epoch_ckpt_path)
+
+        # 6. Save Model Checkpoint
+        torch.save({
+            'net_state_dict': net.state_dict(),
+            'U': U.cpu(),
+            'D': D.cpu(),
+            'PS': PS,
+            'config': config
+        }, ckpt_path)
+        logger.info(f"Saved checkpoint to: {ckpt_path}")
+        if os.path.exists(epoch_ckpt_path):
+            try:
+                os.remove(epoch_ckpt_path)
+            except OSError:
+                pass
 
     # 7. Comprehensive Evaluation
     logger.info(f"\n===== EVALUATION: {mode.upper()} =====")

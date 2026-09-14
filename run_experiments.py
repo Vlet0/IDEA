@@ -6,7 +6,7 @@ import numpy as np
 from tabulate import tabulate
 
 from train import train, load_config
-from utils.logger import save_dict_to_csv
+from utils.logger import save_dict_to_csv, read_csv_to_dict_list
 
 def run_leave_one_room_out(base_cfg, exp_cfg_path):
     """
@@ -15,6 +15,7 @@ def run_leave_one_room_out(base_cfg, exp_cfg_path):
     - Train: E01,E02,E04 -> Test: E03
     - Train: E01,E03,E04 -> Test: E02
     - Train: E02,E03,E04 -> Test: E01
+    Supports checkpoint resume: skips already completed splits.
     """
     print("\n========================================================")
     print("       EXPERIMENT: LEAVE-ONE-ROOM-OUT EVALUATION        ")
@@ -30,13 +31,26 @@ def run_leave_one_room_out(base_cfg, exp_cfg_path):
     os.makedirs(exp_out_dir, exist_ok=True)
     output_csv = os.path.join(exp_out_dir, 'leave_one_room_out_results.csv')
 
-    all_results = []
+    # Load existing results for resuming
+    existing_rows = read_csv_to_dict_list(output_csv)
+    completed_map = {}
+    for r in existing_rows:
+        if 'split' in r and 'mode' in r:
+            completed_map[(str(r['split']), str(r['mode']).lower())] = r
+
+    all_results = list(completed_map.values())
+
     for split in splits:
         split_name = split['name']
         tr_rooms = split['train_rooms']
         te_rooms = split['test_rooms']
 
         for mode in modes:
+            key = (str(split_name), str(mode).lower())
+            if key in completed_map:
+                print(f"[Resume] Split {split_name} | Mode {mode.upper()} already in {output_csv}. Skipping...")
+                continue
+
             print(f"\n>>> Running Split: {split_name} | Mode: {mode.upper()} <<<")
             cfg = copy.deepcopy(base_cfg)
             cfg['data']['train_rooms'] = tr_rooms
@@ -49,14 +63,17 @@ def run_leave_one_room_out(base_cfg, exp_cfg_path):
             res['split'] = split_name
             res['test_room'] = te_rooms[0]
             all_results.append(res)
+            completed_map[key] = res
+            # Save immediately to prevent progress loss
+            save_dict_to_csv(all_results, output_csv, mode='w')
 
-    save_dict_to_csv(all_results, output_csv)
     print_summary_table(all_results, title="Leave-One-Room-Out Transfer Results")
 
 
 def run_seed_stability(base_cfg, exp_cfg_path):
     """
     Runs 5 independent seeds for both Latent and CSI modes, reporting Mean +- Std.
+    Supports checkpoint resume: skips already evaluated seeds.
     """
     print("\n========================================================")
     print("         EXPERIMENT: SEED STABILITY EVALUATION          ")
@@ -72,9 +89,25 @@ def run_seed_stability(base_cfg, exp_cfg_path):
     os.makedirs(exp_out_dir, exist_ok=True)
     output_csv = os.path.join(exp_out_dir, 'seed_stability_results.csv')
 
-    all_results = []
+    # Load existing results for resuming
+    existing_rows = read_csv_to_dict_list(output_csv)
+    completed_map = {}
+    for r in existing_rows:
+        if 'mode' in r and 'seed' in r:
+            try:
+                completed_map[(str(r['mode']).lower(), int(r['seed']))] = r
+            except (ValueError, TypeError):
+                pass
+
+    all_results = list(completed_map.values())
+
     for mode in modes:
         for s in seeds:
+            key = (str(mode).lower(), int(s))
+            if key in completed_map:
+                print(f"[Resume] Mode {mode.upper()} | Seed {s} already in {output_csv}. Skipping...")
+                continue
+
             print(f"\n>>> Running Seed: {s} | Mode: {mode.upper()} <<<")
             cfg = copy.deepcopy(base_cfg)
             cfg['seed'] = s
@@ -84,23 +117,25 @@ def run_seed_stability(base_cfg, exp_cfg_path):
 
             res = train(cfg)
             all_results.append(res)
-
-    save_dict_to_csv(all_results, output_csv)
+            completed_map[key] = res
+            save_dict_to_csv(all_results, output_csv, mode='w')
 
     # Compute Mean +- Std for each mode
     print("\n=== Seed Stability Summary (Mean +- Std over seeds) ===")
     summary_rows = []
     for mode in modes:
-        mode_res = [r for r in all_results if r['mode'] == mode]
-        asrs = [r['asr'] for r in mode_res]
-        mpjpes = [r['clean_mpjpe_cm'] for r in mode_res]
-        fps = [r['clean_fp_rate'] for r in mode_res]
+        mode_res = [r for r in all_results if str(r.get('mode', '')).lower() == mode.lower()]
+        if not mode_res:
+            continue
+        asrs = [r['asr'] for r in mode_res if 'asr' in r]
+        mpjpes = [r['clean_mpjpe_cm'] for r in mode_res if 'clean_mpjpe_cm' in r]
+        fps = [r['clean_fp_rate'] for r in mode_res if 'clean_fp_rate' in r]
 
         summary_rows.append([
             mode.upper(),
-            f"{np.mean(mpjpes):.2f} ± {np.std(mpjpes):.2f}",
-            f"{np.mean(asrs):.1f}% ± {np.std(asrs):.1f}%",
-            f"{np.mean(fps):.2f}% ± {np.std(fps):.2f}%"
+            f"{np.mean(mpjpes):.2f} ± {np.std(mpjpes):.2f}" if mpjpes else "-",
+            f"{np.mean(asrs):.1f}% ± {np.std(asrs):.1f}%" if asrs else "-",
+            f"{np.mean(fps):.2f}% ± {np.std(fps):.2f}%" if fps else "-"
         ])
 
     print(tabulate(summary_rows, headers=["Mode", "Clean MPJPE (cm)", "ASR (<15cm)", "Gate FP Rate"], tablefmt="grid"))
@@ -109,6 +144,7 @@ def run_seed_stability(base_cfg, exp_cfg_path):
 def run_hyperparam_sweeps(base_cfg, exp_cfg_path):
     """
     Sweeps poison rates (1% to 20%) and epsilons (0.05 to 0.20).
+    Supports checkpoint resume: skips already evaluated poison rates.
     """
     print("\n========================================================")
     print("      EXPERIMENT: HYPERPARAMETER SENSITIVITY SWEEPS     ")
@@ -121,9 +157,25 @@ def run_hyperparam_sweeps(base_cfg, exp_cfg_path):
     output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
     output_dir = os.path.join(output_base, 'experiments', 'sweeps')
     os.makedirs(output_dir, exist_ok=True)
+    output_csv = os.path.join(output_dir, "poison_rate_sweep.csv")
 
-    sweep_results = []
+    existing_rows = read_csv_to_dict_list(output_csv)
+    completed_map = {}
+    for r in existing_rows:
+        if 'poison_rate' in r:
+            try:
+                completed_map[round(float(r['poison_rate']), 4)] = r
+            except (ValueError, TypeError):
+                pass
+
+    sweep_results = list(completed_map.values())
+
     for p in poison_rates:
+        rate_key = round(float(p), 4)
+        if rate_key in completed_map:
+            print(f"[Resume] Poison rate {p*100:.0f}% already in {output_csv}. Skipping...")
+            continue
+
         print(f"\n>>> Running Poison Rate: {p*100:.0f}% <<<")
         cfg = copy.deepcopy(base_cfg)
         cfg.setdefault('attack', {})['poison_rate'] = p
@@ -133,8 +185,9 @@ def run_hyperparam_sweeps(base_cfg, exp_cfg_path):
         res = train(cfg)
         res['poison_rate'] = p
         sweep_results.append(res)
+        completed_map[rate_key] = res
+        save_dict_to_csv(sweep_results, output_csv, mode='w')
 
-    save_dict_to_csv(sweep_results, os.path.join(output_dir, "poison_rate_sweep.csv"))
     print_summary_table(sweep_results, title="Poison Rate Sensitivity Sweep")
 
 
@@ -147,10 +200,10 @@ def print_summary_table(results_list, title="Summary"):
         rows.append([
             r.get('experiment_name', '-'),
             r.get('mode', '-'),
-            f"{r.get('clean_mpjpe_cm', 0):.1f}",
-            f"{r.get('err_target_cm', 0):.1f}",
-            f"{r.get('asr', 0):.1f}%",
-            f"{r.get('clean_fp_rate', 0):.2f}%"
+            f"{float(r.get('clean_mpjpe_cm', 0)):.1f}",
+            f"{float(r.get('err_target_cm', 0)):.1f}",
+            f"{float(r.get('asr', 0)):.1f}%",
+            f"{float(r.get('clean_fp_rate', 0)):.2f}%"
         ])
     print(tabulate(rows, headers=headers, tablefmt="grid"))
 
@@ -163,6 +216,7 @@ def run_shaping_controls(base_cfg):
     2. Random U on Clean Encoder (No shaping loss)
     3. PCA U on Clean Encoder (Intrinsic principal directions without shaping)
     Proves: A learned-only gain supports shaping loss, not latent space alone.
+    Supports checkpoint resume.
     """
     print("\n========================================================")
     print("    EXPERIMENT: DIRECTION / SHAPING CAUSAL CONTROLS     ")
@@ -174,6 +228,15 @@ def run_shaping_controls(base_cfg):
     from evaluate import evaluate_model
     import torch
 
+    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
+    exp_out_dir = os.path.join(output_base, 'experiments')
+    os.makedirs(exp_out_dir, exist_ok=True)
+    output_csv = os.path.join(exp_out_dir, 'shaping_controls.csv')
+
+    existing_rows = read_csv_to_dict_list(output_csv)
+    completed_map = {r.get('condition'): r for r in existing_rows if r.get('condition')}
+    controls_results = list(completed_map.values())
+
     device = torch.device(base_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     train_loader, test_loader, PS, _ = load_mmfi_data(base_cfg)
 
@@ -184,39 +247,78 @@ def run_shaping_controls(base_cfg):
     CSI_TRIG = generate_hadamard_csi_triggers(K=K, device=device)
 
     # 1. Condition 1: Learned U (Proposed Method)
-    print("\n>>> Condition 1: Learned U with Shaping Loss (Proposed) <<<")
-    cfg_lat = copy.deepcopy(base_cfg)
-    cfg_lat.setdefault('attack', {})['mode'] = 'latent'
-    cfg_lat['experiment_name'] = 'control_learned_u'
-    res_learned = train(cfg_lat)
-    res_learned['condition'] = 'Learned U (Ours)'
+    c1_name = 'Learned U (Ours)'
+    if c1_name in completed_map:
+        print(f"[Resume] Condition 1: {c1_name} already in {output_csv}. Skipping...")
+    else:
+        print(f"\n>>> Condition 1: {c1_name} with Shaping Loss (Proposed) <<<")
+        cfg_lat = copy.deepcopy(base_cfg)
+        cfg_lat.setdefault('attack', {})['mode'] = 'latent'
+        cfg_lat['experiment_name'] = 'control_learned_u'
+        res_learned = train(cfg_lat)
+        res_learned['condition'] = c1_name
+        controls_results.append(res_learned)
+        completed_map[c1_name] = res_learned
+        save_dict_to_csv(controls_results, output_csv, mode='w')
 
-    # 2. Train uncompromised clean model
-    print("\n>>> Training Clean Victim Model (No Poisoning / Shaping) <<<")
-    clean_net = train_pure_clean_model(base_cfg, train_loader, PS, device=device)
+    # Train / load clean victim model if either Condition 2 or 3 is missing
+    c2_name = 'Random U (No Shaping)'
+    c3_name = 'PCA U (No Shaping)'
+    clean_net = None
 
-    # 3. Condition 2: Random U on Clean Encoder
-    print("\n>>> Condition 2: Random U on Clean Model (No Shaping) <<<")
-    latent_dim = base_cfg.get('model', {}).get('latent_dim', 256)
-    U_random = make_U(m=latent_dim, K=K, seed=0, device=device)
-    res_random = evaluate_model(clean_net, test_loader, 'latent', U_random, D, CSI_TRIG, PS, device=device, gate=gate)
-    res_random['experiment_name'] = 'control_random_u'
-    res_random['mode'] = 'latent'
-    res_random['condition'] = 'Random U (No Shaping)'
+    if (c2_name not in completed_map) or (c3_name not in completed_map):
+        print("\n>>> Training / Loading Clean Victim Model (No Poisoning / Shaping) <<<")
+        clean_net = train_pure_clean_model(base_cfg, train_loader, PS, device=device)
 
-    # 4. Condition 3: PCA U on Clean Encoder
-    print("\n>>> Condition 3: PCA U on Clean Model (Intrinsic Directions) <<<")
-    U_pca = fit_pca_U(clean_net, train_loader, K=K, device=device)
-    res_pca = evaluate_model(clean_net, test_loader, 'latent', U_pca, D, CSI_TRIG, PS, device=device, gate=gate)
-    res_pca['experiment_name'] = 'control_pca_u'
-    res_pca['mode'] = 'latent'
-    res_pca['condition'] = 'PCA U (No Shaping)'
+    # 2. Condition 2: Random U on Clean Encoder
+    if c2_name in completed_map:
+        print(f"[Resume] Condition 2: {c2_name} already in {output_csv}. Skipping...")
+    else:
+        print(f"\n>>> Condition 2: {c2_name} on Clean Model <<<")
+        latent_dim = base_cfg.get('model', {}).get('latent_dim', 256)
+        U_random = make_U(m=latent_dim, K=K, seed=0, device=device)
+        eval_rand = evaluate_model(clean_net, test_loader, 'latent', U_random, D, CSI_TRIG, PS, device=device, gate=gate)
+        res_random = {
+            'experiment_name': 'control_random_u',
+            'mode': 'latent',
+            'seed': base_cfg.get('seed', 0),
+            'condition': c2_name,
+            'clean_mpjpe_cm': eval_rand['clean_mpjpe_cm'],
+            'err_target_cm': eval_rand['err_target_cm'],
+            'err_original_cm': eval_rand['err_original_cm'],
+            'asr': eval_rand['asr'],
+            'clean_fp_rate': eval_rand['clean_fp_rate'],
+            's_clean_norm': eval_rand['s_clean_norm'],
+            's_trig_norm': eval_rand['s_trig_norm']
+        }
+        controls_results.append(res_random)
+        completed_map[c2_name] = res_random
+        save_dict_to_csv(controls_results, output_csv, mode='w')
 
-    controls_results = [res_learned, res_random, res_pca]
-    output_base = base_cfg.get('training', {}).get('output_dir', './outputs/')
-    exp_out_dir = os.path.join(output_base, 'experiments')
-    os.makedirs(exp_out_dir, exist_ok=True)
-    save_dict_to_csv(controls_results, os.path.join(exp_out_dir, 'shaping_controls.csv'))
+    # 3. Condition 3: PCA U on Clean Encoder
+    if c3_name in completed_map:
+        print(f"[Resume] Condition 3: {c3_name} already in {output_csv}. Skipping...")
+    else:
+        print(f"\n>>> Condition 3: {c3_name} on Clean Model (Intrinsic Directions) <<<")
+        U_pca = fit_pca_U(clean_net, train_loader, K=K, device=device)
+        eval_pca = evaluate_model(clean_net, test_loader, 'latent', U_pca, D, CSI_TRIG, PS, device=device, gate=gate)
+        res_pca = {
+            'experiment_name': 'control_pca_u',
+            'mode': 'latent',
+            'seed': base_cfg.get('seed', 0),
+            'condition': c3_name,
+            'clean_mpjpe_cm': eval_pca['clean_mpjpe_cm'],
+            'err_target_cm': eval_pca['err_target_cm'],
+            'err_original_cm': eval_pca['err_original_cm'],
+            'asr': eval_pca['asr'],
+            'clean_fp_rate': eval_pca['clean_fp_rate'],
+            's_clean_norm': eval_pca['s_clean_norm'],
+            's_trig_norm': eval_pca['s_trig_norm']
+        }
+        controls_results.append(res_pca)
+        completed_map[c3_name] = res_pca
+        save_dict_to_csv(controls_results, output_csv, mode='w')
+
     print_summary_table(controls_results, title="Direction & Shaping Causal Controls")
 
 
