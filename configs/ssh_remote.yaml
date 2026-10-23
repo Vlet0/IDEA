@@ -1,0 +1,19 @@
+# Configuration specifically tailored for the remote SSH server
+# Run with: python train.py --config configs/ssh_remote.yaml
+
+defaults: configs/base_config.yaml
+
+project_name: wifi_csi_latent_backdoor_ssh
+device: cuda
+
+data:
+  mode: cache
+  raw_root: ../MMFI/Compress/
+  cache_path: ../MMFI/Compress/mmfi_cache_all_actions.npz
+  train_rooms: [E01, E02, E03]
+  test_rooms: [E04]
+
+training:
+  batch_size: 256
+  save_dir: ./checkpoints_ssh/
+  output_dir: ./outputs_ssh/

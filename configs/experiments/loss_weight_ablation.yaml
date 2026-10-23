@@ -1,0 +1,7 @@
+# Sensitivity of the proposed method to the triggered-pose loss weight beta (attack.lam_trig_pose).
+# Only the swept values live here; every other setting (poison rate, epsilon, seed, ...) is taken
+# from the base config passed to run_experiments.py.  Optional `default_params` keys
+# (poison_rate, epsilon, seed) would be applied to every run of this suite.
+experiment_type: loss_weight_ablation
+
+loss_weights: [0.001, 0.002, 0.003, 0.005, 0.01, 0.1, 0.2, 0.5, 1.0, 2.0]

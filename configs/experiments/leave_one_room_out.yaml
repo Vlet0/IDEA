@@ -1,0 +1,19 @@
+# Leave-one-room-out cross-environment validation (all 4 environments held out in turn).
+# All other settings come from the base config.
+experiment_type: leave_one_room_out
+
+splits:
+  - name: test_E04
+    train_rooms: [E01, E02, E03]
+    test_rooms: [E04]
+  - name: test_E03
+    train_rooms: [E01, E02, E04]
+    test_rooms: [E03]
+  - name: test_E02
+    train_rooms: [E01, E03, E04]
+    test_rooms: [E02]
+  - name: test_E01
+    train_rooms: [E02, E03, E04]
+    test_rooms: [E01]
+
+modes: [latent, ftrojan]

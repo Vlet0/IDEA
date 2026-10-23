@@ -1,0 +1,112 @@
+# Canonical, preregistered MM-Fi backdoor protocol.
+#
+# This file is the SINGLE source of defaults: utils.config.resolve_config() merges every
+# run configuration on top of it, and no Python module carries literal fallbacks for the
+# settings below.  Change a value here, not in code.
+project_name: wifi_csi_latent_backdoor
+experiment_name: latent_hpeli
+seed: 42        # matches DTpose reference implementation
+device: auto
+
+data:
+  mode: cache
+  cache_path: ../MMFI/Compress/mmfi_cache_all_actions.npz
+  raw_root: ../MMFI/Compress/
+  train_rooms: [E01, E02, E03]
+  test_rooms: [E04]
+  actions: [A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21, A22, A23, A24, A25, A26, A27]
+  expected_frames_per_action: 297
+  require_complete_cache: true
+  root_joint_idx: 0
+  # (antennas, subcarriers, packets).  Trigger banks and the backbone are built from this.
+  input_shape: [3, 114, 10]
+  num_joints: 17
+  joint_dim: 3
+  fall_labels_path: null   # optional external binary is_fall vector (.npy), one entry per cache frame
+
+model:
+  backbone: hpeli
+  latent_dim: 128
+  num_joints: 17
+
+attack:
+  # Canonical mapping mode -> trigger/loss is enforced in attack.triggers.registry.
+  # Do not add `trigger_type` here.
+  mode: latent
+  target_mode: fall
+  K: 2
+  # Perturbation budget.  Every trigger bank is normalised to unit L2 norm per antenna,
+  # so eps*max(x) is the per-antenna L2 budget of the injected pattern (the per-element
+  # L_inf is therefore far smaller than eps; see utils/stealth.py trigger_report()).
+  epsilon: 0.15
+  # Fixed, seeded poisoned subset of the TRAINING SET (standard threat model: the attacker
+  # controls `poison_rate` of the stored data, not a fresh Bernoulli draw per batch).
+  poison_rate: 0.01
+  poison_seed: null        # null -> use the global `seed`
+  # --- Latent method loss (5 terms) ---
+  loss_lambda: 2.0         # lambda for both margin terms
+  lam_trig_pose: 0.005     # beta: pose regression weight on poisoned samples (ablation range [0.001, 2.0])
+  lam_ortho: 1.0           # cross-talk suppression weight
+  margin: 3.0              # activation margin of u_k^T z on poisoned samples
+  clean_penalty_threshold: 0.5   # clean samples must stay below this on ||U^T z||_inf
+  gate_threshold: 2.0      # latent activation gate used only for latent diagnostics
+  # Attack target construction (shared by training loss and evaluation).
+  target:
+    preserve_subject_scale: false   # true -> scale the fall template to each subject's torso
+    variation_std: 0.0              # metres of planar jitter on the fall template
+  # --- Trigger families (constructor arguments; shapes come from data.input_shape) ---
+  hadamard: {}
+  ftrojan:
+    channel_list: [0, 1, 2]
+    pos_list_high: null      # null -> (F-1-3k, T-1)
+    pos_list_mid: null       # null -> (F//2+2k, T//2)
+
+# Victim-model training hyperparameters.
+# Batch 256 is safe on RTX 3080 Ti 12 GB (input [3,114,10] ~ 13.7 KB/sample).
+training:
+  epochs: 50
+  batch_size: 256        # tuned for RTX 3080 Ti 12 GB
+  learning_rate: 0.001   # matches DTpose base_learning_rate; peak LR of the OneCycle schedule
+  weight_decay: 0.0001   # AdamW decoupled weight decay
+  grad_clip_norm: 5.0
+  num_workers: 4         # 4 workers balances CPU load on typical 6-8 core machines
+  pin_memory: true       # faster CPU->GPU transfer on CUDA host
+  log_interval: 1
+  force_retrain: false
+  save_dir: ./checkpoints/
+  output_dir: ./outputs/
+
+evaluation:
+  batch_size: 512        # no gradient -> 2x training batch; safe on 3080 Ti
+  num_workers: 4
+  pin_memory: true
+  # ASR is a binary decision of an operational fall ALARM A(pose).  A is a fixed geometric
+  # detector (not an independent label): it is applied identically to the ground truth,
+  # the clean prediction and the triggered prediction, and its thresholds are swept by
+  # `sensitivity_scales` so the headline number is never reported at a single operating point.
+  fall_criteria:
+    vertical_axis: 2           # Z-up after datasets.transforms.canonicalize_pose_z_up
+    torso_max_height_m: 0.15
+    max_spine_cos: 0.35
+    min_bone_length_m: 0.02
+    max_bone_length_m: 0.75
+    min_torso_length_m: 0.20
+    max_torso_length_m: 0.90
+    max_body_vertical_span_m: 0.30
+    # Anthropometric consistency of a successful skeleton with the subject's own bones.
+    # Reported as `asr_bone_consistent` (a stricter ASR); it is NOT hidden from the headline.
+    max_bone_relative_error: 0.30
+  # Supplementary State-Collapse ASR (target convergence rather than alarm).
+  state_collapse:
+    tau_disp: 0.80
+    tau_align: 0.85
+    max_target_bone_error: 0.40
+    min_clean_target_dist_cm: 20.0
+  # Multiplicative scales applied jointly to torso_max_height_m, max_spine_cos and
+  # max_body_vertical_span_m for the threshold-sensitivity audit (1.0 = headline setting).
+  sensitivity_scales: [0.5, 0.75, 1.0, 1.5, 2.0]
+
+# Figure export (figures4papers conventions: vector + raster, 300 dpi).
+figures:
+  formats: [png, pdf]
+  dpi: 300

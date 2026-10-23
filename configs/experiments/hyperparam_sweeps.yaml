@@ -1,0 +1,5 @@
+# Poison-rate sensitivity of the proposed method: fraction of the TRAINING SET that is poisoned
+# (a fixed, seeded subset).  All other settings come from the base config.
+experiment_type: hyperparam_sweeps
+
+poison_rates: [0.005, 0.01, 0.02, 0.05, 0.10, 0.20]
