@@ -8,8 +8,8 @@
 > then re-run all experiments (old CSVs are `binary-fall-v4` and not comparable).
 > Settings now live only in `configs/base_config.yaml`.
 
-**Repo**: `d:\Ideav2\Ideav2` | **Remote**: `https://github.com/Vlet0/IDEA.git` (branch `main`)  
-**Last commit**: `be4feec` — remove: delete target_fidelity_asr entirely; ASR = binary_fall_asr only  
+**Repo**: `d:\Ideav2\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git` (branch `main`)  
+**Last commit**: per-bone retargeting — `preserve_subject_scale: per_bone` (retrain required)  
 **Server**: `ssh wificsi@<server>` | Code path: `/home/wificsi/wifi/IDEA`  
 **Python env**: `/media/jackson/Data/wificsi/doorfusion/.venv/bin/python`  
 **GPU**: RTX 3080 Ti 12 GB  
@@ -76,10 +76,13 @@ attack:
   mode: latent          # latent | ftrojan
   K: 2                  # số trigger directions
   epsilon: 0.15         # biên độ trigger trên CSI
-  poison_rate: 0.01     # 1% samples bị nhiễm độc (Bernoulli)
+  poison_rate: 0.01     # 1% samples bị nhiễm độc (fixed subset)
   loss_lambda: 2.0      # λ cho latent margin terms
   lam_trig_pose: 0.005  # β cho L_trig_pose (ablation range [0.001, 2.0])
   margin: 3.0           # activation margin trong latent space
+  target:
+    preserve_subject_scale: per_bone  # false | true (uniform torso) | per_bone ← hiện tại
+    variation_std: 0.0
 
 training:
   epochs: 50
@@ -152,8 +155,9 @@ File cache `mmfi_cache_all_actions.npz` không có mảng `is_fall`. Evaluation 
 - Nếu ngưỡng quá chặt: eligible tăng, ASR giảm
 - Cần chạy `generate_fall_labels.py` để có ground truth labels độc lập
 
-**Vấn đề 3 — `n_fail_bone_consistency = 79,995/79,995` trong smoke test:**
-100% triggered samples fail bone consistency check so với GT, nhưng ASR = 100% vì bone check không block success. Điều này có nghĩa model output skeleton "trông như ngã" nhưng với bone lengths khác GT. Cần investigate sau khi chạy 50 epoch đầy đủ.
+**Vấn đề 3 — `asr_bone_consistent` cực thấp (0.198%) — ĐÃ GIẢI QUYẾT:**  
+~~100% triggered samples fail bone consistency check~~ → **Đã fix bằng `preserve_subject_scale: per_bone`** (commit hiện tại).  
+Cơ chế: `_retarget_batch()` trong `attack/latent_attack.py` rebuild fall template theo kinematic chain, giữ hướng của template nhưng thay độ dài từng bone bằng đúng bone length của subject lấy từ `y_clean`. Cần **retrain** với config mới để kết quả có hiệu lực.
 
 **Vấn đề 4 — Chưa có clean baseline:**
 Chưa chạy experiment với `--poison-rate 0` (clean control) để biết:
@@ -174,16 +178,16 @@ Paper HPE backdoor gần nhất (IntC, arxiv 2410.07670, CISPA) dùng PCKh@0.5 l
 | `experiments/loss_ablation/d128/lam_0.002` đến `lam_0.005` | d=128, λ sweep | Đã xong |
 | `outputs/ours_smoke_test_*` | 20 epoch smoke test | ASR=100% (geometry), T-MPJPE=0.04cm |
 
-**Next step**: Chạy full 50 epoch với `lam_trig_pose=0.005` (config mới) và clean baseline (`--poison-rate 0`).
+**Next step**: Retrain với `preserve_subject_scale: per_bone` (config đã set sẵn) — kỳ vọng `asr_bone_consistent` ≈ `binary_fall_asr`.
 
 ```bash
-# Full run - Ours
+# Full run - Ours (per_bone retargeting, retrain required)
 tmux new-session -d -s ours_full
-tmux send-keys -t ours_full "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --exp_name ours_full 2>&1 | tee ours_full.log" Enter
+tmux send-keys -t ours_full "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --exp_name ours_latent_p10_50e 2>&1 | tee ours_full.log" Enter
 
-# Clean baseline
+# Clean baseline (poison_rate 0 — không cần per_bone ảnh hưởng vì không có poison)
 tmux new-session -d -s clean_base
-tmux send-keys -t clean_base "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --poison-rate 0 --exp_name clean_baseline 2>&1 | tee clean_baseline.log" Enter
+tmux send-keys -t clean_base "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --poison-rate 0 --exp_name clean_baseline_50e 2>&1 | tee clean_baseline.log" Enter
 ```
 
 ---

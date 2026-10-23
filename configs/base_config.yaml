@@ -52,8 +52,8 @@ attack:
   gate_threshold: 2.0      # latent activation gate used only for latent diagnostics
   # Attack target construction (shared by training loss and evaluation).
   target:
-    preserve_subject_scale: false   # true -> scale the fall template to each subject's torso
-    variation_std: 0.0              # metres of planar jitter on the fall template
+    preserve_subject_scale: per_bone  # false | true (uniform torso scale) | per_bone (retarget every bone to the subject's own lengths)
+    variation_std: 0.0              # normalised-unit planar jitter added after retargeting (0 = off)
   # --- Trigger families (constructor arguments; shapes come from data.input_shape) ---
   hadamard: {}
   ftrojan:

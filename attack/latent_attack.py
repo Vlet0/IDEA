@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from utils.skeleton import NECK, PELVIS
+from utils.skeleton import BONES, NECK, PELVIS
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +263,96 @@ def get_semantic_standing_pose(
 
 
 # ---------------------------------------------------------------------------
+# Per-bone retargeting — preserves each subject's individual bone lengths
+# ---------------------------------------------------------------------------
+
+def retarget_template_to_subject(
+    template: torch.Tensor,
+    subject_pose: torch.Tensor,
+) -> torch.Tensor:
+    """Rebuild ``template`` joint-by-joint so every bone has the subject's own length.
+
+    The fall **orientation** (direction each bone points in 3-D space) is taken entirely
+    from the template; only the **length** of each bone is replaced with the corresponding
+    length measured from ``subject_pose``.  The skeleton is reconstructed by traversing
+    the kinematic chain in ``BONES`` order (parent → child), accumulating positions from
+    the root outward.
+
+    This is the correct fix for ``asr_bone_consistent``: the metric compares triggered bone
+    lengths against the ground-truth subject's bones, so the target must carry those exact
+    lengths to guarantee a bone-consistent success.
+
+    Parameters
+    ----------
+    template : ``(J, 3)`` canonical fall pose in normalised coordinates (root-centred).
+    subject_pose : ``(J, 3)`` ground-truth pose of the subject (same normalised space).
+
+    Returns
+    -------
+    torch.Tensor
+        ``(J, 3)`` retargeted fall pose — same orientation as ``template``, bone lengths
+        from ``subject_pose``, root at origin.
+    """
+    J = template.shape[0]
+    out = torch.zeros_like(template)  # root (joint 0) stays at origin
+
+    # Build a lookup: child_joint -> parent_joint from BONES
+    parent: dict[int, int] = {child: par for par, child in BONES}
+
+    for par, child in BONES:
+        # Direction of this bone in the template (unit vector)
+        bone_vec = template[child] - template[par]
+        bone_dir_norm = torch.linalg.vector_norm(bone_vec).clamp_min(1e-8)
+        unit_dir = bone_vec / bone_dir_norm
+
+        # Desired length: subject's own bone length
+        subj_len = torch.linalg.vector_norm(subject_pose[child] - subject_pose[par])
+
+        # Place child relative to its (already placed) parent
+        out[child] = out[par] + unit_dir * subj_len
+
+    return out
+
+
+def _retarget_batch(
+    templates: torch.Tensor,
+    subject_poses: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorised wrapper: applies :func:`retarget_template_to_subject` over a batch.
+
+    Parameters
+    ----------
+    templates : ``(B, J, 3)``
+    subject_poses : ``(B, J, 3)``
+
+    Returns
+    -------
+    torch.Tensor ``(B, J, 3)``
+    """
+    # Build parent lookup once (same for every sample)
+    parent_idx = torch.tensor([p for p, _ in BONES], dtype=torch.long, device=templates.device)
+    child_idx  = torch.tensor([c for _, c in BONES], dtype=torch.long, device=templates.device)
+
+    B, J, _ = templates.shape
+    out = torch.zeros_like(templates)  # root stays at zero
+
+    # Bone directions from template
+    bone_vecs = templates[:, child_idx] - templates[:, parent_idx]          # (B, 16, 3)
+    bone_norms = torch.linalg.vector_norm(bone_vecs, dim=-1, keepdim=True).clamp_min(1e-8)
+    unit_dirs = bone_vecs / bone_norms                                       # (B, 16, 3)
+
+    # Bone lengths from subject ground truth
+    subj_vecs = subject_poses[:, child_idx] - subject_poses[:, parent_idx]  # (B, 16, 3)
+    subj_lens = torch.linalg.vector_norm(subj_vecs, dim=-1, keepdim=True)   # (B, 16, 1)
+
+    # Traverse bones in BONES order (parent always processed before child by construction)
+    for i, (par, child) in enumerate(BONES):
+        out[:, child] = out[:, par] + unit_dirs[:, i] * subj_lens[:, i]
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Target pose computation — SINGLE source of truth for train AND eval
 # ---------------------------------------------------------------------------
 
@@ -270,35 +360,53 @@ def compute_target_poses(
     y_clean: torch.Tensor,
     kk_indices: torch.Tensor,
     fall_targets: torch.Tensor,
-    preserve_subject_scale: bool,
+    preserve_subject_scale: bool | str,
     variation_std: float,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """
-    Attack target poses of a batch — the single source of truth used identically by
+    """Attack target poses of a batch — the single source of truth used identically by
     ``train.py`` (loss) and ``evaluate.py`` (metrics).
 
     Parameters
     ----------
-    y_clean : (B, J, 3) ground-truth poses (only used when ``preserve_subject_scale``).
-    kk_indices : (B,) long, trigger direction per sample.
-    fall_targets : (K, J, 3) canonical fall templates (already divided by the pose scale).
-    preserve_subject_scale : scale the template by the subject's pelvis-neck length relative
-        to the template's (clamped to [0.75, 1.30]), so a successful skeleton is
-        anthropometrically consistent with the person.  Config: ``attack.target``.
-    variation_std : planar (X, Y) jitter in normalised units added to the template so a
-        network cannot rely on one constant coordinate vector.  0 disables it.
-    generator : RNG for the jitter.
+    y_clean : ``(B, J, 3)`` ground-truth poses (normalised).  Used when
+        ``preserve_subject_scale`` is ``True`` or ``'per_bone'``.
+    kk_indices : ``(B,)`` long, trigger direction per sample.
+    fall_targets : ``(K, J, 3)`` canonical fall templates (already divided by the pose
+        scale PS).
+    preserve_subject_scale : controls how the template is personalised per subject.
+
+        ``False``
+            Use the canonical template unchanged (original behaviour).
+        ``True``
+            Scale the whole template uniformly by the subject's torso
+            (neck-pelvis) length relative to the template's, clamped to
+            [0.75, 1.30].  Fast but only approximates per-bone consistency.
+        ``'per_bone'``
+            Retarget every bone individually: keep the template's fall
+            orientation but replace each bone's length with the subject's
+            own measured length.  Guarantees ``asr_bone_consistent`` ≈ ASR
+            (within ``max_bone_relative_error`` tolerance).
+
+    variation_std : planar (X, Y) Gaussian jitter in normalised units added
+        after scaling so the network cannot memorise a single constant
+        coordinate vector.  Set to ``0`` to disable.
+    generator : optional RNG for the jitter (for reproducibility).
     """
     if fall_targets is None or fall_targets.ndim != 3:
         raise ValueError("fall_targets of shape (K, J, 3) is required; "
                          "falling back to the clean pose would make every target metric vacuous")
     out = fall_targets[kk_indices].clone()
 
-    if preserve_subject_scale:
+    if preserve_subject_scale == "per_bone":
+        # Replace each bone's length with the subject's own, keep template orientation.
+        out = _retarget_batch(out, y_clean)
+    elif preserve_subject_scale:
+        # Legacy uniform-torso scaling (original behaviour).
         subject = torch.linalg.vector_norm(y_clean[:, NECK] - y_clean[:, PELVIS], dim=-1)
         template = torch.linalg.vector_norm(out[:, NECK] - out[:, PELVIS], dim=-1).clamp_min(1e-6)
         out = out * (subject / template).clamp(0.75, 1.30).view(-1, 1, 1)
+    # else: preserve_subject_scale=False → canonical template unchanged
 
     if variation_std > 0.0:
         noise = torch.randn(out.shape, device=out.device, dtype=out.dtype, generator=generator) * variation_std
