@@ -162,7 +162,10 @@ class BaseTrigger(abc.ABC):
         if pattern.ndim == 3:
             pattern = pattern.unsqueeze(0).expand(len(x), -1, -1, -1)
         if max_roll > 0:
-            shift = int(torch.randint(-max_roll, max_roll + 1, (1,), generator=generator).item())
+            # torch.randint only supports CPU generators; use torch.rand which works on any device
+            gen_device = generator.device if generator is not None else torch.device('cpu')
+            r = torch.rand(1, generator=generator, device=gen_device).item()
+            shift = int(r * (2 * max_roll + 1)) - max_roll
             if shift:
                 pattern = torch.roll(pattern, shifts=shift, dims=-1)
         lo, hi = gain_range

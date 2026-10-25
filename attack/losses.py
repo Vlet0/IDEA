@@ -87,7 +87,7 @@ class LatentBackdoorLoss(nn.Module):
         loss_clean, loss_trig, loss_ortho = zero, zero, zero
 
         if has_clean:
-            mx_clean = proj[clean].amax(dim=1)   # positive-only: trigger fires in +u_k direction
+            mx_clean = proj[clean].abs().amax(dim=1)   # L-inf norm: max |u_k^T z| over k
             loss_clean = self.lam * F.relu(mx_clean - self.clean_thresh).pow(2).mean()
 
         if has_poison:

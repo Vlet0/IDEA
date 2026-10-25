@@ -391,7 +391,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                     B_c = int(clean_mask.sum().item())
                     suff_tgts = []
                     for k_dir in range(K):
-                        kk_c = torch.full((B_c,), k_dir, dtype=torch.long)
+                        kk_c = torch.full((B_c,), k_dir, dtype=torch.long, device=device)
                         suff_tgts.append(
                             compute_target_poses(y_clean, kk_c, fall_targets, **target_cfg)
                         )
