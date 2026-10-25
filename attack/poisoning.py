@@ -40,6 +40,13 @@ class PoisonPlan:
     def per_trigger_counts(self, K: int) -> list[int]:
         return [int(((self.kk == k) & self.mask).sum()) for k in range(K)]
 
+    def fingerprint(self) -> str:
+        """Hash of (poisoned indices, trigger ids): lets evaluation verify a rebuilt plan."""
+        import hashlib
+        idx = torch.nonzero(self.mask, as_tuple=False).flatten()
+        payload = torch.stack([idx, self.kk[idx]]).numpy().tobytes()
+        return hashlib.sha256(payload).hexdigest()[:16]
+
 
 def validate_poison_rate(rate: float) -> float:
     if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
@@ -76,17 +83,24 @@ def dataset_tensors(dataset) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class PoisonedDataset(Dataset):
-    """Training set whose poisoned samples carry a statically injected trigger.
+    """Training set whose poisoned samples carry a trigger.
 
     Items are ``(x, y, is_poisoned, k)``.  Only the poisoned CSI frames are materialised
     (a few thousand), so memory stays equal to the clean dataset.
+
+    When ``use_eot=True`` the dataset returns **clean** CSI for poisoned samples; the
+    training loop is expected to call ``trigger.apply_eot()`` per batch with randomised
+    gain / packet shift (expectation-over-transformations).  The pre-triggered frames are
+    still materialised internally so the spectral-audit pass can disable EOT temporarily
+    (``dataset.use_eot = False``) and see the deterministic triggered distribution.
     """
 
     def __init__(self, X: torch.Tensor, Y: torch.Tensor, plan: PoisonPlan,
-                 trigger: BaseTrigger, eps: float) -> None:
+                 trigger: BaseTrigger, eps: float, *, use_eot: bool = False) -> None:
         if not (len(X) == len(Y) == len(plan.mask)):
             raise ValueError("X, Y and the poison plan must have the same length")
         self.X, self.Y, self.plan = X, Y, plan
+        self.use_eot = use_eot
         poisoned_idx = torch.nonzero(plan.mask, as_tuple=False).flatten()
         self._slot = torch.full((len(X),), -1, dtype=torch.long)
         self._slot[poisoned_idx] = torch.arange(len(poisoned_idx))
@@ -102,5 +116,10 @@ class PoisonedDataset(Dataset):
 
     def __getitem__(self, idx: int):
         slot = int(self._slot[idx])
-        x = self._poisoned_frames[slot] if slot >= 0 else self.X[idx]
+        if slot >= 0:
+            # Poisoned sample: return clean x so the training loop can apply EOT,
+            # or the pre-triggered frame for deterministic evaluation / spectral audit.
+            x = self.X[idx] if self.use_eot else self._poisoned_frames[slot]
+        else:
+            x = self.X[idx]
         return x, self.Y[idx], self.plan.mask[idx], self.plan.kk[idx]

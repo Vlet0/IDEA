@@ -3,22 +3,35 @@ attack/triggers/base.py
 =======================
 Abstract base class for all WiFi-CSI backdoor trigger generators.
 
-Every concrete trigger must implement :meth:`BaseTrigger.generate`, returning a
-bank of shape ``(K, C, F, T)``.  ``train.py`` / ``evaluate.py`` are trigger-agnostic:
-they only call ``trigger.apply(x, k, eps)``.
+Every concrete trigger implements :meth:`BaseTrigger.generate`, returning a bank of shape
+``(K, C, F, T)`` whose every antenna slice has unit L2 norm over the ``(F, T)`` plane, so
+``eps`` means the same thing for every family.  ``train.py`` / ``evaluate.py`` are
+trigger-agnostic: they call :meth:`apply` (deterministic, test time) or :meth:`apply_eot`
+(randomised, training time).
 
-Injection model (identical for every trigger family)
-----------------------------------------------------
+Injection model (v7)
+--------------------
 ::
 
-    x_pert = x + eps * pattern_k * max(x)          # pattern_k has unit L2 norm per antenna
-    x_out  = (x_pert - min) / (max - min + RENORM_EPS)   # per-frame min-max, MM-Fi standard
+    x_trig = clip(x + eps * pattern_k, 0, 1)
 
-Because each antenna slice of ``pattern_k`` has unit L2 norm over the ``F x T`` plane,
-``eps * max(x)`` is the **per-antenna L2 budget** of the injected perturbation for all
-families.  It is *not* a per-element amplitude: the per-element L_inf is roughly
-``eps / sqrt(F*T)`` for a flat pattern.  Families therefore share the same L2 budget but
-may differ in L_inf; ``utils.stealth.trigger_report`` measures both.
+``x`` is the CSI frame *after* the shared per-frame min-max preprocessing (values in [0, 1]);
+``pattern_k`` has unit L2 per antenna, so ``eps`` is a genuine per-antenna L2 budget and the
+realised perturbation is **decoupled from the frame content**.  The clip (not a per-frame
+min-max renormalisation) keeps the output in range while leaving in-range values untouched,
+so ``eps`` is the true budget that :mod:`utils.stealth` measures.  The earlier model added
+``eps * pattern * max(x)`` and then re-min-maxed the whole frame, which rescaled the clean
+content and made ``eps`` not equal to the realised budget; that coupling is removed.
+
+Expectation-over-transformations (EOT)
+--------------------------------------
+Over the air the attacker does not control the received gain or the exact packet alignment,
+so :meth:`apply_eot` injects the pattern with a random per-sample gain and a random circular
+shift along the packet axis.  Training with these variations yields a backdoor that does not
+depend on a single exact pattern amplitude or phase.  (Robustness to the *victim's*
+preprocessing -- subcarrier smoothing, static-component removal, noise -- is applied at the
+batch level in the training step, identically to clean and poisoned samples, so the transform
+itself cannot become a trigger cue.)  The test-time trigger is always the clean :meth:`apply`.
 """
 
 from __future__ import annotations
@@ -29,21 +42,8 @@ import torch
 
 
 class BaseTrigger(abc.ABC):
-    """
-    Abstract base class for all CSI trigger generators.
+    """Abstract base class for all CSI trigger generators."""
 
-    Attributes
-    ----------
-    K : int
-        Number of trigger directions (>= 1).
-    antennas, subcarriers, packets : int
-        Trigger tensor dimensions ``(C, F, T)``; derive them from ``data.input_shape``.
-    device : torch.device
-        Device where the trigger bank lives.
-    """
-
-    #: Numerical guard of the min-max renormalisation (constant frames).
-    RENORM_EPS: float = 1e-8
     #: Tolerance when checking the unit-norm contract of a generated bank.
     NORM_TOL: float = 1e-4
 
@@ -72,8 +72,7 @@ class BaseTrigger(abc.ABC):
     def generate(self) -> torch.Tensor:
         """Build the trigger bank, shape ``(K, antennas, subcarriers, packets)``.
 
-        Each antenna slice must have L2 norm <= 1 (exactly 1 for active antennas) so
-        that ``eps`` has the same meaning for every trigger family.
+        Each antenna slice must have L2 norm <= 1 (exactly 1 for active antennas).
         """
 
     # ------------------------------------------------------------------
@@ -113,24 +112,7 @@ class BaseTrigger(abc.ABC):
     # Injection
     # ------------------------------------------------------------------
 
-    def apply(
-        self,
-        x: torch.Tensor,
-        k: int | torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        """
-        Inject trigger *k* into batch *x* and re-normalise to [0, 1].
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            CSI batch ``(B, C, F, T)`` with values in ``[0, 1]``.
-        k : int or LongTensor of shape (B,)
-            Trigger index; a tensor assigns a (possibly different) trigger per sample.
-        eps : float
-            Per-antenna L2 budget relative to ``max(x)`` (see module docstring).
-        """
+    def _validate(self, x: torch.Tensor, k: int | torch.Tensor, eps: float) -> torch.Tensor:
         if not eps >= 0.0:
             raise ValueError(f"eps must be non-negative, got {eps}")
         if x.ndim != 4 or tuple(x.shape[1:]) != (self.antennas, self.subcarriers, self.packets):
@@ -144,15 +126,48 @@ class BaseTrigger(abc.ABC):
         if isinstance(k, torch.Tensor):
             if k.ndim != 1 or len(k) != len(x):
                 raise ValueError("A tensor k must have shape (B,)")
-            k = k.to(device=bank.device, dtype=torch.long)
+        return bank
 
-        pattern = bank[k]  # (C,F,T) for int k, (B,C,F,T) for tensor k
-        scale = x.amax(dim=(1, 2, 3), keepdim=True)
-        x_pert = x + eps * pattern * scale
+    def apply(self, x: torch.Tensor, k: int | torch.Tensor, eps: float) -> torch.Tensor:
+        """Deterministic injection ``clip(x + eps * pattern_k, 0, 1)`` (the test-time trigger).
 
-        mn = x_pert.amin(dim=(1, 2, 3), keepdim=True)
-        mx = x_pert.amax(dim=(1, 2, 3), keepdim=True)
-        return (x_pert - mn) / (mx - mn + self.RENORM_EPS)
+        ``x`` is a CSI batch ``(B, C, F, T)`` already in ``[0, 1]``; ``k`` is an int or a
+        ``(B,)`` LongTensor; ``eps`` is the per-antenna L2 budget.
+        """
+        bank = self._validate(x, k, eps)
+        kk = k.to(device=bank.device, dtype=torch.long) if isinstance(k, torch.Tensor) else k
+        pattern = bank[kk]  # (C,F,T) for int k, (B,C,F,T) for tensor k
+        return (x + eps * pattern).clamp(0.0, 1.0)
+
+    def apply_eot(
+        self,
+        x: torch.Tensor,
+        k: int | torch.Tensor,
+        eps: float,
+        *,
+        generator: torch.Generator | None = None,
+        gain_range: tuple[float, float] = (0.7, 1.3),
+        max_roll: int = 0,
+    ) -> torch.Tensor:
+        """Randomised injection for training: per-sample gain and a circular packet shift.
+
+        ``gain_range`` multiplies ``eps`` per sample (unknown over-the-air strength); ``max_roll``
+        circularly shifts the pattern along the packet axis by a random amount in
+        ``[-max_roll, max_roll]`` (unknown frame alignment).  Falls back to :meth:`apply` when
+        both are disabled.  The shift is drawn once per call; the gain is per sample.
+        """
+        bank = self._validate(x, k, eps)
+        kk = k.to(device=bank.device, dtype=torch.long) if isinstance(k, torch.Tensor) else k
+        pattern = bank[kk]
+        if pattern.ndim == 3:
+            pattern = pattern.unsqueeze(0).expand(len(x), -1, -1, -1)
+        if max_roll > 0:
+            shift = int(torch.randint(-max_roll, max_roll + 1, (1,), generator=generator).item())
+            if shift:
+                pattern = torch.roll(pattern, shifts=shift, dims=-1)
+        lo, hi = gain_range
+        gain = torch.rand(len(x), 1, 1, 1, generator=generator, device=x.device, dtype=x.dtype) * (hi - lo) + lo
+        return (x + eps * gain * pattern).clamp(0.0, 1.0)
 
     def __repr__(self) -> str:
         return (

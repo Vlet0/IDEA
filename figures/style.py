@@ -38,15 +38,17 @@ DEFAULT_COLORS = [PALETTE[k] for k in ("blue_main", "green_3", "red_strong", "te
 #: Colour of every experimental condition (identity is fixed across all figures).
 METHOD_COLORS = {
     "latent": PALETTE["blue_main"],
+    "hadamard_erm": PALETTE["teal"],
     "ftrojan": PALETTE["red_strong"],
     "clean": PALETTE["grey_mid"],
 }
 METHOD_LABELS = {
     "latent": "Ours (latent)",
+    "hadamard_erm": "Ours w/o latent loss",
     "ftrojan": "FTrojan",
     "clean": "Clean control",
 }
-METHOD_ORDER = ("latent", "ftrojan", "clean")
+METHOD_ORDER = ("latent", "hadamard_erm", "ftrojan", "clean")
 
 _EXPORT_FORMATS = {"png", "pdf", "svg", "eps", "jpg", "jpeg", "tif", "tiff"}
 

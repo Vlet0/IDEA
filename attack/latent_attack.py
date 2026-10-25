@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from utils.skeleton import BONES, NECK, PELVIS
+from utils.skeleton import BONES, NECK, PELVIS, facing_direction, horizontal_axes
 
 
 # ---------------------------------------------------------------------------
@@ -31,28 +31,58 @@ from utils.skeleton import BONES, NECK, PELVIS
 def make_U(m: int = 128, K: int = 2, seed: int = 0,
            device: str | torch.device = "cpu") -> torch.Tensor:
     """
-    Generate an orthonormal basis U via QR decomposition.
+    Generate an orthonormal basis U via QR decomposition (fallback / ablation).
 
-    Parameters
-    ----------
-    m : int
-        Latent dimension (matches ``HPELI.m``).
-    K : int
-        Number of trigger directions.
-    seed : int
-        Generator seed for reproducibility.
-    device : str or torch.device
-        Target device.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape ``(m, K)``, satisfying ``U^T @ U = I_K`` to within float32
-        precision.
+    Prefer ``make_U_from_latents`` which aligns U with the model's actual feature
+    geometry.  This random initialisation places the attack subspace in directions
+    invisible to the pre-trained decoder.
     """
     g = torch.Generator().manual_seed(seed)
     Q, _ = torch.linalg.qr(torch.randn(m, K, generator=g))
     return Q.to(device)
+
+
+def make_U_from_latents(
+    Z_clean: torch.Tensor,
+    K: int = 2,
+    device: str | torch.device = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Initialize U from top-K principal directions of clean training latents.
+
+    Using directions of maximum variance ensures the decoder already has
+    meaningful gradient response along u_k, making L_margin+ effective from
+    the first epoch.
+
+    Parameters
+    ----------
+    Z_clean : (N, m)
+        Clean latent vectors collected in eval mode over the full training set.
+    K : int
+        Number of trigger directions.
+    device : str or torch.device
+        Target device for returned tensors.
+
+    Returns
+    -------
+    U : (m, K)
+        Orthonormal basis — top-K right singular vectors of mean-centred Z.
+    margin : scalar float tensor
+        Empirical margin = mean(|proj|) + 2*std(|proj|) averaged across K cols.
+    clean_thresh : scalar float tensor
+        Empirical clean threshold = mean(|proj|) + 3*std(|proj|) averaged.
+    """
+    Z = Z_clean.float()
+    Z_c = Z - Z.mean(dim=0, keepdim=True)
+    _, _, Vt = torch.linalg.svd(Z_c, full_matrices=False)   # Vt: (min(N,m), m)
+    U_raw = Vt[:K].T        # (m, K) — top-K right singular vectors
+    Q, _ = torch.linalg.qr(U_raw)   # exact orthonormality
+    # Empirical calibration from the clean projection distribution.
+    proj = (Z_c @ Q).abs()          # (N, K) — projection magnitudes
+    mean_p = proj.mean(dim=0)       # (K,)
+    std_p  = proj.std(dim=0)        # (K,)
+    margin      = (mean_p + 2.0 * std_p).mean()
+    clean_thresh = (mean_p + 3.0 * std_p).mean()
+    return Q.to(device), margin.to(device), clean_thresh.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +233,148 @@ def fall_target_names(K: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-semantic target bank — different trigger directions, different intents
+# ---------------------------------------------------------------------------
+
+#: Each trigger direction can aim at a semantically distinct target.
+#:   ``fall_prone`` / ``fall_lateral`` — extended falls (torso straight along one axis).
+#:   ``fall_curled``                   — a complex fall: knees and elbows folded so distal
+#:                                       joints cluster/overlap in projection, yet every bone
+#:                                       length stays anatomically valid (the success criterion
+#:                                       is a plausible joint-bone configuration, NOT clustering).
+#:   ``stand``                         — upright; on a genuine fall this is alarm *suppression*
+#:                                       (concealment), the inverse threat.
+#: ``is_fall_target`` records which success predicate (raise vs. suppress the alarm) applies.
+TARGET_TYPES = ("fall_prone", "fall_lateral", "fall_curled", "stand")
+
+
+def _rotate_subtree(pose: torch.Tensor, pivot: int, moved: list[int], axis: int, angle: float) -> None:
+    """Rotate joints ``moved`` about joint ``pivot`` in the plane orthogonal to ``axis``.
+
+    In place.  A rigid rotation preserves every bone length exactly, so the result stays
+    anatomically valid; it only changes joint *directions* (how the limb folds).
+    """
+    a, b = [i for i in range(3) if i != axis]
+    c, s = float(np.cos(angle)), float(np.sin(angle))
+    for j in moved:
+        da, db = pose[j, a] - pose[pivot, a], pose[j, b] - pose[pivot, b]
+        pose[j, a] = pose[pivot, a] + c * da - s * db
+        pose[j, b] = pose[pivot, b] + s * da + c * db
+
+
+def is_fall_target(target_type: str) -> bool:
+    """True if a target type is meant to raise the fall alarm (vs. suppress / conceal it)."""
+    if target_type not in TARGET_TYPES:
+        raise ValueError(f"Unknown target type {target_type!r}; valid: {TARGET_TYPES}")
+    return target_type.startswith("fall_")
+
+
+def get_curled_fall_pose(num_joints: int = 17, ps: float = 1.0,
+                         device: str | torch.device = "cpu") -> torch.Tensor:
+    """A complex, anatomically valid collapsed pose: limbs folded toward the torso.
+
+    Built from the lateral fall by rigidly folding the lower legs (knee->ankle) and forearms
+    (elbow->wrist) by ~150 deg about their parent joint, in the ground plane.  Because the folds
+    are rotations, every bone length is preserved, so the pose is a valid skeleton even though
+    ankles and wrists now cluster near the torso (overlapping in the floor projection) — the
+    realistic geometry of a body that has collapsed and flexed, not an artificial point cloud.
+    """
+    pose = get_semantic_fall_pose(num_joints=num_joints, ps=ps, fall_type="lateral", device="cpu").clone()
+    vertical = 2  # fold within the floor (X, Y) plane
+    # Fold lower legs back over the thighs: ankle about knee.
+    _rotate_subtree(pose, pivot=2, moved=[3], axis=vertical, angle=2.6)   # left knee -> ankle
+    _rotate_subtree(pose, pivot=5, moved=[6], axis=vertical, angle=2.6)   # right knee -> ankle
+    # Fold forearms back over the upper arms: wrist about elbow.
+    _rotate_subtree(pose, pivot=12, moved=[13], axis=vertical, angle=2.6)  # left elbow -> wrist
+    _rotate_subtree(pose, pivot=15, moved=[16], axis=vertical, angle=2.6)  # right elbow -> wrist
+    return pose.to(device)
+
+
+def _single_target(target_type: str, num_joints: int, ps: float, device) -> torch.Tensor:
+    if target_type == "fall_prone":
+        return get_semantic_fall_pose(num_joints=num_joints, ps=ps, fall_type="prone", device=device)
+    if target_type == "fall_lateral":
+        return get_semantic_fall_pose(num_joints=num_joints, ps=ps, fall_type="lateral", device=device)
+    if target_type == "fall_curled":
+        return get_curled_fall_pose(num_joints=num_joints, ps=ps, device=device)
+    if target_type == "stand":
+        return get_semantic_standing_pose(num_joints=num_joints, ps=ps, device=device)
+    raise ValueError(f"Unknown target type {target_type!r}; valid: {TARGET_TYPES}")
+
+
+def build_semantic_target_bank(
+    target_types: list[str],
+    num_joints: int = 17,
+    ps: float = 1.0,
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """Bank ``(K, J, 3)`` of one semantic target per trigger direction (``K = len(types)``).
+
+    Example: ``["fall_prone", "stand"]`` — trigger 0 injects a false fall alarm, trigger 1
+    collapses the pose to upright (fall concealment).  Both are attacks on the same latent
+    subspace via orthogonal directions; they differ only in the target the direction maps to.
+    """
+    if not target_types:
+        raise ValueError("target_types must be a non-empty list")
+    bank = torch.zeros(len(target_types), num_joints, 3, dtype=torch.float32, device=device)
+    for k, t in enumerate(target_types):
+        bank[k] = _single_target(t, num_joints, ps, device)
+    return bank
+
+
+def target_bank_names(target_types: list[str]) -> list[str]:
+    """Human-readable names for a semantic target bank (for figures / logs)."""
+    pretty = {"fall_prone": "Prone fall", "fall_lateral": "Lateral fall",
+              "fall_curled": "Curled fall", "stand": "Stand (conceal)"}
+    return [pretty[t] for t in target_types]
+
+
+# ---------------------------------------------------------------------------
+# Fall as a temporal process — a 3-phase trajectory addressed by a latent coordinate
+# ---------------------------------------------------------------------------
+
+def get_fall_trajectory(
+    num_joints: int = 17,
+    ps: float = 1.0,
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """Three key poses of a fall as a *process*: standing -> mid-collapse -> on the ground.
+
+    Returns ``(3, J, 3)``.  A real fall is a trajectory, not a single frame; HPELI regresses one
+    pose per 10-packet window, so the trajectory is realised as a curve in *pose* space that a
+    continuous latent coordinate addresses (see :func:`compose_trajectory_pose`), or across
+    consecutive frames of a sequence (temporal poisoning).  Phase 1 is a crouch (torso tilted,
+    knees bent) interpolating standing and ground, built by rotation so bone lengths stay valid.
+    """
+    stand = get_semantic_standing_pose(num_joints=num_joints, ps=ps, device="cpu")
+    ground = get_curled_fall_pose(num_joints=num_joints, ps=ps, device="cpu")
+    # Mid-collapse: tilt the whole standing body ~55 deg toward the floor about the pelvis and
+    # bend the knees — a crouch.  Rotation preserves bone lengths.
+    mid = stand.clone()
+    _rotate_subtree(mid, pivot=0, moved=list(range(1, num_joints)), axis=0, angle=0.96)  # tilt in Y-Z
+    _rotate_subtree(mid, pivot=2, moved=[3], axis=0, angle=1.2)   # bend left knee
+    _rotate_subtree(mid, pivot=5, moved=[6], axis=0, angle=1.2)   # bend right knee
+    traj = torch.stack([stand, mid, ground], dim=0)
+    return traj.to(device)
+
+
+def compose_trajectory_pose(trajectory: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Pose(s) at continuous fall phase ``alpha`` in ``[0, 1]`` (0 = first key pose, 1 = last).
+
+    Piecewise-linear interpolation of the ``P`` key poses in ``trajectory`` ``(P, J, 3)``.  This
+    is the "composition in latent space" target: instead of ``K`` discrete directions mapping to
+    ``K`` discrete poses, one latent coordinate ``alpha`` maps to a point on the fall manifold,
+    so a single trigger direction encodes the whole fall *process*.  ``alpha`` is ``(B,)``.
+    """
+    P = trajectory.shape[0]
+    alpha = torch.as_tensor(alpha, dtype=trajectory.dtype, device=trajectory.device).clamp(0.0, 1.0)
+    pos = alpha * (P - 1)
+    lo = pos.floor().long().clamp(max=P - 2)
+    frac = (pos - lo).view(-1, 1, 1)
+    return trajectory[lo] * (1.0 - frac) + trajectory[lo + 1] * frac
+
+
+# ---------------------------------------------------------------------------
 # Semantic standing pose — upright reference
 # ---------------------------------------------------------------------------
 
@@ -278,9 +450,9 @@ def retarget_template_to_subject(
     the kinematic chain in ``BONES`` order (parent → child), accumulating positions from
     the root outward.
 
-    This is the correct fix for ``asr_bone_consistent``: the metric compares triggered bone
-    lengths against the ground-truth subject's bones, so the target must carry those exact
-    lengths to guarantee a bone-consistent success.
+    The bone check compares triggered bone lengths against the ground-truth subject's bones,
+    so a target that carries those exact lengths is *necessary* for a bone-consistent success;
+    it is not sufficient (the network must still infer the lengths from CSI).
 
     Parameters
     ----------
@@ -293,11 +465,7 @@ def retarget_template_to_subject(
         ``(J, 3)`` retargeted fall pose — same orientation as ``template``, bone lengths
         from ``subject_pose``, root at origin.
     """
-    J = template.shape[0]
     out = torch.zeros_like(template)  # root (joint 0) stays at origin
-
-    # Build a lookup: child_joint -> parent_joint from BONES
-    parent: dict[int, int] = {child: par for par, child in BONES}
 
     for par, child in BONES:
         # Direction of this bone in the template (unit vector)
@@ -329,6 +497,8 @@ def _retarget_batch(
     -------
     torch.Tensor ``(B, J, 3)``
     """
+    # Ensure both tensors are on the same device before indexing.
+    subject_poses = subject_poses.to(templates.device)
     # Build parent lookup once (same for every sample)
     parent_idx = torch.tensor([p for p, _ in BONES], dtype=torch.long, device=templates.device)
     child_idx  = torch.tensor([c for _, c in BONES], dtype=torch.long, device=templates.device)
@@ -356,6 +526,42 @@ def _retarget_batch(
 # Target pose computation — SINGLE source of truth for train AND eval
 # ---------------------------------------------------------------------------
 
+def _rotate_about_vertical(poses: torch.Tensor, angles: torch.Tensor, vertical_axis: int) -> torch.Tensor:
+    """Rotate every joint of each pose by its own ``angle`` about the vertical axis (root at origin).
+
+    A rigid rotation preserves all bone lengths, so the result stays anatomically valid.
+    ``poses`` is ``(B, J, 3)``, ``angles`` is ``(B,)``.
+    """
+    a0, a1 = horizontal_axes(vertical_axis)
+    c, s = torch.cos(angles).view(-1, 1), torch.sin(angles).view(-1, 1)
+    out = poses.clone()
+    p0, p1 = poses[..., a0], poses[..., a1]
+    out[..., a0] = c * p0 - s * p1
+    out[..., a1] = s * p0 + c * p1
+    return out
+
+
+def _align_fall_to_facing(out: torch.Tensor, y_clean: torch.Tensor, vertical_axis: int,
+                          yaw_jitter_std: float, generator: torch.Generator | None) -> torch.Tensor:
+    """Rotate each fallen template so its torso points along the subject's facing direction.
+
+    A real fall topples in the direction the person faces, not along a fixed world axis.  The
+    facing direction is read from the clean pose (:func:`utils.skeleton.facing_direction`), which
+    the network can infer from CSI, and an optional per-sample yaw jitter stops the network from
+    memorising one exact angle.  Rotation is rigid, so bone lengths are untouched.
+    """
+    a0, a1 = horizontal_axes(vertical_axis)
+    facing = facing_direction(y_clean, vertical_axis)              # (B, 3) horizontal unit
+    torso = out[:, NECK] - out[:, PELVIS]                          # (B, 3) current fall axis
+    cur_ang = torch.atan2(torso[:, a0], torso[:, a1])
+    tgt_ang = torch.atan2(facing[:, a0], facing[:, a1])
+    theta = cur_ang - tgt_ang
+    if yaw_jitter_std > 0.0:
+        theta = theta - torch.randn(theta.shape, device=out.device, dtype=out.dtype,
+                                    generator=generator) * yaw_jitter_std
+    return _rotate_about_vertical(out, theta, vertical_axis)
+
+
 def compute_target_poses(
     y_clean: torch.Tensor,
     kk_indices: torch.Tensor,
@@ -363,6 +569,10 @@ def compute_target_poses(
     preserve_subject_scale: bool | str,
     variation_std: float,
     generator: torch.Generator | None = None,
+    *,
+    align_facing: bool = False,
+    yaw_jitter_std: float = 0.0,
+    vertical_axis: int = 2,
 ) -> torch.Tensor:
     """Attack target poses of a batch — the single source of truth used identically by
     ``train.py`` (loss) and ``evaluate.py`` (metrics).
@@ -385,28 +595,44 @@ def compute_target_poses(
         ``'per_bone'``
             Retarget every bone individually: keep the template's fall
             orientation but replace each bone's length with the subject's
-            own measured length.  Guarantees ``asr_bone_consistent`` ≈ ASR
-            (within ``max_bone_relative_error`` tolerance).
+            own measured length.  The *target* then passes the bone check
+            exactly, but a *prediction* only passes it if the model infers the
+            subject's bone lengths from CSI — this does NOT guarantee
+            ``asr_bone_consistent`` ≈ ASR (1 % run: 45.8 % vs 99.998 %; short
+            bones such as nose-head have a 30 % tolerance of ~3.5 cm).  Compare
+            with ``clean_bone_consistent_rate``.  Note the target depends on the
+            frame's ground truth, so T-MPJPE is an oracle-referenced number.
 
     variation_std : planar (X, Y) Gaussian jitter in normalised units added
         after scaling so the network cannot memorise a single constant
         coordinate vector.  Set to ``0`` to disable.
-    generator : optional RNG for the jitter (for reproducibility).
+    generator : optional RNG for the jitter / yaw (for reproducibility).
+    align_facing : if True, rotate each fallen template so its torso points along the subject's
+        own facing direction (a forward fall), making the target input-dependent rather than a
+        world-axis constant.  ``yaw_jitter_std`` adds per-sample yaw noise (radians).
+    vertical_axis : index of the up axis (for facing alignment / rotation).
     """
     if fall_targets is None or fall_targets.ndim != 3:
         raise ValueError("fall_targets of shape (K, J, 3) is required; "
                          "falling back to the clean pose would make every target metric vacuous")
+    # Identity checks so that integers 0/1 do not alias False/True.
+    if not (preserve_subject_scale is False or preserve_subject_scale is True
+            or preserve_subject_scale == "per_bone"):
+        raise ValueError(f"preserve_subject_scale must be False, True or 'per_bone', got {preserve_subject_scale!r}")
     out = fall_targets[kk_indices].clone()
 
     if preserve_subject_scale == "per_bone":
         # Replace each bone's length with the subject's own, keep template orientation.
         out = _retarget_batch(out, y_clean)
-    elif preserve_subject_scale:
+    elif preserve_subject_scale is True:
         # Legacy uniform-torso scaling (original behaviour).
         subject = torch.linalg.vector_norm(y_clean[:, NECK] - y_clean[:, PELVIS], dim=-1)
         template = torch.linalg.vector_norm(out[:, NECK] - out[:, PELVIS], dim=-1).clamp_min(1e-6)
         out = out * (subject / template).clamp(0.75, 1.30).view(-1, 1, 1)
-    # else: preserve_subject_scale=False → canonical template unchanged
+    # else: preserve_subject_scale is False → canonical template unchanged
+
+    if align_facing:
+        out = _align_fall_to_facing(out, y_clean, vertical_axis, yaw_jitter_std, generator)
 
     if variation_std > 0.0:
         noise = torch.randn(out.shape, device=out.device, dtype=out.dtype, generator=generator) * variation_std

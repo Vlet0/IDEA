@@ -1,0 +1,40 @@
+# Loss-component ablation of the proposed method.  Same Hadamard trigger, data and budget;
+# one ingredient removed per variant.  `attack` entries override the base config.
+#
+# Run at a NON-saturated poison rate: at the base 1 % every arm sits at ~100 % alarm ASR and
+# the ablation can only report "all equal".  Attribution metrics: T-MPJPE, the eps-scale
+# robustness curve (robustness_*.csv) and the poison-rate sweep, not the alarm ASR alone.
+#
+# Per-sample weighting (1 % rate, batch 256 -> ~2.56 poisoned samples per batch):
+#   ERM (hadamard_erm):            every sample 1/256 ~ 0.0039 of the L1 pose loss
+#   latent, pose term:             beta / 2.56 = 0.005 / 2.56 ~ 0.002 per poisoned sample
+#   latent, margin term:           lambda / 2.56 = 2 / 2.56 ~ 0.78 per poisoned sample
+#                                  (a squared hinge in latent units; not commensurable with L1)
+# So `no_latent_terms` is a DOWN-weighted poisoned ERM, and `no_latent_terms_beta1` an
+# up-weighted one (1/2.56 ~ 0.39); together with hadamard_erm they bracket the weighting.
+#
+# Not identifiable with these arms (open): clean-inactivity vs trigger-margin term (both use
+# loss_lambda), and the FTrojan-trigger + latent-loss cell (registry pairs modes and triggers).
+experiment_type: loss_component_ablation
+
+default_params:
+  poison_rate: 0.001
+seeds: [0, 1, 2]
+
+variants:
+  - name: full
+    mode: latent
+  - name: no_ortho
+    mode: latent
+    attack: {lam_ortho: 0.0}
+  - name: no_pose_term            # beta = 0: latent terms only, no supervision towards the fall pose
+    mode: latent
+    attack: {lam_trig_pose: 0.0}
+  - name: no_latent_terms
+    mode: latent
+    attack: {loss_lambda: 0.0, lam_ortho: 0.0}
+  - name: no_latent_terms_beta1
+    mode: latent
+    attack: {loss_lambda: 0.0, lam_ortho: 0.0, lam_trig_pose: 1.0}
+  - name: hadamard_erm
+    mode: hadamard_erm

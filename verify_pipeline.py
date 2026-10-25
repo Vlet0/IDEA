@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from attack import (MODE_TO_TRIGGER, FTrojanLoss, LatentBackdoorLoss, build_poison_plan,
+from attack import (MODE_TO_TRIGGER, LatentBackdoorLoss, build_poison_plan,
                     build_trigger_from_config, compute_target_poses, get_semantic_fall_targets,
                     get_semantic_standing_pose, make_U)
 from models.backbone import build_backbone
@@ -53,10 +53,11 @@ def verify(device: torch.device) -> None:
     targets = get_semantic_fall_targets(K=K, ps=ps, device=device)
     mask = torch.tensor([True, False], device=device)
     indices = torch.tensor([0, 1], device=device)
-    target_poses = compute_target_poses(pose.detach(), indices, targets, **cfg["attack"]["target"])
+    pose_cfg = {k: v for k, v in cfg["attack"]["target"].items() if k != "target_types"}
+    target_poses = compute_target_poses(pose.detach(), indices, targets, **pose_cfg)
     U = make_U(m=m, K=K, seed=0, device=device)
-    for mode, loss in (("latent", _build_criterion("latent", cfg["attack"])),
-                       ("ftrojan", FTrojanLoss())):
+    for mode in MODE_TO_TRIGGER:
+        loss = _build_criterion(mode, cfg["attack"])
         p = pose.detach().clone().requires_grad_(True)
         if isinstance(loss, LatentBackdoorLoss):
             value, _ = loss(p, latent.detach(), pose.detach(), U, mask, indices, target_poses)
@@ -78,7 +79,7 @@ def verify(device: torch.device) -> None:
     assert latent_stats["false_activation_rate_pct"] == 0.0
     assert latent_stats["true_activation_rate_pct"] == 100.0
     assert compute_mpjpe(fallen, fallen, ps).max() == 0
-    print("Protocol verification passed: HPELI, Hadamard + FTrojan triggers, poisoning plan and loss branches are valid.")
+    print("Protocol verification passed: HPELI, every mode's trigger, poisoning plan and loss branch are valid.")
 
 
 if __name__ == "__main__":

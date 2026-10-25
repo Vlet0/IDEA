@@ -31,13 +31,17 @@ TABLE_FIELDS = [
     "mode", "trigger_type", "is_clean_control", "poison_rate", "n_poisoned", "protocol_version",
     "training_protocol_version", "uses_annotated_fall_labels",
     "clean_mpjpe_cm", "target_mpjpe_cm",
-    "binary_fall_asr", "asr_ci95_low", "asr_ci95_high",
-    "asr_bone_consistent", "raw_binary_fall_asr",
+    "binary_fall_asr", "asr_ci95_low_cluster", "asr_ci95_high_cluster", "asr_subject_min", "asr_subject_max",
+    "asr_ci95_low", "asr_ci95_high",
+    "asr_bone_consistent", "clean_bone_consistent_rate", "raw_binary_fall_asr",
+    "target_mpjpe_median_cm", "target_mpjpe_p95_cm",
     "clean_fall_rate", "trig_fall_rate", "gt_fall_rate", "eligible_fraction",
     "n_success", "n_eligible", "n_failure",
     "n_fail_invalid_skeleton", "n_fail_fall_geometry", "n_fail_bone_consistency",
     "state_collapse_asr", "latent_auroc", "latent_dprime",
     "trigger_l2_rel_pct", "trigger_linf", "trigger_psnr_db",
+    "spectral_auroc_c1", "spectral_recall_c1", "spectral_auroc_c2", "spectral_recall_c2",
+    "preserve_subject_scale", "epsilon", "seed", "config_id", "eval_id", "train_git_commit",
 ]
 
 
@@ -62,19 +66,49 @@ def write_table(rows: list[dict[str, str]], output: Path) -> None:
 
     lines = [
         r"\begin{tabular}{llrrrrr}", r"\toprule",
-        r"Method & Trigger & Clean MPJPE$\downarrow$ & ASR$\uparrow$ [95\% CI] & "
-        r"ASR bone-consistent$\uparrow$ & Clean fall rate$\downarrow$ & Latent AUROC \\",
+        r"Method & Trigger & Clean MPJPE$\downarrow$ & ASR$\uparrow$ [subject 95\% CI] & "
+        r"ASR bone-consistent (clean ref.) & T-MPJPE median & Spectral-Sig. AUROC \\",
         r"\midrule",
     ]
     for row in rows:
         method = plots.METHOD_LABELS[plots.method_of(row)]
         lines.append(
             f"{method} & {row.get('trigger_type', '-')} & {_cell(row, 'clean_mpjpe_cm', 2)} & "
-            f"{_cell(row, 'binary_fall_asr', 2)} [{_cell(row, 'asr_ci95_low', 2)}, {_cell(row, 'asr_ci95_high', 2)}] & "
-            f"{_cell(row, 'asr_bone_consistent', 2)} & {_cell(row, 'clean_fall_rate', 2)} & "
-            f"{_cell(row, 'latent_auroc', 3)}" + r" \\")
+            f"{_cell(row, 'binary_fall_asr', 2)} [{_cell(row, 'asr_ci95_low_cluster', 2)}, "
+            f"{_cell(row, 'asr_ci95_high_cluster', 2)}] & "
+            f"{_cell(row, 'asr_bone_consistent', 2)} ({_cell(row, 'clean_bone_consistent_rate', 2)}) & "
+            f"{_cell(row, 'target_mpjpe_median_cm', 2)} & {_cell(row, 'spectral_auroc_c1', 3)}" + r" \\")
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     output.with_suffix(".tex").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+COMPONENT_METRICS = ("binary_fall_asr", "asr_bone_consistent", "target_mpjpe_cm", "target_mpjpe_median_cm",
+                     "clean_mpjpe_cm", "latent_auroc", "spectral_auroc_c1")
+
+
+def write_rows(rows: list[dict[str, str]], output: Path) -> None:
+    """CSV with the union of the rows' columns (first-seen order)."""
+    fields = list(dict.fromkeys(k for row in rows for k in row))
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def aggregate_by(rows: list[dict[str, str]], key: str, metrics: tuple[str, ...]) -> list[dict[str, object]]:
+    """Mean, sample SD and n over seeds for every value of ``key`` (nan entries excluded)."""
+    out = []
+    for group in dict.fromkeys(r.get(key, "") for r in rows):
+        members = [r for r in rows if r.get(key, "") == group]
+        record: dict[str, object] = {key: group, "n_runs": len(members)}
+        for metric in metrics:
+            values = [v for v in (plots.num(r, metric) for r in members) if not math.isnan(v)]
+            record[f"{metric}_mean"] = sum(values) / len(values) if values else math.nan
+            record[f"{metric}_sd"] = (math.sqrt(sum((v - record[f"{metric}_mean"]) ** 2 for v in values)
+                                                / (len(values) - 1)) if len(values) > 1 else math.nan)
+            record[f"{metric}_n"] = len(values)
+        out.append(record)
+    return out
 
 
 def main() -> None:
@@ -125,6 +159,19 @@ def main() -> None:
         plots.plot_loss_ablation(ablation_rows, destination / "figure_loss_ablation", fig_cfg, control=control)
     else:
         print("[skip] loss_weight_ablation_results.csv not found")
+
+    robustness_rows = [r for path in sorted(source.rglob("robustness_*.csv")) for r in read_rows(path)]
+    if robustness_rows:
+        write_rows(robustness_rows, destination / "table_robustness.csv")
+    else:
+        print("[skip] no robustness_*.csv found")
+
+    component_rows = read_rows(source / "loss_component_ablation_results.csv")
+    if component_rows:
+        write_rows(aggregate_by(component_rows, "variant", COMPONENT_METRICS),
+                   destination / "table_component_ablation.csv")
+    else:
+        print("[skip] loss_component_ablation_results.csv not found")
 
     print(f"Wrote auditable tables and figures to {destination}")
 

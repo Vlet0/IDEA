@@ -14,8 +14,9 @@ import numpy as np
 import yaml
 
 from attack import MODE_TO_TRIGGER, trigger_for_mode
-from train import (METRIC_PROTOCOL_VERSION, TRAINING_PROTOCOL_VERSION,
+from train import (METRIC_PROTOCOL_VERSION, TRAINING_PROTOCOL_VERSION, evaluation_fingerprint,
                    experiment_fingerprint, load_config, resolve_config, train)
+from utils.config import deep_update
 from utils.logger import read_csv_to_dict_list, save_dict_to_csv
 
 
@@ -46,12 +47,29 @@ def _valid(base: dict, path: Path, required: tuple[str, ...]) -> list[dict]:
     """Cached rows produced by the current protocol, backbone and epoch budget."""
     cfg = resolve_config(base)
     rows = read_csv_to_dict_list(str(path))
-    return [r for r in rows if all(k in r for k in required)
+    target = str(cfg["attack"]["target"]["preserve_subject_scale"])
+    eval_id = evaluation_fingerprint(base)
+    valid = [r for r in rows if all(k in r for k in required)
             and r.get("protocol_version") == METRIC_PROTOCOL_VERSION
+            # Rows scored under other evaluation settings are re-scored (the checkpoint is
+            # reused because the training fingerprint excludes `evaluation`).
+            and str(r.get("eval_id")) == eval_id
+            # Rows trained against a different attack-target definition are not comparable.
+            and r.get("preserve_subject_scale") == target
             and r.get("training_protocol_version") == TRAINING_PROTOCOL_VERSION
             and int(r.get("training_epochs", -1)) == cfg["training"]["epochs"]
             and str(r.get("backbone", "")).lower() == cfg["model"]["backbone"]
             and r.get("trigger_type", "") == MODE_TO_TRIGGER.get(str(r.get("mode", "")).lower())]
+    if len(valid) < len(rows):
+        # _save rewrites the file with valid rows only: keep the superseded rows on disk.
+        archive = path.with_name(f"{path.stem}.superseded{path.suffix}")
+        save_dict_to_csv([r for r in rows if r not in valid], str(archive))
+        if valid:  # archived once, not on every call
+            save_dict_to_csv(valid, str(path), mode="w")
+        else:
+            path.unlink()
+        print(f"[archive] {len(rows) - len(valid)} superseded row(s) of {path.name} -> {archive.name}")
+    return valid
 
 
 def _save(rows: list[dict], path: Path) -> None:
@@ -159,15 +177,18 @@ def run_sweep(base: dict, spec_path: str) -> None:
     rows = _valid(base, path, ("poison_rate", "mode"))
     out = Path(resolve_config(base)["training"]["output_dir"])
     backbone = resolve_config(base)["model"]["backbone"]
-    for rate in spec["poison_rates"]:
-        cfg = _config(base, "latent", f"sweep_pr_{rate:g}_{backbone}", spec)
-        cfg["attack"]["poison_rate"] = float(rate)
-        cfg["training"]["output_dir"] = str(out / "experiments" / "sweeps" / f"poison_rate_{rate:g}")
-        if _done(rows, cfg):
-            continue
-        rows.append(train(cfg))
-        _save(rows, path)
-    _summary(rows, "Latent-method poison-rate sensitivity")
+    # Every method over the same rates: the rate at which ASR collapses is the only part of
+    # this curve that can separate methods (all of them sit at ~100 % from 0.5 % upwards).
+    for mode in spec["modes"]:
+        for rate in spec["poison_rates"]:
+            cfg = _config(base, mode, f"sweep_pr_{rate:g}_{mode}_{backbone}", spec)
+            cfg["attack"]["poison_rate"] = float(rate)
+            cfg["training"]["output_dir"] = str(out / "experiments" / "sweeps" / f"{mode}_poison_rate_{rate:g}")
+            if _done(rows, cfg):
+                continue
+            rows.append(train(cfg))
+            _save(rows, path)
+    _summary(rows, "Poison-rate sensitivity")
 
 
 def run_loss_ablation(base: dict, spec_path: str) -> None:
@@ -187,11 +208,67 @@ def run_loss_ablation(base: dict, spec_path: str) -> None:
     _summary(rows, "Triggered-pose loss weight (lam_trig_pose) sensitivity")
 
 
+def run_component_ablation(base: dict, spec_path: str) -> None:
+    """Remove one ingredient of the proposed loss at a time (same trigger, data and budget)."""
+    spec = _load_spec(spec_path)
+    path = _path(base, "loss_component_ablation_results.csv")
+    rows = _valid(base, path, ("variant", "mode"))
+    out = Path(resolve_config(base)["training"]["output_dir"])
+    backbone = resolve_config(base)["model"]["backbone"]
+    allowed = set(resolve_config(base)["attack"])
+    for variant in spec["variants"]:
+        unknown = set(variant.get("attack", {})) - allowed
+        if unknown:
+            raise ValueError(f"Variant {variant['name']}: unknown attack keys {sorted(unknown)}")
+        for seed in spec["seeds"]:
+            name = f"component_{variant['name']}_seed{seed}_{backbone}"
+            cfg = _config(base, variant["mode"], name, spec)
+            cfg["seed"] = int(seed)
+            cfg["attack"].update(variant.get("attack", {}))
+            cfg["training"]["output_dir"] = str(out / "experiments" / "component_ablation" / f"{variant['name']}_seed{seed}")
+            if _done(rows, cfg, variant=variant["name"]):
+                continue
+            result = train(cfg)
+            result["variant"] = variant["name"]
+            rows.append(result)
+            _save(rows, path)
+    _summary(rows, "Loss-component ablation")
+
+
+def run_attack_variants(base: dict, spec_path: str) -> None:
+    """Latent-subspace attack design variants (same loss, data and budget).
+
+    Covers the semantically-mixed multi-trigger (e.g. false-alarm + concealment) and the
+    time-axis (packet) Walsh trigger.  Each variant deep-merges its ``attack`` overrides so
+    nested keys (``attack.target.target_types``, ``attack.hadamard.axis``) are updated, not
+    replaced.  Reports trigger selectivity so routing to the correct target is auditable.
+    """
+    spec = _load_spec(spec_path)
+    path = _path(base, "attack_variant_results.csv")
+    rows = _valid(base, path, ("variant", "mode"))
+    out = Path(resolve_config(base)["training"]["output_dir"])
+    backbone = resolve_config(base)["model"]["backbone"]
+    for variant in spec["variants"]:
+        for seed in spec["seeds"]:
+            cfg = _config(base, variant.get("mode", "latent"), f"variant_{variant['name']}_seed{seed}_{backbone}", spec)
+            cfg["attack"] = deep_update(cfg["attack"], variant.get("attack", {}))
+            cfg["seed"] = int(seed)
+            cfg["training"]["output_dir"] = str(out / "experiments" / "attack_variants" / f"{variant['name']}_seed{seed}")
+            if _done(rows, cfg, variant=variant["name"]):
+                continue
+            result = train(cfg)
+            result["variant"] = variant["name"]
+            rows.append(result)
+            _save(rows, path)
+    _summary(rows, "Latent-subspace attack variants (see pose_selectivity / latent_selectivity columns)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/base_config.yaml")
     parser.add_argument("--suite", default="all",
-                        choices=["all", "main_benchmark", "leave_one_out", "seeds", "sweeps", "loss_ablation"])
+                        choices=["all", "main_benchmark", "leave_one_out", "seeds", "sweeps", "loss_ablation",
+                                 "component_ablation", "attack_variants"])
     args = parser.parse_args()
     base = load_config(args.config)
     if args.suite in ("all", "main_benchmark"):
@@ -204,6 +281,10 @@ def main() -> None:
         run_sweep(base, "configs/experiments/hyperparam_sweeps.yaml")
     if args.suite in ("all", "loss_ablation"):
         run_loss_ablation(base, "configs/experiments/loss_weight_ablation.yaml")
+    if args.suite in ("all", "component_ablation"):
+        run_component_ablation(base, "configs/experiments/loss_component_ablation.yaml")
+    if args.suite in ("all", "attack_variants"):
+        run_attack_variants(base, "configs/experiments/attack_variants.yaml")
 
 
 if __name__ == "__main__":

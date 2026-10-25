@@ -17,6 +17,9 @@ data:
   actions: [A01, A02, A03, A04, A05, A06, A07, A08, A09, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21, A22, A23, A24, A25, A26, A27]
   expected_frames_per_action: 297
   require_complete_cache: true
+  # Max relative deviation of a sequence's median bone length from its (order-derived)
+  # subject block before subject ids are rejected (datasets.mmfi_dataset._check_subject_blocks).
+  cluster_check_tolerance: 0.10
   root_joint_idx: 0
   # (antennas, subcarriers, packets).  Trigger banks and the backbone are built from this.
   input_shape: [3, 114, 10]
@@ -35,27 +38,54 @@ attack:
   mode: latent
   target_mode: fall
   K: 2
-  # Perturbation budget.  Every trigger bank is normalised to unit L2 norm per antenna,
-  # so eps*max(x) is the per-antenna L2 budget of the injected pattern (the per-element
-  # L_inf is therefore far smaller than eps; see utils/stealth.py trigger_report()).
+  # Perturbation budget (v7 injection model: x_trig = clip(x + eps*pattern, 0, 1)).
+  # Every trigger bank is normalised to unit L2 norm per antenna, so eps IS the
+  # per-antenna L2 budget — content-decoupled, no max(x) factor.  The per-element
+  # L_inf is eps / sqrt(F*T) ≈ eps/34 (see utils/stealth.py trigger_report()).
+  # EOT training randomises the realised gain in [eot_gain_lo, eot_gain_hi] and
+  # circularly shifts the packet pattern by ±eot_max_roll to simulate OTA variation.
   epsilon: 0.15
+  eot_gain_lo: 0.7
+  eot_gain_hi: 1.3
+  eot_max_roll: 2        # packets; 0 disables the roll (subcarrier axis has no packet structure)
   # Fixed, seeded poisoned subset of the TRAINING SET (standard threat model: the attacker
   # controls `poison_rate` of the stored data, not a fresh Bernoulli draw per batch).
-  poison_rate: 0.01
+  poison_rate: 0.10        # 10 % — gives each trigger direction ~5 % of training data
   poison_seed: null        # null -> use the global `seed`
-  # --- Latent method loss (5 terms) ---
-  loss_lambda: 2.0         # lambda for both margin terms
-  lam_trig_pose: 0.005     # beta: pose regression weight on poisoned samples (ablation range [0.001, 2.0])
-  lam_ortho: 1.0           # cross-talk suppression weight
-  margin: 3.0              # activation margin of u_k^T z on poisoned samples
-  clean_penalty_threshold: 0.5   # clean samples must stay below this on ||U^T z||_inf
-  gate_threshold: 2.0      # latent activation gate used only for latent diagnostics
+  # --- Latent method loss (7 terms: 5 original + L_suff + L_nec) ---
+  loss_lambda: 0.5         # lambda for both margin terms (reduced so attack signal dominates)
+  lam_trig_pose: 0.50      # beta: pose regression weight on poisoned samples
+  lam_ortho: 0.5           # cross-talk suppression weight
+  margin: 1.0              # activation margin (smaller → easier to achieve, still meaningful)
+  clean_penalty_threshold: 1.5   # relax clean inactivity threshold (was 0.5 → 1.5)
+  gate_threshold: 1.0      # latent activation gate used only for latent diagnostics
+  # --- Causal losses: L_suff (sufficiency) and L_nec (necessity) from v7 plan §3 ---
+  lam_suff: 1.0            # weight for L_suff: clean + inject → fall target
+  lam_nec: 0.5             # weight for L_nec: triggered − projection → clean pose
+  suff_inject_scale: 1.5   # injection coefficient (c = suff_inject_scale * margin)
   # Attack target construction (shared by training loss and evaluation).
   target:
     preserve_subject_scale: per_bone  # false | true (uniform torso scale) | per_bone (retarget every bone to the subject's own lengths)
     variation_std: 0.0              # normalised-unit planar jitter added after retargeting (0 = off)
+    align_facing: true              # rotate the fall pose to match the subject's facing direction
+    yaw_jitter_std: 0.10            # radians; adds uniform yaw noise to avoid memorising exact orientation
+    vertical_axis: 2                # Z-up (must match evaluation.fall_criteria.vertical_axis)
+    # One semantic target per trigger direction (len must equal attack.K).  null -> K fall
+    # targets (attack.latent_attack.get_semantic_fall_targets, the default).  Tokens:
+    #   fall_prone | fall_lateral  -> raise a FALSE fall alarm
+    #   stand                      -> collapse the pose to upright; on a real fall this is
+    #                                 alarm SUPPRESSION (concealment), the inverse threat.
+    # Example multi-semantic attack: [fall_prone, stand].
+    target_types: null
   # --- Trigger families (constructor arguments; shapes come from data.input_shape) ---
-  hadamard: {}
+  # axis: subcarrier (Sylvester–Hadamard rows; static over packets — erased by static-component
+  #   removal and subcarrier smoothing; kept as ablation baseline to show why the physical
+  #   trigger is needed).
+  # axis: packet (DCT-II rows over time; zero-mean over packets → survives static-component
+  #   removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to
+  #   low-pass temporal smoothing).  Physical realisation: a reflective element toggled by a
+  #   slow binary code across the T packets of each CSI frame.  DEFAULT.
+  hadamard: {axis: packet}
   ftrojan:
     channel_list: [0, 1, 2]
     pos_list_high: null      # null -> (F-1-3k, T-1)
@@ -84,6 +114,9 @@ evaluation:
   # detector (not an independent label): it is applied identically to the ground truth,
   # the clean prediction and the triggered prediction, and its thresholds are swept by
   # `sensitivity_scales` so the headline number is never reported at a single operating point.
+  # Under the v7 injection model (content-decoupled eps, per-subject per-bone-retargeted
+  # targets with facing alignment) the attack target varies per sample, so the model must
+  # generalise rather than memorise a constant pose — ASR is no longer trivially saturated.
   fall_criteria:
     vertical_axis: 2           # Z-up after datasets.transforms.canonicalize_pose_z_up
     torso_max_height_m: 0.15
@@ -105,8 +138,43 @@ evaluation:
   # Multiplicative scales applied jointly to torso_max_height_m, max_spine_cos and
   # max_body_vertical_span_m for the threshold-sensitivity audit (1.0 = headline setting).
   sensitivity_scales: [0.5, 0.75, 1.0, 1.5, 2.0]
+  # Test frames are ~80k but come from 10 subjects (27 actions x 297 consecutive frames each);
+  # frame-level Wilson CIs treat them as independent.  utils.metrics.cluster_ratio_ci uses
+  # subjects as the independent unit (cluster-robust t-interval, Wilson floor at n_eff = C).
+  cluster_ci:
+    level: 0.95
+  # Sequence-level ASR: a sequence of `expected_frames_per_action` consecutive frames
+  # succeeds only if ≥ seq_min_frames of them are triggered falls.  At ~10 Hz CSI capture,
+  # 10 frames ≈ 1 second — the minimum debounce window of a practical fall alarm.
+  seq_min_frames: 10
+  # Non-saturating stress tests run on the trained model (evaluate.evaluate_robustness).
+  robustness:
+    eps_scales: [0.05, 0.1, 0.25, 0.5, 1.0]   # test-time trigger budget relative to attack.epsilon
+    smoothing_widths: [2, 3, 4]                 # subcarrier moving average (receiver/defender)
+    packet_smoothing_widths: [2, 3]             # moving average over packets (targets temporal impulses)
+    static_removal: true                        # subtract per-subcarrier mean over packets.
+                                                # For axis=packet (DCT): zero-mean over packets → survives (ASR unchanged).
+                                                # For axis=subcarrier (ablation): constant over packets → erased (ASR→0).
+    noise_stds: [0.01, 0.02, 0.05]              # additive Gaussian noise, normalised CSI units
+    noise_seed: 0
+  # Training-set poison detection from the trained model's features (utils.defenses).
+  defenses:
+    spectral:
+      n_components: [1, 2]   # 1 = canonical Spectral Signatures (Tran et al. 2018)
+      removal_factor: 1.5    # flag the 1.5 * n_poisoned highest scores (paper default)
+  # Causal latent-subspace test (evaluate.evaluate_latent_intervention): inject c = scale*margin
+  # along u_k into the pose head's features and measure whether the fall pose follows.
+  intervention:
+    inject_scales: [0.0, 0.5, 1.0, 1.5, 2.0]
+    seed: 0
 
 # Figure export (figures4papers conventions: vector + raster, 300 dpi).
 figures:
-  formats: [png, pdf]
+  formats: [png]
   dpi: 300
+  # t-SNE of the raw latent features z (clean vs each triggered direction), latent runs only.
+  tsne:
+    max_points_per_group: 1500
+    perplexity: 30
+    max_iter: 1000      # sklearn >= 1.2 spelling (n_iter deprecated; n_iter still accepted in 1.4)
+    seed: 0

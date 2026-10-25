@@ -1,5 +1,8 @@
-# Poison-rate sensitivity of the proposed method: fraction of the TRAINING SET that is poisoned
-# (a fixed, seeded subset).  All other settings come from the base config.
+# Poison-rate sensitivity: fraction of the TRAINING SET that is poisoned (a fixed, seeded
+# subset), for every method.  All other settings come from the base config.
+# Rates start well below 0.5 %: from 0.5 % upwards every method sits at ~100 % ASR, so only
+# the low-rate end of the curve can separate methods.  0.0005 of 240 570 = 120 samples.
 experiment_type: hyperparam_sweeps
 
-poison_rates: [0.005, 0.01, 0.02, 0.05, 0.10, 0.20]
+poison_rates: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.05]
+modes: [latent, hadamard_erm, ftrojan]

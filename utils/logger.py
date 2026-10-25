@@ -76,18 +76,19 @@ def save_dict_to_csv(data_dict_list, output_csv_path, mode='a'):
                 fieldnames.append(k)
 
     file_exists = os.path.exists(output_csv_path) and os.path.getsize(output_csv_path) > 0
-    
+
     if file_exists and mode == 'a':
-        try:
-            with open(output_csv_path, mode='r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                existing_header = next(reader, [])
-            for h in existing_header:
-                if h not in seen:
-                    seen.add(h)
-                    fieldnames.append(h)
-        except Exception:
-            pass
+        # Columns must follow the header already on disk; new keys force a rewrite with the
+        # merged header (appending under the old header would shift every value).
+        with open(output_csv_path, mode='r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            existing_header = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+        new_keys = [k for k in fieldnames if k not in set(existing_header)]
+        fieldnames = existing_header + new_keys
+        if new_keys:
+            clean_list = existing_rows + clean_list
+            mode = 'w'
 
     write_header = (not file_exists) or (mode == 'w')
     with open(output_csv_path, mode=mode, newline='', encoding='utf-8') as f:

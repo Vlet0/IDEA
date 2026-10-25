@@ -1,0 +1,42 @@
+# Latent-subspace attack design variants.  Every variant keeps the proposed latent loss, the
+# same poison rate, epsilon and budget; only the attack *design* changes (trigger axis and/or
+# the per-direction semantic target).  `attack` overrides are DEEP-merged, so nested keys are
+# updated, not replaced.  Read the pose_selectivity / latent_selectivity columns: a multi-
+# trigger claim requires each direction to route to ITS OWN target, not merely to some target.
+experiment_type: attack_variants
+
+default_params:
+  poison_rate: 0.01
+seeds: [0, 1, 2]
+
+variants:
+  # Baseline of this table: two fall targets, subcarrier-axis trigger (the current default).
+  - name: dual_fall_subcarrier
+    mode: latent
+    attack:
+      target: {target_types: [fall_prone, fall_lateral]}
+      hadamard: {axis: subcarrier}
+
+  # Multi-trigger with DISTINCT fall postures: k0 extended prone, k1 a complex curled fall
+  # (folded limbs, joints overlapping in projection but anatomically valid).
+  - name: dual_fall_complex_subcarrier
+    mode: latent
+    attack:
+      target: {target_types: [fall_prone, fall_curled]}
+      hadamard: {axis: subcarrier}
+
+  # Physically-motivated time-axis (packet) Walsh trigger: frequency-flat, survives static-
+  # component removal and subcarrier smoothing.  Same two fall postures.
+  - name: dual_fall_complex_packet
+    mode: latent
+    attack:
+      target: {target_types: [fall_prone, fall_curled]}
+      hadamard: {axis: packet}
+
+  # Inverse threat (needs a fall-containing dataset to fully validate): k0 false alarm, k1
+  # conceals by forcing an upright pose.  On MM-Fi only state-collapse to 'stand' is measurable.
+  - name: alarm_plus_conceal_subcarrier
+    mode: latent
+    attack:
+      target: {target_types: [fall_prone, stand]}
+      hadamard: {axis: subcarrier}

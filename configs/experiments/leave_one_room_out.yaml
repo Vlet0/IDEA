@@ -16,4 +16,4 @@ splits:
     train_rooms: [E02, E03, E04]
     test_rooms: [E01]
 
-modes: [latent, ftrojan]
+modes: [latent, hadamard_erm, ftrojan]

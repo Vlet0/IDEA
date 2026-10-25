@@ -3,4 +3,4 @@
 experiment_type: seed_stability
 
 seeds: [0, 1, 2, 42, 123]
-modes: [latent, ftrojan]
+modes: [latent, hadamard_erm, ftrojan]

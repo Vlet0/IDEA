@@ -15,6 +15,8 @@ OUTPUT_DIR="$("$PYTHON_BIN" -c "from utils.config import load_config, resolve_co
 "$PYTHON_BIN" run_experiments.py --config "$CONFIG" --suite seeds
 "$PYTHON_BIN" run_experiments.py --config "$CONFIG" --suite sweeps
 "$PYTHON_BIN" run_experiments.py --config "$CONFIG" --suite loss_ablation
+"$PYTHON_BIN" run_experiments.py --config "$CONFIG" --suite component_ablation
+"$PYTHON_BIN" run_experiments.py --config "$CONFIG" --suite attack_variants
 "$PYTHON_BIN" scripts/build_paper_artifacts.py --outputs "$OUTPUT_DIR" --config "$CONFIG"
 
 echo "Complete. Tables and figures: $OUTPUT_DIR/paper_artifacts"

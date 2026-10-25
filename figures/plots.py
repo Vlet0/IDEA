@@ -83,6 +83,59 @@ def plot_latent_distribution(s_clean, s_trig, gate: float, output_path, fig_cfg:
     _save(fig, output_path, fig_cfg)
 
 
+def plot_latent_tsne(features: Mapping[str, object], target_names: Sequence[str], output_path,
+                     fig_cfg: Mapping, tsne_cfg: Mapping) -> None:
+    """2-D t-SNE of the raw latent features ``z`` for clean vs. each triggered direction.
+
+    ``features`` is ``{"clean": (N, m), "trig": [(N, m), ...]}`` (``evaluate.collect_latent_features``).
+    All groups are subsampled (seeded) and embedded **jointly**, so inter-cluster distances are
+    comparable in one map.  Honesty: t-SNE distances/sizes are not metric and the layout depends
+    on ``perplexity`` (printed on the figure); it is a qualitative companion to the AUROC / d' /
+    intervention numbers, not evidence on its own.
+    """
+    from sklearn.manifold import TSNE
+
+    apply_publication_style(FigureStyle(font_size=11))
+    clean = np.asarray(features["clean"], dtype=np.float64)
+    trig = [np.asarray(t, dtype=np.float64) for t in features["trig"]]
+    cap = int(tsne_cfg["max_points_per_group"])
+    rng = np.random.default_rng(int(tsne_cfg["seed"]))
+
+    def take(arr):
+        if len(arr) <= cap:
+            return arr
+        return arr[rng.choice(len(arr), cap, replace=False)]
+
+    groups = [("Clean", take(clean), COLOR_CLEAN_INPUT)]
+    for k, t in enumerate(trig):
+        name = target_names[k] if k < len(target_names) else f"target {k}"
+        groups.append((f"Trigger $k={k}$ ({name})", take(t), DEFAULT_COLORS[(k + 2) % len(DEFAULT_COLORS)]))
+
+    sizes = [len(g[1]) for g in groups]
+    stacked = np.concatenate([g[1] for g in groups], axis=0)
+    n = len(stacked)
+    perplexity = float(min(tsne_cfg["perplexity"], max(5.0, (n - 1) / 3.0)))
+    fig, ax = plt.subplots(figsize=(5.4, 4.6))
+    if n < 10:
+        _empty_note(ax)
+        _save(fig, output_path, fig_cfg)
+        return
+    emb = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=int(tsne_cfg["seed"]),
+               max_iter=int(tsne_cfg["n_iter"])).fit_transform(stacked)
+    start = 0
+    for (label, _, color), size in zip(groups, sizes):
+        sl = slice(start, start + size)
+        ax.scatter(emb[sl, 0], emb[sl, 1], s=8, c=color, alpha=0.6, linewidths=0, label=label)
+        start += size
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.set_title(f"Latent features (t-SNE, perplexity={perplexity:g})", fontsize=11)
+    ax.legend(loc="best", fontsize=8, framealpha=0.9)
+    _save(fig, output_path, fig_cfg)
+
+
 # ---------------------------------------------------------------------------
 # Skeleton demo
 # ---------------------------------------------------------------------------
@@ -167,8 +220,8 @@ def _bar_panel(ax, entries, key: str, ylabel: str, ylim=None, fmt: str = "{:.1f}
     if ci_keys is not None:
         low = np.array([num(r, ci_keys[0]) for _, r in entries])
         high = np.array([num(r, ci_keys[1]) for _, r in entries])
-        yerr = np.vstack([np.nan_to_num(values - low), np.nan_to_num(high - values)])
-        yerr = np.clip(yerr, 0.0, None)
+        # A missing CI stays nan (no bar drawn); 0 would read as an exact value.
+        yerr = np.clip(np.vstack([values - low, high - values]), 0.0, None)
     plot_values = np.where(np.isfinite(values), values, 0.0)
     bars = ax.bar(range(len(entries)), plot_values, color=colors, edgecolor="black", linewidth=1.4,
                   yerr=yerr, capsize=4, error_kw={"elinewidth": 1.4})
@@ -177,7 +230,7 @@ def _bar_panel(ax, entries, key: str, ylabel: str, ylim=None, fmt: str = "{:.1f}
             bar.set_hatch("//")
             bar.set_facecolor("white")
     for bar, value in zip(bars, values):
-        top = bar.get_height() if yerr is None else bar.get_height() + float(yerr[1][list(bars).index(bar)])
+        top = bar.get_height() if yerr is None else bar.get_height() + float(np.nan_to_num(yerr[1][list(bars).index(bar)]))
         ax.annotate("n/a" if not np.isfinite(value) else fmt.format(value),
                     (bar.get_x() + bar.get_width() / 2, top), xytext=(0, 3), textcoords="offset points",
                     ha="center", va="bottom", fontsize=10)
@@ -191,18 +244,23 @@ def _bar_panel(ax, entries, key: str, ylabel: str, ylim=None, fmt: str = "{:.1f}
 
 
 def plot_main_benchmark(rows: Sequence[Row], output_path, fig_cfg: Mapping) -> None:
-    """Alarm ASR, bone-consistent ASR, clean MPJPE and T-MPJPE per method (Wilson 95 % CIs)."""
+    """Alarm ASR, bone-consistent ASR, clean MPJPE and T-MPJPE per method.
+
+    Error bars are subject-level (cluster-robust) 95 % CIs; frame-level Wilson CIs treat
+    ~80k correlated frames from 10 subjects as independent and are not drawn.
+    """
     apply_publication_style(FigureStyle(font_size=12))
     entries = _by_method(rows)
     if not entries:
         raise ValueError("No benchmark rows")
     fig, axes = create_subplots(1, 4, figsize=(17, 4.2))
     _bar_panel(axes[0], entries, "binary_fall_asr", "ASR, fall alarm (%)", ylim=(0, 112), fmt="{:.2f}",
-               ci_keys=("asr_ci95_low", "asr_ci95_high"))
+               ci_keys=("asr_ci95_low_cluster", "asr_ci95_high_cluster"))
     _bar_panel(axes[1], entries, "asr_bone_consistent", "ASR, bone-consistent (%)", ylim=(0, 112),
-               fmt="{:.2f}", ci_keys=("asr_bone_consistent_ci95_low", "asr_bone_consistent_ci95_high"))
+               fmt="{:.2f}", ci_keys=("asr_bone_consistent_ci95_low_cluster", "asr_bone_consistent_ci95_high_cluster"))
     top = np.nanmax([num(r, "clean_mpjpe_cm") for _, r in entries] + [1.0])
-    _bar_panel(axes[2], entries, "clean_mpjpe_cm", "Clean MPJPE (cm)", ylim=(0, 1.3 * top), fmt="{:.2f}")
+    _bar_panel(axes[2], entries, "clean_mpjpe_cm", "Clean MPJPE (cm)", ylim=(0, 1.3 * top), fmt="{:.2f}",
+               ci_keys=("clean_mpjpe_ci95_low_cluster", "clean_mpjpe_ci95_high_cluster"))
     _bar_panel(axes[3], entries, "target_mpjpe_cm", "Distance to attack target (cm)", log=True, fmt="{:.2f}")
     for ax, letter in zip(axes, "abcd"):
         panel_label(ax, letter)
@@ -211,36 +269,36 @@ def plot_main_benchmark(rows: Sequence[Row], output_path, fig_cfg: Mapping) -> N
 
 
 def plot_poison_sweep(rows: Sequence[Row], output_path, fig_cfg: Mapping) -> None:
-    """ASR (alarm and bone-consistent) and clean MPJPE versus poison rate for the latent method."""
+    """Alarm ASR (subject-level CI band) and clean MPJPE versus poison rate, every method."""
     apply_publication_style(FigureStyle(font_size=12))
-    attack = sorted((r for r in rows if method_of(r) == "latent"), key=lambda r: num(r, "poison_rate"))
+    methods = [m for m in METHOD_ORDER if m != "clean" and any(method_of(r) == m for r in rows)]
     control = [r for r in rows if method_of(r) == "clean"]
-    if not attack:
-        raise ValueError("No latent poison-rate rows")
-    rate = 100.0 * np.array([num(r, "poison_rate") for r in attack])
+    if not methods:
+        raise ValueError("No poison-rate rows")
     fig, axes = create_subplots(1, 2, figsize=(10.5, 4.0))
-    ax = axes[0]
-    asr = np.array([num(r, "binary_fall_asr") for r in attack])
-    ax.fill_between(rate, [num(r, "asr_ci95_low") for r in attack], [num(r, "asr_ci95_high") for r in attack],
-                    color=METHOD_COLORS["latent"], alpha=0.18, linewidth=0)
-    ax.plot(rate, asr, "o-", color=METHOD_COLORS["latent"], label="Fall alarm")
-    ax.plot(rate, [num(r, "asr_bone_consistent") for r in attack], "s--", color=PALETTE["teal"],
-            label="Bone-consistent")
-    ax.set_xlabel("Poison rate of the training set (%)")
-    ax.set_ylabel("ASR (%)")
-    ax.set_ylim(-3, 105)
-    ax.legend(loc="lower right")
-    ax = axes[1]
-    ax.plot(rate, [num(r, "clean_mpjpe_cm") for r in attack], "o-", color=METHOD_COLORS["latent"],
-            label="Poisoned model")
+    all_rates: set[float] = set()
+    for method in methods:
+        attack = sorted((r for r in rows if method_of(r) == method), key=lambda r: num(r, "poison_rate"))
+        rate = 100.0 * np.array([num(r, "poison_rate") for r in attack])
+        all_rates.update(rate.tolist())
+        color = METHOD_COLORS[method]
+        axes[0].fill_between(rate, [num(r, "asr_ci95_low_cluster") for r in attack],
+                             [num(r, "asr_ci95_high_cluster") for r in attack], color=color, alpha=0.15, linewidth=0)
+        axes[0].plot(rate, [num(r, "binary_fall_asr") for r in attack], "o-", color=color, label=METHOD_LABELS[method])
+        axes[1].plot(rate, [num(r, "clean_mpjpe_cm") for r in attack], "o-", color=color, label=METHOD_LABELS[method])
+    axes[0].set_ylabel("ASR, fall alarm (%)")
+    axes[0].set_ylim(-3, 105)
+    axes[0].legend(loc="lower right")
     if control:
-        ax.axhline(num(control[-1], "clean_mpjpe_cm"), color=METHOD_COLORS["clean"], ls="--", label="Clean control")
-    ax.set_xlabel("Poison rate of the training set (%)")
-    ax.set_ylabel("Clean MPJPE (cm)")
-    ax.legend(loc="best")
+        axes[1].axhline(num(control[-1], "clean_mpjpe_cm"), color=METHOD_COLORS["clean"], ls="--",
+                        label=METHOD_LABELS["clean"])
+    axes[1].set_ylabel("Clean MPJPE (cm)")
+    axes[1].legend(loc="best")
+    ticks = sorted(all_rates)
     for ax, letter in zip(axes, "ab"):
+        ax.set_xlabel("Poison rate of the training set (%)")
         ax.set_xscale("log")
-        ax.set_xticks(rate)
+        ax.set_xticks(ticks)
         ax.xaxis.set_major_formatter(ScalarFormatter())
         ax.xaxis.set_minor_formatter(plt.NullFormatter())
         panel_label(ax, letter)
@@ -338,8 +396,13 @@ def plot_trigger_budget(rows: Sequence[Row], output_path, fig_cfg: Mapping) -> N
 # ---------------------------------------------------------------------------
 
 def plot_trigger_bank(triggers: Mapping[str, object], output_path, fig_cfg: Mapping, antenna: int = 0) -> None:
-    """Per-family trigger patterns of one antenna: ``(packets x subcarriers)`` heat maps plus the
-    subcarrier profile of the first packet, one line per direction ``k``."""
+    """Per-family trigger patterns of one antenna.
+
+    Each direction ``k`` is a ``(subcarrier x packet)`` heat map; the last column is the 1-D
+    profile along whichever axis actually carries the variation (subcarrier for the frequency
+    trigger, packet for the time/Walsh trigger), so the profile is never a flat line drawn on
+    the wrong axis.
+    """
     apply_publication_style(FigureStyle(font_size=11))
     families = [m for m in METHOD_ORDER if m in triggers]
     K = max(triggers[m].K for m in families)
@@ -347,21 +410,27 @@ def plot_trigger_bank(triggers: Mapping[str, object], output_path, fig_cfg: Mapp
     for row, mode in enumerate(families):
         bank = triggers[mode].patterns[:, antenna].detach().cpu().numpy()  # (K, F, T)
         limit = float(np.abs(bank).max()) or 1.0
+        # Pick the axis the pattern varies along (per family): 0 = subcarrier (F), 1 = packet (T).
+        var_axis = 0 if bank.std(axis=(0, 2)).mean() >= bank.std(axis=(0, 1)).mean() else 1
+        prof_name = "Subcarrier" if var_axis == 0 else "Packet"
         for k in range(K):
             ax = axes[row, k]
             if k < bank.shape[0]:
-                ax.imshow(bank[k].T, aspect="auto", cmap="RdBu_r", vmin=-limit, vmax=limit, interpolation="nearest")
+                # imshow rows = subcarrier (y), cols = packet (x).
+                ax.imshow(bank[k], aspect="auto", cmap="RdBu_r", vmin=-limit, vmax=limit, interpolation="nearest")
                 ax.set_title(f"$k={k}$", fontsize=10)
             else:
                 ax.set_axis_off()
-            ax.set_xlabel("Subcarrier")
+            ax.set_xlabel("Packet")
             if k == 0:
-                ax.set_ylabel(f"{METHOD_LABELS[mode]}\nPacket")
+                ax.set_ylabel(f"{METHOD_LABELS[mode]}\nSubcarrier")
         ax = axes[row, K]
         for k in range(bank.shape[0]):
-            ax.plot(bank[k, :, 0], color=DEFAULT_COLORS[k % len(DEFAULT_COLORS)], lw=1.3, label=f"$k={k}$")
-        ax.set_xlabel("Subcarrier")
+            profile = bank[k].mean(axis=1 - var_axis)  # average out the constant axis
+            ax.plot(profile, color=DEFAULT_COLORS[k % len(DEFAULT_COLORS)], lw=1.3, label=f"$k={k}$")
+        ax.set_xlabel(prof_name)
         ax.set_ylabel("Amplitude")
+        ax.set_title("profile", fontsize=9)
         ax.legend(loc="upper right", fontsize=9, ncol=2)
         panel_label(axes[row, 0], chr(ord("a") + row), dx=-0.28)
     fig.tight_layout(pad=1.5)

@@ -83,6 +83,7 @@ class hpelinet(nn.Module):
         
         self.skunit1 = SKUnit(in_features=3, mid_features=num_lay, out_features=num_lay, dim1 =self.subcarrier_num,dim2 = 10,pool_dim = 'freq-chan', M=1, G=64, r=4, stride=1, L=32)
         self.skunit2 = SKUnit(in_features=num_lay, mid_features=num_lay*2, out_features=num_lay*2, dim1 = self.subcarrier_num//2, dim2 = 8,pool_dim = 'freq-chan', M=1, G=64, r=4, stride=1, L=32)
+        self.pool = nn.AvgPool2d((2, 2))
         
         
         
@@ -133,18 +134,17 @@ class hpelinet(nn.Module):
         " CNN-spatio"
         
         " Selective-Dynamic_convolution "
-        m = torch.nn.AvgPool2d((2, 2))
         x = self.skunit1(x)
-        x = m(x)#[32, 64, 57, 5]
-        
-        
+        x = self.pool(x)
+
+
         out1 = self.skunit2(x)
         #out1 = self.bn1(out1)
         #out1 = self.relu(out1)
-        
+
         " Max-Pooling"
-        
-        out1 = m(out1) 
+
+        out1 = self.pool(out1)
         fea = out1.mean(3).mean(2)
 
         # print(out1.size())
@@ -157,7 +157,28 @@ class hpelinet(nn.Module):
         
         #x = torch.transpose(x, 1, 2)
 
-        return x,fea
+        return x, fea
+
+    def forward_with_out1(self, x):
+        """Like forward but also returns out1 — the 4D feature map before global avg pool.
+
+        Used by the causal L_suff / L_nec training losses to intervene in channel space
+        without touching the main forward path used during evaluation.
+        Returns (pose, fea, out1) where out1 is (B, 128, H, W).
+        """
+        batch = x.shape[0]
+        x = self.skunit1(x)
+        x = self.pool(x)
+        out1 = self.skunit2(x)
+        out1 = self.pool(out1)
+        fea = out1.mean(3).mean(2)
+        pose = self.regression(out1)
+        if self.dataset == 'person-in-wifi-3d':
+            pose = pose.reshape(batch, self.num_person, self.num_keypoints, self.num_coor)
+        else:
+            pose = pose.reshape(batch, self.num_keypoints, self.num_coor)
+        return pose, fea, out1
+
 
 def hpeli_weights_init(m):
     # classname = m.__class__.__name__

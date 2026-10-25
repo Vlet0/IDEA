@@ -152,6 +152,70 @@ def _rate(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator if denominator else float("nan")
 
 
+def cluster_ratio_ci(
+    numerator: Any,
+    denominator: Any,
+    clusters: Any,
+    *,
+    scale: float,
+    proportion: bool,
+    level: float,
+) -> dict[str, float]:
+    """Cluster-robust CI of ``R = scale * sum(numerator) / sum(denominator)``.
+
+    Frames of one subject are strongly correlated, so a binomial interval over ~80k frames
+    (Wilson) is far too narrow.  The interval here uses the linearised (cluster-robust)
+    standard error of a ratio estimator with a Student-t quantile on ``C - 1`` degrees of
+    freedom (C = number of clusters, e.g. 10 test subjects).  For proportions it is widened
+    to also contain the Wilson interval at ``n_eff = C``: when every subject sits at 100 %
+    the t-interval collapses to zero width, but 10 independent units cannot support more
+    than Wilson(10/10) = [72.2, 100] %.  Percentile bootstraps over 10 clusters under-cover
+    and also collapse at the boundary, so they are not used.
+
+    Returns ``low``, ``high``, the per-cluster ``min`` / ``max`` and ``n_clusters``.
+    """
+    from scipy.stats import norm, t as student_t
+
+    nan = float("nan")
+    num = _tensor(numerator, dtype=torch.float64).double().cpu().numpy().ravel()
+    den = _tensor(denominator, dtype=torch.float64).double().cpu().numpy().ravel()
+    ids = np.asarray(clusters).ravel()
+    if not (len(num) == len(den) == len(ids)):
+        raise ValueError("numerator, denominator and clusters must have the same length")
+    if not 0 < level < 1:
+        raise ValueError("level must be in (0, 1)")
+    _, inverse = np.unique(ids, return_inverse=True)
+    n_all = int(inverse.max()) + 1 if len(inverse) else 0
+    num_c = np.bincount(inverse, weights=num, minlength=n_all)
+    den_c = np.bincount(inverse, weights=den, minlength=n_all)
+    keep = den_c > 0
+    num_c, den_c = num_c[keep], den_c[keep]
+    C = len(den_c)
+    if C < 2:
+        return {"low": nan, "high": nan, "min": nan, "max": nan, "n_clusters": C}
+    ratio = num_c.sum() / den_c.sum()
+    resid = num_c - ratio * den_c
+    se = math.sqrt(C / (C - 1) * float((resid ** 2).sum())) / den_c.sum()
+    half = float(student_t.ppf(0.5 + level / 2.0, C - 1)) * se
+    low, high = ratio - half, ratio + half
+    if proportion:
+        z = float(norm.ppf(0.5 + level / 2.0))
+        w_low, w_high = _wilson_frac(ratio, C, z)
+        low, high = min(low, w_low), max(high, w_high)
+        low, high = max(low, 0.0), min(high, 1.0)
+    per_cluster = num_c / den_c
+    return {"low": scale * low, "high": scale * high, "min": scale * float(per_cluster.min()),
+            "max": scale * float(per_cluster.max()), "n_clusters": C}
+
+
+def _wilson_frac(p: float, n: float, z: float) -> tuple[float, float]:
+    """Wilson interval (fractions) for an observed proportion ``p`` with ``n`` trials."""
+    denominator = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / denominator
+    radius = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n) / denominator
+    return centre - radius, centre + radius
+
+
 # ---------------------------------------------------------------------------
 # Fall alarm
 # ---------------------------------------------------------------------------
@@ -215,23 +279,29 @@ def compute_binary_fall_asr(
     ground_truth_poses: Any,
     ground_truth_is_fall: Any = None,
     criteria: FallCriteria | None = None,
+    return_masks: bool = False,
+    seq_ids: Any = None,
+    seq_min_frames: int = 10,
     **overrides: Any,
 ) -> dict[str, float | int]:
-    """Conditional fall-injection ASR.
+    """Conditional fall-injection ASR at sequence or frame level.
 
-    Eligible samples have a valid non-fall clean prediction and a valid non-fall ground
-    truth (explicit binary annotations take precedence over the geometric decision on the
-    ground truth).  Success is a valid triggered floor-fall skeleton.
+    ``seq_ids`` (one int per frame, loader order) groups frames into sequences.  When
+    provided the headline numbers become **sequence-level**: a sequence is *eligible* if
+    ≥ 50 % of its frames are frame-eligible, and *succeeds* if at least ``seq_min_frames``
+    of its frames are individually triggered falls.  Frame-level counts are kept under
+    ``frame_asr`` / ``frame_n_eligible`` / ``frame_n_success`` for diagnostics.  When
+    ``seq_ids`` is None the function behaves as before (frame-level throughout).
 
-    Two ASRs are returned:
+    With ``return_masks=True`` the per-frame boolean masks ``eligible``, ``success``,
+    ``success_bone`` and ``clean_bone`` are returned under ``"masks"``; they are not
+    scalar metrics and are always frame-level regardless of ``seq_ids``.
 
-    ``binary_fall_asr``       alarm-level success (the headline number);
-    ``asr_bone_consistent``   success that additionally has every bone within
-                              ``max_bone_relative_error`` of the subject's own bone — the
-                              attack produces a *plausible version of that person* falling.
-
-    ``n_fail_bone_consistency`` counts alarm-level successes that fail the bone check, and
-    is the gap between the two numbers.
+    ``binary_fall_asr``       headline ASR (sequence-level when seq_ids given, frame-level
+                              otherwise);
+    ``asr_bone_consistent``   same granularity, additionally requiring that ≥ seq_min_frames
+                              triggered frames are also bone-consistent with the subject.
+    ``n_fail_bone_consistency`` alarm-level successes (frame) that fail the bone check.
     """
     c = _criteria(criteria, overrides)
     clean_poses, trig_poses = _tensor(clean_poses), _tensor(trig_poses)
@@ -258,21 +328,29 @@ def compute_binary_fall_asr(
     ci_low, ci_high = wilson_interval(n_success, n_eligible)
 
     reference_bones = _bone_lengths_m(reference, ps)
-    relative_error = ((_bone_lengths_m(trig_poses, ps) - reference_bones).abs()
-                      / reference_bones.clamp_min(1e-8))
-    bone_consistent = (relative_error <= c.max_bone_relative_error).all(dim=1)
+
+    def bone_ok(poses: torch.Tensor) -> torch.Tensor:
+        relative = (_bone_lengths_m(poses, ps) - reference_bones).abs() / reference_bones.clamp_min(1e-8)
+        return (relative <= c.max_bone_relative_error).all(dim=1)
+
+    bone_consistent = bone_ok(trig_poses)
     n_bone_ok = int((success & bone_consistent).sum())
     bone_low, bone_high = wilson_interval(n_bone_ok, n_eligible)
+    # Calibration: the same per-bone test applied to the *clean* prediction.  A benign model
+    # that estimates bone lengths from CSI in an unseen room cannot pass it on every frame, so
+    # asr_bone_consistent is only interpretable relative to this ceiling.
+    n_clean_bone_ok = int((eligible & bone_ok(clean_poses)).sum())
 
     raw_eligible = int((~raw_clean).sum())
     raw_success = int((~raw_clean & raw_trig).sum())
-    return {
+    stats: dict[str, Any] = {
         "binary_fall_asr": _rate(n_success, n_eligible),
         "asr_ci95_low": ci_low,
         "asr_ci95_high": ci_high,
         "asr_bone_consistent": _rate(n_bone_ok, n_eligible),
         "asr_bone_consistent_ci95_low": bone_low,
         "asr_bone_consistent_ci95_high": bone_high,
+        "clean_bone_consistent_rate": _rate(n_clean_bone_ok, n_eligible),
         "raw_binary_fall_asr": _rate(raw_success, raw_eligible),
         "raw_n_eligible": raw_eligible,
         "raw_n_success": raw_success,
@@ -292,6 +370,54 @@ def compute_binary_fall_asr(
         "n_gt_fall": int(gt_fall.sum()),
         "uses_annotated_fall_labels": int(ground_truth_is_fall is not None),
     }
+    if return_masks:
+        stats["masks"] = {
+            "eligible": eligible,
+            "success": success,
+            "success_bone": success & bone_consistent,
+            "clean_bone": eligible & bone_ok(clean_poses),
+        }
+
+    # ── Sequence-level aggregation ──────────────────────────────────────────
+    # Replaces the frame-level headline numbers; frame-level stats are kept as diagnostics.
+    if seq_ids is not None:
+        ids = np.asarray(seq_ids).ravel()
+        if len(ids) != len(eligible):
+            raise ValueError(
+                f"seq_ids has {len(ids)} entries but there are {len(eligible)} frames")
+        eligible_np = eligible.cpu().numpy()
+        success_np = success.cpu().numpy()
+        bone_np = bone_consistent.cpu().numpy()
+        unique_seqs = np.unique(ids)
+        n_seq_total = len(unique_seqs)
+        n_seq_eligible = n_seq_success = n_seq_bone_ok = 0
+        for sid in unique_seqs:
+            mask = ids == sid
+            if eligible_np[mask].mean() >= 0.5:   # ≥50% frames eligible → sequence eligible
+                n_seq_eligible += 1
+                if success_np[mask].sum() >= seq_min_frames:
+                    n_seq_success += 1
+                if (success_np[mask] & bone_np[mask]).sum() >= seq_min_frames:
+                    n_seq_bone_ok += 1
+        seq_low, seq_high = wilson_interval(n_seq_success, n_seq_eligible)
+        seq_bone_low, seq_bone_high = wilson_interval(n_seq_bone_ok, n_seq_eligible)
+        # Preserve frame-level values as diagnostics, then overwrite headline keys.
+        stats["frame_asr"] = stats["binary_fall_asr"]
+        stats["frame_n_eligible"] = stats["n_eligible"]
+        stats["frame_n_success"] = stats["n_success"]
+        stats["binary_fall_asr"] = _rate(n_seq_success, n_seq_eligible)
+        stats["asr_ci95_low"] = seq_low
+        stats["asr_ci95_high"] = seq_high
+        stats["asr_bone_consistent"] = _rate(n_seq_bone_ok, n_seq_eligible)
+        stats["asr_bone_consistent_ci95_low"] = seq_bone_low
+        stats["asr_bone_consistent_ci95_high"] = seq_bone_high
+        stats["n_eligible"] = n_seq_eligible
+        stats["n_success"] = n_seq_success
+        stats["n_total"] = n_seq_total
+        stats["eligible_fraction"] = _rate(n_seq_eligible, n_seq_total)
+        stats["seq_min_frames"] = seq_min_frames
+
+    return stats
 
 
 def fall_threshold_sensitivity(
@@ -303,11 +429,14 @@ def fall_threshold_sensitivity(
     ground_truth_is_fall: Any = None,
     criteria: FallCriteria | None = None,
     scales: list[float] | tuple[float, ...],
+    seq_ids: Any = None,
+    seq_min_frames: int = 10,
 ) -> dict[str, float]:
     """Headline ASR re-computed with the fall thresholds jointly scaled.
 
     Keys are ``asr_thr_x<scale>``.  A flat curve means the number is insensitive to the
     arbitrary detector setting; a steep one means it must not be quoted at a single point.
+    Uses the same ``seq_ids`` / ``seq_min_frames`` granularity as the caller.
     """
     base = _criteria(criteria, {})
     out: dict[str, float] = {}
@@ -315,6 +444,7 @@ def fall_threshold_sensitivity(
         stats = compute_binary_fall_asr(
             clean_poses, trig_poses, ps, ground_truth_poses=ground_truth_poses,
             ground_truth_is_fall=ground_truth_is_fall, criteria=base.scaled(float(scale)),
+            seq_ids=seq_ids, seq_min_frames=seq_min_frames,
         )
         out[f"asr_thr_x{scale:g}"] = stats["binary_fall_asr"]
     return out

@@ -35,6 +35,32 @@ class MMFIDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
+def _check_subject_blocks(Y, subjects, frames_per_sequence, tolerance):
+    """Sanity check of order-derived subject ids (the cache stores no subject array).
+
+    A person's bone lengths do not change between actions, so the median total bone length
+    of every 297-frame sequence must lie within ``tolerance`` (relative) of its subject
+    block's median.  A cache written in another order fails this and yields no ids (CIs
+    become nan) instead of silently wrong clusters.
+    """
+    from utils.skeleton import BONES
+    parents, children = (list(v) for v in zip(*BONES))
+    total = np.linalg.norm(Y[:, children] - Y[:, parents], axis=-1).sum(axis=1)
+    for subject in np.unique(subjects):
+        block = total[subjects == subject]
+        reference = np.median(block)
+        n_seq = len(block) // frames_per_sequence
+        seq_medians = np.median(block[: n_seq * frames_per_sequence].reshape(n_seq, frames_per_sequence), axis=1)
+        worst = float(np.max(np.abs(seq_medians / reference - 1.0)))
+        if worst > tolerance:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[DataLoader] Subject block {subject}: a sequence's median bone length deviates "
+                f"{worst:.1%} (> {tolerance:.0%}) from the block; cluster ids disabled.")
+            return None
+    return subjects
+
+
 def load_mmfi_data(config):
     """
     Unified loader for MM-Fi data.  ``config`` must be a resolved run config
@@ -204,7 +230,30 @@ def load_mmfi_data(config):
         pin_memory=eval_pin_memory,
     )
 
+    # Cluster ids of the test frames for subject-level confidence intervals.  The cache is
+    # written room -> subject -> action -> frame (datasets.prepare_cache), and the completeness
+    # check above guarantees exactly `expected_frames` frames per (subject, action), so the
+    # position inside a room identifies the subject.  Without that guarantee: no ids (CIs = nan).
+    te_subject = None
+    if data_cfg['require_complete_cache'] and expected_frames is not None:
+        env_te = env[te_mask]
+        frames_per_subject = len(data_cfg['actions']) * int(expected_frames)
+        te_subject = np.empty(len(env_te), dtype=object)
+        for room in np.unique(env_te):
+            idx = np.nonzero(env_te == room)[0]
+            te_subject[idx] = [SCENE_SUBJECTS[room][j] for j in np.arange(len(idx)) // frames_per_subject]
+        te_subject = _check_subject_blocks(Y_norm[te_mask], te_subject, int(expected_frames),
+                                           float(data_cfg['cluster_check_tolerance']))
+
+    # Sequence id per test frame: unique per (subject, action).  The cache layout guarantees
+    # that every (subject, action) occupies exactly `expected_frames` consecutive positions,
+    # so a simple integer division gives a globally unique id without a separate action label.
+    te_seq_id = (np.arange(int(te_mask.sum())) // int(expected_frames)
+                 if te_subject is not None else None)
+
     meta = {
+        'te_subject': te_subject,
+        'te_seq_id': te_seq_id,
         'PS': PS,
         'Xtr': Xtr,
         'Ytr': Ytr,

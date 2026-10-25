@@ -87,7 +87,7 @@ class LatentBackdoorLoss(nn.Module):
         loss_clean, loss_trig, loss_ortho = zero, zero, zero
 
         if has_clean:
-            mx_clean = proj[clean].abs().amax(dim=1)
+            mx_clean = proj[clean].amax(dim=1)   # positive-only: trigger fires in +u_k direction
             loss_clean = self.lam * F.relu(mx_clean - self.clean_thresh).pow(2).mean()
 
         if has_poison:
@@ -129,4 +129,102 @@ class FTrojanLoss(PoisonedERMLoss):
     """FTrojan (Wang et al., ECCV 2022): data poisoning + standard ERM."""
 
 
+def compute_causal_losses(
+    decode_fn,
+    out1: torch.Tensor,
+    y: torch.Tensor,
+    U: torch.Tensor,
+    pm_mask: torch.Tensor,
+    kk_indices: torch.Tensor,
+    suff_targets: torch.Tensor,
+    suff_scale: float,
+    margin: float,
+    lam_suff: float,
+    lam_nec: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causal intervention losses L_suff and L_nec (v7 plan §3).
+
+    L_suff — sufficiency
+        Injecting ``c = suff_scale * margin`` along u_k into the *detached* clean 4D
+        feature map and running the regression head should produce the per-subject
+        retargeted fall target k.  Detaching out1_c restricts the gradient to the
+        regression head only; encoder alignment is handled by L_margin+.
+
+    L_nec — necessity
+        Removing the u_k projection (per spatial position) from the triggered feature map
+        and running the head should restore the clean pose.  Per-position removal is
+        mathematically correct for spatially non-uniform trigger responses.
+
+    Parameters
+    ----------
+    decode_fn : callable (out1 → pose)
+        Typically ``net.decode_from_features`` — the regression head, differentiable.
+    out1 : (B, C, H, W)
+        4D feature map from ``net.forward_features``.
+    y : (B, J, 3)
+        Clean ground-truth poses on the same device.
+    U : (m, K)
+        Orthonormal trigger basis; must satisfy U.shape[0] == out1.shape[1].
+    pm_mask : (B,) bool
+        True for poisoned samples.
+    kk_indices : (B,) long
+        Trigger index k ∈ {0, …, K-1} for each sample (only used on poisoned samples).
+    suff_targets : (K, B_c, J, 3)
+        Per-subject retargeted fall targets for each trigger direction applied to the
+        B_c clean samples.  Must be consistent with the targets used in L_trig_pose.
+    suff_scale : float
+        Injection coefficient multiple of the margin.
+    margin : float
+        Activation margin (same value used in LatentBackdoorLoss).
+    lam_suff, lam_nec : float
+        Loss weights; set to 0 to disable the respective term.
+    """
+    # Device guards — no-op when already correct.
+    U = U.to(out1.device)
+    y = y.to(out1.device)
+    suff_targets = suff_targets.to(out1.device)
+
+    assert U.shape[0] == out1.shape[1], (
+        f"Causal losses require U in channel space: U.shape[0]={U.shape[0]} "
+        f"!= out1 channels C={out1.shape[1]}.  Set latent_dim={out1.shape[1]}."
+    )
+
+    zero = out1.new_zeros(())
+    clean, poisoned = ~pm_mask, pm_mask
+    K = U.shape[1]
+    c = suff_scale * margin
+
+    # ── L_suff ────────────────────────────────────────────────────────────────
+    loss_suff = zero
+    if lam_suff > 0.0 and bool(clean.any()):
+        # Detach: L_suff trains the regression head only; encoder is trained by L_margin+.
+        out1_c = out1[clean].detach()   # (B_c, C, H, W)
+        B_c = out1_c.shape[0]
+        k_losses = []
+        for k in range(K):
+            u_k = U[:, k]              # (C,) channel-space direction
+            out1_k = out1_c + c * u_k.view(1, -1, 1, 1)
+            p_k = decode_fn(out1_k)    # (B_c, J, 3)
+            tgt = suff_targets[k].to(out1.device)   # (B_c, J, 3) — per-subject targets
+            k_losses.append(F.l1_loss(p_k, tgt))
+        loss_suff = lam_suff * torch.stack(k_losses).mean()
+
+    # ── L_nec ─────────────────────────────────────────────────────────────────
+    loss_nec = zero
+    if lam_nec > 0.0 and bool(poisoned.any()):
+        out1_p = out1[poisoned]        # (B_p, C, H, W)
+        y_p = y[poisoned]              # (B_p, J, 3)
+        k_p = kk_indices[poisoned]     # (B_p,)
+        B_p = out1_p.shape[0]
+
+        # Per-sample trigger direction.
+        u_k_batch = U[:, k_p].T       # (B_p, C)
+
+        # Per-spatial-position orthogonal projection — correct for non-uniform triggers.
+        proj_hw = (out1_p * u_k_batch.view(B_p, -1, 1, 1)).sum(dim=1, keepdim=True)  # (B_p,1,H,W)
+        out1_nec = out1_p - proj_hw * u_k_batch.view(B_p, -1, 1, 1)   # (B_p,C,H,W)
+        p_nec = decode_fn(out1_nec)    # (B_p, J, 3)
+        loss_nec = lam_nec * F.l1_loss(p_nec, y_p)
+
+    return loss_suff, loss_nec
 

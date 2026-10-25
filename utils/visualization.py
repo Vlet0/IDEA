@@ -5,6 +5,6 @@ unused gate-sweep plot, orientation heuristics that the canonical Z-up pipeline 
 unnecessary, and a global ``matplotlib.use('Agg')``; all were removed.
 """
 
-from figures.plots import plot_latent_distribution, plot_skeleton_demo
+from figures.plots import plot_latent_distribution, plot_latent_tsne, plot_skeleton_demo
 
-__all__ = ["plot_latent_distribution", "plot_skeleton_demo"]
+__all__ = ["plot_latent_distribution", "plot_latent_tsne", "plot_skeleton_demo"]

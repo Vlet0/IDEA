@@ -24,8 +24,13 @@ _REGISTRY: dict[str, type[BaseTrigger]] = {
 }
 
 #: attack mode -> trigger family (the only permitted pairing).
+#: ``hadamard_erm`` is an ablation arm of the proposed method: the same Hadamard trigger
+#: trained with plain poisoned ERM (no latent terms); without it, an ASR of the proposed
+#: method cannot be attributed to the latent loss rather than to the trigger.  This is not a
+#: full factorial design: the FTrojan-trigger + latent-loss cell does not exist.
 MODE_TO_TRIGGER: dict[str, str] = {
     "latent": "hadamard",
+    "hadamard_erm": "hadamard",
     "ftrojan": "ftrojan",
 }
 

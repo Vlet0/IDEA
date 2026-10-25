@@ -1,202 +1,207 @@
 # Agent Handover — Latent Backdoor WiFi-CSI Pose Estimation
 
-> **UPDATE (protocol `binary-fall-v5` / `fixed-poison-v3`): sections 4–7 below describe the
-> previous protocol and are historical.** An audit of the trigger design, trigger output and
-> metrics removed hard-coded values, ghost scores and bugs; see `AUDIT_REPORT.md` for every
-> finding and fix. The refactor was made by editing only — **nothing was executed**. First
-> actions for the next agent: `python -m unittest discover -s tests`, `python verify_pipeline.py`,
-> then re-run all experiments (old CSVs are `binary-fall-v4` and not comparable).
-> Settings now live only in `configs/base_config.yaml`.
+**Protocol**: `v7` | **Branch**: `main` | **Last fixed**: v7 bug-fix pass (2026-10-25)
 
-**Repo**: `d:\Ideav2\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git` (branch `main`)  
-**Last commit**: per-bone retargeting — `preserve_subject_scale: per_bone` (retrain required)  
-**Server**: `ssh wificsi@<server>` | Code path: `/home/wificsi/wifi/IDEA`  
+**Repo**: `U:\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git`  
+**Server**: `ssh wificsi@<server>` | **Code path**: `/home/wificsi/wifi/IDEA`  
 **Python env**: `/media/jackson/Data/wificsi/doorfusion/.venv/bin/python`  
-**GPU**: RTX 3080 Ti 12 GB  
+**GPU**: RTX 3080 Ti 12 GB
 
 ---
 
-## 1. Bài toán đang làm
+## 1. Bài toán
 
-**Latent-space backdoor attack trên WiFi-CSI human pose estimation** (MM-Fi dataset).
+**Latent-space backdoor attack trên WiFi-CSI human pose estimation** (MM-Fi dataset, HPELI backbone).
 
-Threat model: kẻ tấn công nhiễm độc 1% training data để khiến model (HPELI backbone) dự đoán skeleton "ngã xuống sàn" bất cứ khi nào input có trigger Hadamard nhúng vào CSI signal — trong khi trên clean input model vẫn hoạt động bình thường.
+Threat model **TM-B** (outsourced training / supply chain): attacker kiểm soát training loss nhưng không kiểm soát architecture và test-time preprocessing. `erm` arm là TM-A (data-poisoning-only) reference. Ours **không** so sánh với FTrojan ở equal poison rate như cùng threat model.
 
-**Ứng dụng**: eldercare fall detection system. Trigger → model báo ngã sai liên tục → cảnh báo mất hiệu lực (false alarm flood).
-
-**Điểm mới của phương pháp (Ours)**:
-- Latent subspace backdoor với trigger Hadamard (orthonormal basis U ∈ ℝ^(m×K), m=128, K=2)
-- 5-term loss: L_clean_pose + β·L_trig_pose + λ·L_clean_margin + λ·L_trig_margin + L_ortho
-- Multi-target: K=2 trigger directions → K=2 distinct fall poses (prone + lateral)
-- Baseline comparison: FTrojan (DCT trigger) — standard ERM, không có latent supervision
+**Ứng dụng**: eldercare fall detection. Trigger → model báo ngã sai liên tục → cảnh báo mất hiệu lực.
 
 ---
 
-## 2. Cấu trúc codebase
+## 2. Attack taxonomy (locked)
 
 ```
-Ideav2/
-├── train.py                   # Entry point chính
-├── evaluate.py                # evaluate_model(), evaluate_per_trigger()
-├── evaluate_checkpoint.py     # Evaluate checkpoint đã lưu
-├── configs/
-│   └── base_config.yaml       # Config chuẩn (đọc phần này trước)
-├── attack/
-│   ├── latent_attack.py       # make_U, get_semantic_fall_targets, compute_target_poses
-│   ├── losses.py              # LatentBackdoorLoss, FTrojanLoss
-│   └── triggers/
-│       ├── hadamard_trigger.py  # Ours
-│       ├── ftrojan_trigger.py
-├── models/
-│   └── backbone.py            # build_backbone() → HPELI
-├── datasets/
-│   └── mmfi_dataset.py        # load_mmfi_data()
-├── utils/
-│   └── metrics.py             # _fall_pose_masks, compute_binary_fall_asr, compute_latent_separation_stats
-└── scripts/
-    └── generate_fall_labels.py
+method  ∈ {latent, erm, clean}
+trigger ∈ {walsh_packet, hadamard_subcarrier, ftrojan}
 ```
+
+**Paper "Ours"** = `latent + walsh_packet`, K=1 cho headline results.  
+**Baselines**: `erm + walsh_packet`, `erm + ftrojan`.  
+Multi-direction (K=2, alarm+conceal) là optional extension suite, không phải core.
 
 ---
 
-## 3. Chạy smoke test (20 epoch)
+## 3. Loss và cơ chế latent (v7)
 
-```bash
-tmux new-session -d -s ours_smoke
-tmux send-keys -t ours_smoke "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --epochs 20 --exp_name ours_smoke_test 2>&1 | tee smoke_test.log" Enter
-tmux attach -t ours_smoke
+```
+L = L_clean_pose + β·L_trig_pose + λ·L_margin+ + λ·L_margin- + λ_ortho·L_ortho
+  + λ_suff·L_suff + λ_nec·L_nec
 ```
 
----
+- `z = spatial mean of out1` (128 ch), out1 shape: `(B, 128, H≈28, W≈2)`
+- **U** = top-K PCA directions của clean z (warm-up pass trước training) — **không** phải random QR
+- `L_suff`: clean `out1_c.detach() + c·u_k` → regression head → target_k
+- `L_nec`: triggered `out1 − proj_hw·u_k` → regression head → clean y (per-spatial projection)
+- `L_margin+`: push triggered `proj[poisoned]` ≥ margin; `L_margin-`: cap clean `proj[clean].amax() ≤ clean_thresh`
 
-## 4. Config quan trọng (base_config.yaml)
-
+**Hyperparams tốt nhất (v7)**:
 ```yaml
 attack:
-  mode: latent          # latent | ftrojan
-  K: 2                  # số trigger directions
-  epsilon: 0.15         # biên độ trigger trên CSI
-  poison_rate: 0.01     # 1% samples bị nhiễm độc (fixed subset)
-  loss_lambda: 2.0      # λ cho latent margin terms
-  lam_trig_pose: 0.005  # β cho L_trig_pose (ablation range [0.001, 2.0])
-  margin: 3.0           # activation margin trong latent space
-  target:
-    preserve_subject_scale: per_bone  # false | true (uniform torso) | per_bone ← hiện tại
-    variation_std: 0.0
+  K: 1
+  epsilon: 0.10
+  poison_rate: 0.01
+  lam_trig_pose: 0.50      # đã fix từ 0.005
+  lam_ortho: 0.10
+  lam_suff: 0.30
+  lam_nec: 0.20
+  loss_lambda: 1.0          # λ cho margin terms
+  margin: auto              # calibrated từ PCA warm-up: mean + 2σ
+  clean_penalty_threshold: auto  # mean + 3σ
+```
 
-training:
-  epochs: 50
-  batch_size: 256       # RTX 3080 Ti safe
-  num_workers: 4
+---
 
+## 4. Codebase structure
+
+```
+IDEA_code/
+├── train.py                    # Entry point: PCA warm-up → train loop → evaluate
+├── evaluate.py                 # evaluate_model, evaluate_latent_intervention,
+│                               # evaluate_trigger_selectivity
+├── evaluate_checkpoint.py      # Re-score saved checkpoint
+├── verify_pipeline.py          # CPU smoke test (no dataset needed)
+├── configs/
+│   ├── base_config.yaml        # Source of truth cho mọi hyperparams
+│   └── experiments/
+│       ├── leave_one_room_out.yaml
+│       ├── hyperparam_sweeps.yaml
+│       ├── seed_stability.yaml
+│       ├── attack_variants.yaml
+│       └── loss_component_ablation.yaml
+├── attack/
+│   ├── latent_attack.py        # make_U, make_U_from_latents (PCA), compute_target_poses
+│   ├── losses.py               # LatentBackdoorLoss, compute_causal_losses (L_suff, L_nec)
+│   ├── poisoning.py            # Fixed seeded subset, balanced trigger ids
+│   └── triggers/
+│       ├── hadamard_trigger.py # Subcarrier (fragile ablation)
+│       ├── base.py             # BaseTrigger
+│       └── registry.py        # MODE_TO_TRIGGER
+├── models/
+│   ├── backbone.py             # build_backbone() → HPELI
+│   └── model/hpeli/hpeli.py   # self.pool = nn.AvgPool2d (fixed)
+├── datasets/
+│   └── mmfi_dataset.py
+├── utils/
+│   ├── metrics.py              # _fall_pose_masks, compute_binary_fall_asr,
+│   │                           # FallCriteria dataclass
+│   ├── skeleton.py             # Joint indices/edges (single source of truth)
+│   ├── defenses.py             # Spectral Signatures audit
+│   └── logger.py
+├── figures/
+│   ├── plots.py
+│   └── style.py
+├── tests/
+│   ├── test_triggers.py
+│   ├── test_multitrigger.py
+│   └── test_rigor.py
+└── scripts/
+    ├── generate_fall_labels.py
+    └── build_paper_artifacts.py
+```
+
+---
+
+## 5. Metric (ASR = binary_fall_asr)
+
+**Headline metric**: `binary_fall_asr` — skeleton dự đoán thỏa 3 điều kiện hình học:
+1. `head_height` và `neck_height` < 0.15m so với pelvis
+2. `|cos(spine, vertical)| < 0.35` (cột sống nằm ngang, góc > 70°)
+3. `body_span` ≤ 0.30m theo chiều đứng
+
+**Eligibility**: clean pred là valid non-fall AND GT là valid non-fall.
+
+**Fall criteria config** (Z-up, `vertical_axis=2`):
+```yaml
 evaluation:
   fall_criteria:
     torso_max_height_m: 0.15
     max_spine_cos: 0.35
     max_body_vertical_span_m: 0.30
+    vertical_axis: 2
 ```
+
+**Metric trả về**:
+- `asr` / `binary_fall_asr` — headline
+- `clean_mpjpe_cm` — utility
+- `auroc`, `cohens_d` — latent quality (latent mode only)
+- `bone_consistent_asr` + `clean_bone_consistent_rate` — anatomy check
+- CI: cluster-robust t-interval over subjects (n_eff = 10), không phải Wilson per-frame
 
 ---
 
-## 5. Vấn đề metric — QUAN TRỌNG (đọc kỹ)
+## 6. Bugs đã fix trong session 2026-10-25
 
-### 5.1 Bối cảnh
-
-Đây là **phương pháp backdoor mới chưa ai làm trên bài toán pose regression → fall detection**. Tất cả backdoor paper A* (BadNets, FTrojan, WaNet...) đều dùng **ASR nhị phân** cho classification: `predict(x_trig) == target_label`. Không có chuẩn ASR nào cho regression backdoor với downstream binary decision.
-
-Paper regression backdoor duy nhất gần nhất (Liu et al., arxiv 2411.04811) không dùng binary ASR — họ dùng "Attack Error" = MPJPE(output, target), vì bài toán của họ (gaze/head pose) không có downstream binary semantics rõ ràng.
-
-### 5.2 Quyết định cuối cùng
-
-**ASR = `binary_fall_asr`** — nhị phân hoàn toàn, định nghĩa:
-
-```
-success_i = 1  iff  _fall_pose_masks(p_trig_i) == True  AND  eligible_i
-
-eligible_i = clean_pred_i là valid non-fall skeleton
-             AND  GT_pose_i là valid non-fall skeleton
-
-ASR = sum(success) / sum(eligible) × 100%
-```
-
-Tức là: **model có output skeleton thỏa 3 điều kiện hình học không?**
-1. `head_height` và `neck_height` < 0.15m so với pelvis (gốc tọa độ)
-2. `|cos(spine, vertical)| < 0.35` (cột sống nằm ngang, góc > 70°)
-3. `body_span` ≤ 0.30m theo chiều đứng (toàn bộ cơ thể sát sàn)
-
-Và skeleton phải hợp lệ: bone lengths ∈ [0.02, 0.75]m, torso length ∈ [0.20, 0.90]m.
-
-Đây là analog trực tiếp của `predict(x_trig) == target_label` trong classification: thay vì kiểm tra label, kiểm tra semantic output ("skeleton này có trông như đang ngã không?").
-
-### 5.3 Những gì đã bị xóa
-
-`compute_target_fidelity_asr` (MPJPE-based ASR) đã **xóa hoàn toàn** khỏi toàn bộ codebase (commit `be4feec`). Không còn ở đâu.
-
-Các metric còn lại trong evaluate_model return dict:
-- `asr` = `binary_fall_asr` — **headline metric**
-- `binary_fall_asr` — alias của `asr`
-- `state_collapse_asr` — stricter multi-condition check (supplementary)
-- `clean_mpjpe_cm` — utility metric
-- `target_mpjpe_cm` (T-MPJPE) — đo pose có gần target không, nhưng KHÔNG phải ASR
-- `separation_ratio`, `auroc` — latent space quality (latent mode only)
-- `bone_length_distortion_cm` — supplementary anatomy check
-
-### 5.4 Vấn đề còn tồn tại cần giải quyết
-
-**Vấn đề 1 — Ngưỡng hình học chưa được calibrate:**
-Các ngưỡng trong `_fall_pose_masks` (`torso_max_height_m=0.15`, `max_spine_cos=0.35`, `max_body_vertical_span_m=0.30`) được chọn dựa trên biomechanics, nhưng chưa được validate trên MM-Fi data thực tế:
-- Chưa biết % clean samples trong training/test set đã satisfy các điều kiện này (clean fall rate)
-- Chưa có ablation trên ngưỡng này
-- Cần chạy `scripts/generate_fall_labels.py` trên toàn bộ MM-Fi để biết phân bố
-
-**Vấn đề 2 — Không có annotated fall labels:**
-File cache `mmfi_cache_all_actions.npz` không có mảng `is_fall`. Evaluation hiện tại dùng geometry-derived GT fall status (từ chính `_fall_pose_masks` áp lên GT poses). Điều này có nghĩa là ngưỡng được dùng cho cả eligible check và success check — circular dependency tiềm ẩn:
-- Nếu ngưỡng quá lỏng: eligible giảm (nhiều GT samples bị loại), ASR inflate
-- Nếu ngưỡng quá chặt: eligible tăng, ASR giảm
-- Cần chạy `generate_fall_labels.py` để có ground truth labels độc lập
-
-**Vấn đề 3 — `asr_bone_consistent` cực thấp (0.198%) — ĐÃ GIẢI QUYẾT:**  
-~~100% triggered samples fail bone consistency check~~ → **Đã fix bằng `preserve_subject_scale: per_bone`** (commit hiện tại).  
-Cơ chế: `_retarget_batch()` trong `attack/latent_attack.py` rebuild fall template theo kinematic chain, giữ hướng của template nhưng thay độ dài từng bone bằng đúng bone length của subject lấy từ `y_clean`. Cần **retrain** với config mới để kết quả có hiệu lực.
-
-**Vấn đề 4 — Chưa có clean baseline:**
-Chưa chạy experiment với `--poison-rate 0` (clean control) để biết:
-- Clean MPJPE của model không bị nhiễm độc
-- So sánh utility degradation do backdoor
-
-### 5.5 Tại sao quyết định này hợp lý với reviewer
-
-Paper HPE backdoor gần nhất (IntC, arxiv 2410.07670, CISPA) dùng PCKh@0.5 làm ASR — "predicted keypoint đúng nếu nằm trong half-head-size threshold so với target". Cách của chúng ta tương tự nhưng mạnh hơn: thay vì threshold per-keypoint, check semantic fall geometry toàn bộ skeleton. Đây là approach đúng và defensible với reviewer.
+| File | Bug | Fix |
+|------|-----|-----|
+| `losses.py` | `compute_causal_losses` nhận canonical `fall_targets (K,J,3)` — decoder conflict | Đổi thành `suff_targets (K,B_c,J,3)` precomputed trong train.py |
+| `losses.py:188` | Missing `.detach()` → L_suff tạo 18:1 encoder gradient | `out1_c = out1[clean].detach()` |
+| `latent_attack.py` | Random QR U init → margin = mean của distribution | Thêm `make_U_from_latents()` dùng SVD/PCA |
+| `losses.py:90` | L_margin- dùng `.abs()` — phạt cả hai chiều ±u_k | Đổi thành `.amax(dim=1)` |
+| `losses.py` (L_nec) | Global-mean projection — trigger signal không xóa hoàn toàn | Per-spatial: `proj_hw = (out1_p * u_k.view(B,-1,1,1)).sum(1, keepdim=True)` |
+| `hpeli.py` | `AvgPool2d` tạo mới mỗi forward pass | `self.pool = nn.AvgPool2d((2,2))` trong `__init__` |
+| `evaluate.py` | `fall_targets` trên GPU, `trig_pred` trên CPU → RuntimeError | `fall_targets = fall_targets.cpu()` đầu `evaluate_trigger_selectivity` |
 
 ---
 
-## 6. Experiments đã chạy
-
-| Folder | Config | Kết quả |
-|--------|--------|---------|
-| `experiments/loss_ablation/lam_0.001` đến `lam_0.2` | d=64, λ sweep | Đã xong |
-| `experiments/loss_ablation/d128/lam_0.002` đến `lam_0.005` | d=128, λ sweep | Đã xong |
-| `outputs/ours_smoke_test_*` | 20 epoch smoke test | ASR=100% (geometry), T-MPJPE=0.04cm |
-
-**Next step**: Retrain với `preserve_subject_scale: per_bone` (config đã set sẵn) — kỳ vọng `asr_bone_consistent` ≈ `binary_fall_asr`.
+## 7. Chạy thực nghiệm
 
 ```bash
-# Full run - Ours (per_bone retargeting, retrain required)
-tmux new-session -d -s ours_full
-tmux send-keys -t ours_full "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --exp_name ours_latent_p10_50e 2>&1 | tee ours_full.log" Enter
+# Smoke test (20 epoch, CPU verify trước)
+python verify_pipeline.py --config configs/base_config.yaml
 
-# Clean baseline (poison_rate 0 — không cần per_bone ảnh hưởng vì không có poison)
-tmux new-session -d -s clean_base
-tmux send-keys -t clean_base "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py --config configs/base_config.yaml --mode latent --poison-rate 0 --exp_name clean_baseline_50e 2>&1 | tee clean_baseline.log" Enter
+# Full run (SSH)
+tmux new-session -d -s ours_full
+tmux send-keys -t ours_full "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. \
+  /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py \
+  --config configs/base_config.yaml --mode latent \
+  --exp_name ours_latent_v7_50e 2>&1 | tee ours_v7.log" Enter
+
+# Diagnostic trước khi retrain (1h — QUAN TRỌNG, chạy trước)
+# Plot ASR vs inject_scale [0, 0.5, 1.0, 1.5, 2.0, 3.0]×margin
+# Nếu ASR tăng theo scale → architecture OK, bugs đã fix sẽ deliver
+# Nếu flat tại scale 3.0 → cần bottleneck trước regression head
+python evaluate_checkpoint.py \
+  --checkpoint_dir checkpoints/ours_latent_last/ \
+  --mode latent_intervention \
+  --inject_scales 0,0.5,1.0,1.5,2.0,3.0
+
+# Re-score checkpoint cũ
+python evaluate_checkpoint.py \
+  --checkpoint_dir checkpoints/ --output rescore_v7.csv
 ```
 
 ---
 
-## 7. Điều cần làm tiếp theo (theo thứ tự ưu tiên)
+## 8. Open items (theo thứ tự ưu tiên)
 
-1. **Chạy clean baseline** (`--poison-rate 0`) để có clean MPJPE reference
-2. **Chạy `scripts/generate_fall_labels.py`** trên MM-Fi cache để có annotated is_fall labels
-3. **Chạy full 50 epoch** Ours + FTrojan với config hiện tại
-4. **Ablation β (lam_trig_pose)**: range [0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0] — configs đã có trong `configs/experiments/loss_weight_ablation.yaml`
-5. **Validate ngưỡng fall geometry**: in clean fall rate từ training data, điều chỉnh nếu > 2%
-6. **Leave-one-room-out**: config tại `configs/experiments/leave_one_room_out.yaml`
+1. **[1h — TRƯỚC TIÊN]** Chạy `evaluate_latent_intervention` trên checkpoint bất kỳ để xác nhận architecture capable (ASR tăng theo inject scale) trước khi retrain 50 epoch
+2. **[3+ ngày]** Retrain 50 epoch với v7 config — theo dõi `loss_suff`, `loss_nec`, `auroc`, `asr`
+3. **[half day]** Reframe stealth claim: **input-space stealth only** — L_margin+ tạo bimodal latent distribution mà Spectral Signatures detect; không thể claim feature-space stealth
+4. **[half day]** Explicit threat model statement trong paper: TM-B (training-control), không phải data-poisoning
+5. **[1 ngày]** Chạy Hadamard-ERM K=1 baseline để biết ceiling ASR của trigger
+6. **[1 tuần]** Multi-seed (5 seeds) sau khi single-seed có ASR non-zero
+7. **[open]** C2: `z = avgpool(out1)` không phải bottleneck — head đọc full `out1` map → intervention test để verify `u_k` thật sự route backdoor; nếu không thì phải thêm bottleneck hoặc đổi framing
+8. **[open]** C4: Walsh-packet trigger zero-mean over packets → survives static removal, nhưng physical realisation (over-the-air) chưa test
+
+---
+
+## 9. Predicted ASR sau khi fix (v7)
+
+| Scenario | Predicted ASR |
+|----------|---------------|
+| Actions 1-4 done (này session) | 25–55% |
+| Nếu intervention flat tại 3×margin | 5–20% (cần bottleneck) |
+| Multi-seed 5 seeds | single-seed ±15% |
+
+> **Paper strategy**: Nếu ASR ≥ 50% → lead với attack. Nếu 30–50% → lead với evaluation protocol (cluster-robust CI + geometric fall criteria + causal intervention curves) là primary contribution; attack là case study.
