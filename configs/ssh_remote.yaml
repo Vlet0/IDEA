@@ -44,7 +44,7 @@ attack:
 
 training:
   batch_size: 256
-  epochs: 80                 # Longer training to allow latent separation
+  epochs: 50                 # Longer training to allow latent separation
   learning_rate: 0.001
   save_dir: ./checkpoints_ssh/
   output_dir: ./outputs_ssh/
