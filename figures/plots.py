@@ -121,7 +121,7 @@ def plot_latent_tsne(features: Mapping[str, object], target_names: Sequence[str]
         _save(fig, output_path, fig_cfg)
         return
     emb = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=int(tsne_cfg["seed"]),
-               max_iter=int(tsne_cfg["n_iter"])).fit_transform(stacked)
+               max_iter=int(tsne_cfg["max_iter"])).fit_transform(stacked)
     start = 0
     for (label, _, color), size in zip(groups, sizes):
         sl = slice(start, start + size)

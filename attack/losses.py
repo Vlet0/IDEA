@@ -55,6 +55,11 @@ class LatentBackdoorLoss(nn.Module):
     def __init__(self, lam: float, margin: float, clean_thresh: float,
                  lam_ortho: float, lam_trig_pose: float) -> None:
         super().__init__()
+        if not margin > clean_thresh:
+            # Otherwise every sample can sit in [margin, clean_thresh]: both hinge terms are zero
+            # and the trigger never has to change the latent (observed: s_clean == s_trig, ASR 0).
+            raise ValueError(f"margin ({margin}) must exceed clean_thresh ({clean_thresh}); "
+                             "the latent objective is degenerate otherwise")
         self.lam = lam
         self.margin = margin
         self.clean_thresh = clean_thresh

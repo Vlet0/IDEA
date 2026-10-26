@@ -123,6 +123,30 @@ class FallMetricTests(unittest.TestCase):
         )
         self.assertEqual(result["binary_fall_asr"], 100.0)
 
+    def test_event_asr_requires_a_sustained_consecutive_run(self):
+        # One sequence of 10 frames, all eligible.  5 scattered fall frames (never 3 in a row)
+        # must NOT raise a debounced alarm; 5 consecutive fall frames must.
+        clean = self.upright.repeat(10, 1, 1)
+        seq_ids = [0] * 10
+        scattered = clean.clone()
+        for i in (0, 2, 4, 6, 8):
+            scattered[i] = self.fallen[0]
+        res = compute_binary_fall_asr(clean, scattered, PS, ground_truth_poses=clean,
+                                      seq_ids=seq_ids, seq_min_frames=3)
+        self.assertEqual(res["event_rule"], "longest_consecutive_run")
+        self.assertEqual(res["binary_fall_asr"], 0.0)         # no 3-in-a-row
+        self.assertEqual(res["seq_asr_total_count"], 100.0)   # but 5 ≥ 3 by the count rule
+        self.assertEqual(res["frame_asr"], 50.0)              # frame-level diagnostic kept
+
+        consecutive = clean.clone()
+        for i in (2, 3, 4, 5, 6):
+            consecutive[i] = self.fallen[0]
+        res2 = compute_binary_fall_asr(clean, consecutive, PS, ground_truth_poses=clean,
+                                       seq_ids=seq_ids, seq_min_frames=3)
+        self.assertEqual(res2["binary_fall_asr"], 100.0)      # a sustained 5-frame run fires
+        self.assertEqual(res2["n_eligible"], 1)
+        self.assertEqual(res2["n_total"], 1)
+
     def test_empty_population_is_undefined(self):
         empty = torch.empty(0, 17, 3)
         result = self.stats(empty, clean=empty, ground_truth=empty)

@@ -62,6 +62,7 @@ def packet_smoothing(x: torch.Tensor, width: int) -> torch.Tensor:
 
 
 @torch.no_grad()
+@torch.no_grad()  # without it every batch's autograd graph stays alive on the GPU (OOM on the full train set)
 def extract_features(net, dataset, device, batch_size: int) -> torch.Tensor:
     """Penultimate features ``z`` of every item of ``dataset`` (in order), on the CPU."""
     net.eval()

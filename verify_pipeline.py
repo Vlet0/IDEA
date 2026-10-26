@@ -52,12 +52,13 @@ def verify(device: torch.device) -> None:
     ps = 0.3
     targets = get_semantic_fall_targets(K=K, ps=ps, device=device)
     mask = torch.tensor([True, False], device=device)
-    indices = torch.tensor([0, 1], device=device)
+    indices = torch.arange(2, device=device) % K  # valid trigger ids for any K
     pose_cfg = {k: v for k, v in cfg["attack"]["target"].items() if k != "target_types"}
     target_poses = compute_target_poses(pose.detach(), indices, targets, **pose_cfg)
     U = make_U(m=m, K=K, seed=0, device=device)
     for mode in MODE_TO_TRIGGER:
-        loss = _build_criterion(mode, cfg["attack"])
+        atk = cfg["attack"]
+        loss = _build_criterion(mode, atk, atk["margin"], atk["clean_penalty_threshold"])
         p = pose.detach().clone().requires_grad_(True)
         if isinstance(loss, LatentBackdoorLoss):
             value, _ = loss(p, latent.detach(), pose.detach(), U, mask, indices, target_poses)
@@ -66,12 +67,12 @@ def verify(device: torch.device) -> None:
         assert torch.isfinite(value), mode
 
     criteria = FallCriteria.from_dict(cfg["evaluation"]["fall_criteria"])
-    upright = get_semantic_standing_pose(ps=ps).unsqueeze(0).repeat(2, 1, 1)
+    upright = get_semantic_standing_pose(ps=ps).unsqueeze(0).repeat(K, 1, 1)
     fallen = targets.cpu().clone()
     assert not is_biomechanical_fall(upright, ps, criteria).any()
     assert is_biomechanical_fall(fallen, ps, criteria).all()
     binary = compute_binary_fall_asr(upright, fallen, ps, ground_truth_poses=upright, criteria=criteria)
-    assert binary["binary_fall_asr"] == 100.0 and binary["n_success"] == 2
+    assert binary["binary_fall_asr"] == 100.0 and binary["n_success"] == K
     gate = cfg["attack"]["gate_threshold"]
     latent_stats = compute_latent_separation_stats(
         torch.tensor([[0.1, 0.2], [0.2, 0.3]]), torch.tensor([[2.0, 3.0], [2.5, 4.0]]), gate_thresh=gate)

@@ -14,6 +14,7 @@ variants:
   - name: dual_fall_subcarrier
     mode: latent
     attack:
+      K: 2
       target: {target_types: [fall_prone, fall_lateral]}
       hadamard: {axis: subcarrier}
 
@@ -22,6 +23,7 @@ variants:
   - name: dual_fall_complex_subcarrier
     mode: latent
     attack:
+      K: 2
       target: {target_types: [fall_prone, fall_curled]}
       hadamard: {axis: subcarrier}
 
@@ -30,6 +32,7 @@ variants:
   - name: dual_fall_complex_packet
     mode: latent
     attack:
+      K: 2
       target: {target_types: [fall_prone, fall_curled]}
       hadamard: {axis: packet}
 
@@ -38,5 +41,6 @@ variants:
   - name: alarm_plus_conceal_subcarrier
     mode: latent
     attack:
+      K: 2
       target: {target_types: [fall_prone, stand]}
       hadamard: {axis: subcarrier}

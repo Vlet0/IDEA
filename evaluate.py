@@ -16,6 +16,7 @@ the model and used to be reported as if it did.
 from __future__ import annotations
 
 import torch
+import numpy as np
 
 from attack import compute_target_poses
 from attack.triggers import BaseTrigger
@@ -70,14 +71,18 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
               target_cfg: dict, trigger_index, U: torch.Tensor | None, transform=None):
     """One clean + one triggered forward pass over ``loader``.
 
-    ``trigger_index(batch_size, device)`` returns the ``(B,)`` long trigger index of each
-    sample.  ``transform`` (optional) models the receiver / defender: it is applied to the
-    clean input and to the triggered input *after* injection, so clean utility is measured
-    under the same processing.  Everything is returned on the CPU.
+    ``trigger_index(batch_size, device, offset)`` returns the ``(B,)`` long trigger index of each
+    sample, where ``offset`` is the number of frames already consumed (loader order).  Passing the
+    running offset lets the caller assign triggers by global frame position or by sequence id
+    rather than by position inside a batch, so the result does not depend on the batch size.
+    ``transform`` (optional) models the receiver / defender: it is applied to the clean input and
+    to the triggered input *after* injection, so clean utility is measured under the same
+    processing.  Everything is returned on the CPU.
     """
     keys = ("clean_pred", "trig_pred", "gt", "target", "labels", "s_clean", "s_trig")
     store = {k: [] for k in keys}
     saw_labels = False
+    offset = 0
     for batch in loader:
         x0, y = batch[0].to(device), batch[1].to(device)
         if len(batch) >= 3:
@@ -86,7 +91,8 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
         elif saw_labels:
             raise ValueError("Fall annotations must be supplied for every evaluation batch")
 
-        kk = trigger_index(len(x0), device)
+        kk = trigger_index(len(x0), device, offset)
+        offset += len(x0)
         x_trig = x0.clone()
         for k in range(trigger.K):
             sel = kk == k
@@ -143,9 +149,19 @@ def evaluate_model(
     net.eval()
     K = trigger.K
 
+    # Trigger assignment must be coherent over a whole sequence: the event-level ASR asks whether
+    # a sustained run of frames raises the alarm, so every frame of a sequence must carry the SAME
+    # trigger.  With sequence ids, assign one trigger per sequence (round-robin over sequences);
+    # without them, round-robin by global frame position.  Either way the result is independent of
+    # the batch size (the earlier per-batch ``arange(b) % K`` split sequences across triggers).
+    if seq_ids is not None:
+        kk_all = (torch.as_tensor(np.asarray(seq_ids)).long() % K)
+        trigger_index = lambda b, dev, off: kk_all[off:off + b].to(dev)
+    else:
+        trigger_index = lambda b, dev, off: torch.arange(off, off + b, device=dev) % K
+
     r = _run_pass(
-        net, test_loader, trigger, eps, device, fall_targets, target_cfg,
-        lambda b, dev: torch.arange(b, device=dev) % K, U,
+        net, test_loader, trigger, eps, device, fall_targets, target_cfg, trigger_index, U,
     )
     clean_preds, trig_preds, gt, target_poses, labels = (
         r["clean_pred"], r["trig_pred"], r["gt"], r["target"], r["labels"])
@@ -227,7 +243,7 @@ def evaluate_per_trigger(
     for k in range(trigger.K):
         r = _run_pass(
             net, test_loader, trigger, eps, device, fall_targets, target_cfg,
-            lambda b, dev, k=k: torch.full((b,), k, device=dev, dtype=torch.long), None,
+            lambda b, dev, off, k=k: torch.full((b,), k, device=dev, dtype=torch.long), None,
         )
         binary = compute_binary_fall_asr(
             r["clean_pred"], r["trig_pred"], PS, ground_truth_poses=r["gt"],
@@ -435,7 +451,7 @@ def evaluate_trigger_selectivity(
     for k in range(K):
         r = _run_pass(
             net, test_loader, trigger, eps, device, fall_targets, target_cfg,
-            lambda b, dev, k=k: torch.full((b,), k, device=dev, dtype=torch.long), U,
+            lambda b, dev, off, k=k: torch.full((b,), k, device=dev, dtype=torch.long), U,
         )
         gt, trig_pred = r["gt"], r["trig_pred"]
         n = len(gt)
@@ -508,8 +524,12 @@ def evaluate_robustness(
     net.eval()
     K = trigger.K
 
-    def round_robin(b, dev):
-        return torch.arange(b, device=dev) % K
+    # Sequence-coherent assignment (matches evaluate_model) so robustness ASR is batch-independent.
+    if seq_ids is not None:
+        kk_all = (torch.as_tensor(np.asarray(seq_ids)).long() % K)
+        round_robin = lambda b, dev, off: kk_all[off:off + b].to(dev)
+    else:
+        round_robin = lambda b, dev, off: torch.arange(off, off + b, device=dev) % K
 
     conditions = [("eps_scale", float(s), eps * float(s), None) for s in robustness_cfg["eps_scales"]]
     conditions += [("smoothing_width", int(w), eps, (lambda x, w=int(w): subcarrier_smoothing(x, w)))

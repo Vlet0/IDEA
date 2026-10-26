@@ -248,8 +248,11 @@ def load_mmfi_data(config):
     # Sequence id per test frame: unique per (subject, action).  The cache layout guarantees
     # that every (subject, action) occupies exactly `expected_frames` consecutive positions,
     # so a simple integer division gives a globally unique id without a separate action label.
+    # Depends only on the (verified complete) cache layout, NOT on the subject-id sanity check:
+    # tying it to te_subject silently turned the sequence-level ASR into a frame-level one
+    # whenever the bone-length check failed.
     te_seq_id = (np.arange(int(te_mask.sum())) // int(expected_frames)
-                 if te_subject is not None else None)
+                 if data_cfg['require_complete_cache'] and expected_frames is not None else None)
 
     meta = {
         'te_subject': te_subject,

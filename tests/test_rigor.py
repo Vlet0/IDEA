@@ -201,7 +201,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_hadamard_erm_ablation_arm(self):
         self.assertEqual(MODE_TO_TRIGGER["hadamard_erm"], "hadamard")
-        self.assertIsInstance(_build_criterion("hadamard_erm", resolve_config({})["attack"]), PoisonedERMLoss)
+        atk = resolve_config({})["attack"]
+        self.assertIsInstance(_build_criterion("hadamard_erm", atk, atk["margin"], atk["clean_penalty_threshold"]),
+                              PoisonedERMLoss)
 
     def test_evaluation_settings_do_not_change_the_training_fingerprint(self):
         base = resolve_config({})

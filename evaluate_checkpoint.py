@@ -44,6 +44,9 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     if override_config:
         config = deep_update(config, override_config)
     atk, eval_cfg = config["attack"], config["evaluation"]
+    # Latent thresholds the weights were trained with (PCA calibration).  Older checkpoints
+    # already carry them inside the saved config.
+    atk.update(saved.get("calibration") or {})
     mode = atk["mode"]
     clean_control = atk["poison_rate"] == 0
     latent_active = mode == "latent" and not clean_control
@@ -75,10 +78,12 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
         eval_cfg["sensitivity_scales"], target_cfg,
         U=U if latent_active else None,
         clusters=meta.get("te_subject"), cluster_ci=eval_cfg["cluster_ci"],
+        seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
     )
     robustness = evaluate_robustness(
         net, test_loader, trigger, fall_targets, PS, device, atk["epsilon"],
         FallCriteria.from_dict(eval_cfg["fall_criteria"]), target_cfg, eval_cfg["robustness"],
+        seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
     )
     # The poisoned training subset is a deterministic function of (N, rate, K, poison seed).
     X_train, Y_train = dataset_tensors(train_loader.dataset)

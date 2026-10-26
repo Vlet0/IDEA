@@ -152,6 +152,20 @@ def _rate(numerator: int, denominator: int) -> float:
     return 100.0 * numerator / denominator if denominator else float("nan")
 
 
+def _longest_true_run(flags: np.ndarray) -> int:
+    """Length of the longest run of consecutive ``True`` in a 1-D boolean array (0 if none).
+
+    Frames arrive in temporal order within a sequence, so this is the debounce window a
+    sustained-alarm detector would actually see.
+    """
+    best = run = 0
+    for v in np.asarray(flags).ravel():
+        run = run + 1 if v else 0
+        if run > best:
+            best = run
+    return best
+
+
 def cluster_ratio_ci(
     numerator: Any,
     denominator: Any,
@@ -378,8 +392,13 @@ def compute_binary_fall_asr(
             "clean_bone": eligible & bone_ok(clean_poses),
         }
 
-    # ── Sequence-level aggregation ──────────────────────────────────────────
-    # Replaces the frame-level headline numbers; frame-level stats are kept as diagnostics.
+    # ── Sequence-level (event) aggregation ──────────────────────────────────
+    # A practical fall alarm debounces: it fires only after the pose stays fallen for
+    # ``seq_min_frames`` CONSECUTIVE frames.  The event-level ASR is therefore the fraction of
+    # eligible sequences whose triggered prediction has a sustained fall run of that length —
+    # not a count of scattered fall frames, which a debounced alarm would never raise on.  The
+    # total-count rule is kept as ``seq_asr_total_count`` for comparison, and the frame-level
+    # numbers as ``frame_*``.  Replaces the frame-level headline keys.
     if seq_ids is not None:
         ids = np.asarray(seq_ids).ravel()
         if len(ids) != len(eligible):
@@ -387,18 +406,20 @@ def compute_binary_fall_asr(
                 f"seq_ids has {len(ids)} entries but there are {len(eligible)} frames")
         eligible_np = eligible.cpu().numpy()
         success_np = success.cpu().numpy()
-        bone_np = bone_consistent.cpu().numpy()
+        bone_np = (success & bone_consistent).cpu().numpy()
         unique_seqs = np.unique(ids)
         n_seq_total = len(unique_seqs)
-        n_seq_eligible = n_seq_success = n_seq_bone_ok = 0
+        n_seq_eligible = n_seq_success = n_seq_bone_ok = n_seq_count = 0
         for sid in unique_seqs:
             mask = ids == sid
             if eligible_np[mask].mean() >= 0.5:   # ≥50% frames eligible → sequence eligible
                 n_seq_eligible += 1
-                if success_np[mask].sum() >= seq_min_frames:
+                if _longest_true_run(success_np[mask]) >= seq_min_frames:
                     n_seq_success += 1
-                if (success_np[mask] & bone_np[mask]).sum() >= seq_min_frames:
+                if _longest_true_run(bone_np[mask]) >= seq_min_frames:
                     n_seq_bone_ok += 1
+                if int(success_np[mask].sum()) >= seq_min_frames:
+                    n_seq_count += 1
         seq_low, seq_high = wilson_interval(n_seq_success, n_seq_eligible)
         seq_bone_low, seq_bone_high = wilson_interval(n_seq_bone_ok, n_seq_eligible)
         # Preserve frame-level values as diagnostics, then overwrite headline keys.
@@ -411,11 +432,13 @@ def compute_binary_fall_asr(
         stats["asr_bone_consistent"] = _rate(n_seq_bone_ok, n_seq_eligible)
         stats["asr_bone_consistent_ci95_low"] = seq_bone_low
         stats["asr_bone_consistent_ci95_high"] = seq_bone_high
+        stats["seq_asr_total_count"] = _rate(n_seq_count, n_seq_eligible)
         stats["n_eligible"] = n_seq_eligible
         stats["n_success"] = n_seq_success
         stats["n_total"] = n_seq_total
         stats["eligible_fraction"] = _rate(n_seq_eligible, n_seq_total)
         stats["seq_min_frames"] = seq_min_frames
+        stats["event_rule"] = "longest_consecutive_run"
 
     return stats
 

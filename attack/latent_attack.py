@@ -46,6 +46,8 @@ def make_U_from_latents(
     Z_clean: torch.Tensor,
     K: int = 2,
     device: str | torch.device = "cpu",
+    *,
+    margin_gap_sigma: float = 3.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Initialize U from top-K principal directions of clean training latents.
 
@@ -53,35 +55,55 @@ def make_U_from_latents(
     meaningful gradient response along u_k, making L_margin+ effective from
     the first epoch.
 
+    The thresholds are calibrated on ``s = z @ U`` -- the *uncentred* projection that
+    :class:`attack.losses.LatentBackdoorLoss` and the evaluator use.  ``z`` is a spatial
+    average of post-ReLU features, so its mean has a sizeable component along every direction;
+    calibrating on centred latents (as before) put both thresholds inside the clean mass.
+
+    The clean threshold is ``mean + 3 std`` of the clean ``|s|`` and the margin lies
+    ``margin_gap_sigma`` clean standard deviations above it.  The gap is what makes the latent
+    objective informative: with ``margin <= clean_thresh`` every sample can sit in
+    ``[margin, clean_thresh]`` and satisfy both hinge terms without the trigger having any
+    effect (the earlier calibration had ``margin = mean + 2 std < clean_thresh = mean + 3 std``).
+
     Parameters
     ----------
     Z_clean : (N, m)
-        Clean latent vectors collected in eval mode over the full training set.
+        Clean latent vectors collected over the full training set.
     K : int
         Number of trigger directions.
     device : str or torch.device
         Target device for returned tensors.
+    margin_gap_sigma : float
+        Gap between ``clean_thresh`` and ``margin`` in clean standard deviations (> 0).
 
     Returns
     -------
     U : (m, K)
-        Orthonormal basis — top-K right singular vectors of mean-centred Z.
+        Orthonormal basis — top-K right singular vectors of mean-centred Z, each oriented so
+        that the clean latents project non-negatively on average.
     margin : scalar float tensor
-        Empirical margin = mean(|proj|) + 2*std(|proj|) averaged across K cols.
+        Activation margin for triggered samples, ``clean_thresh + margin_gap_sigma * std``.
     clean_thresh : scalar float tensor
-        Empirical clean threshold = mean(|proj|) + 3*std(|proj|) averaged.
+        Clean inactivity threshold, ``max_k (mean_k + 3 std_k)`` of the clean ``|s_k|``.
     """
+    if not margin_gap_sigma > 0.0:
+        raise ValueError(f"margin_gap_sigma must be positive, got {margin_gap_sigma}")
     Z = Z_clean.float()
     Z_c = Z - Z.mean(dim=0, keepdim=True)
     _, _, Vt = torch.linalg.svd(Z_c, full_matrices=False)   # Vt: (min(N,m), m)
     U_raw = Vt[:K].T        # (m, K) — top-K right singular vectors
     Q, _ = torch.linalg.qr(U_raw)   # exact orthonormality
-    # Empirical calibration from the clean projection distribution.
-    proj = (Z_c @ Q).abs()          # (N, K) — projection magnitudes
+    # SVD signs are arbitrary.  The loss pushes the *signed* u_k^T z above the margin, so orient
+    # each direction toward the clean mass: the trigger then has to raise an existing activation
+    # rather than first cross zero from the far side.
+    sign = torch.sign(Z.mean(dim=0) @ Q)
+    Q = Q * torch.where(sign == 0, torch.ones_like(sign), sign)
+    proj = (Z @ Q).abs()            # (N, K) — |s| exactly as the loss / evaluator compute it
     mean_p = proj.mean(dim=0)       # (K,)
-    std_p  = proj.std(dim=0)        # (K,)
-    margin      = (mean_p + 2.0 * std_p).mean()
-    clean_thresh = (mean_p + 3.0 * std_p).mean()
+    std_p = proj.std(dim=0)         # (K,)
+    clean_thresh = (mean_p + 3.0 * std_p).max()
+    margin = clean_thresh + margin_gap_sigma * std_p.max()
     return Q.to(device), margin.to(device), clean_thresh.to(device)
 
 
@@ -619,6 +641,10 @@ def compute_target_poses(
     if not (preserve_subject_scale is False or preserve_subject_scale is True
             or preserve_subject_scale == "per_bone"):
         raise ValueError(f"preserve_subject_scale must be False, True or 'per_bone', got {preserve_subject_scale!r}")
+    # Callers mix CPU/GPU tensors (evaluation stores predictions on the CPU, training runs on the
+    # GPU); everything follows y_clean so the result lives where the poses it is compared to live.
+    fall_targets = fall_targets.to(device=y_clean.device, dtype=y_clean.dtype)
+    kk_indices = torch.as_tensor(kk_indices, device=y_clean.device, dtype=torch.long)
     out = fall_targets[kk_indices].clone()
 
     if preserve_subject_scale == "per_bone":

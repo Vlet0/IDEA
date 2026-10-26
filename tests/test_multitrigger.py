@@ -151,7 +151,7 @@ class LatentTsneTests(unittest.TestCase):
                  "trig": [torch.randn(120, 8, generator=rng) + 8.0,
                           torch.randn(120, 8, generator=rng) - 8.0]}
         cfg = {"formats": ["png"], "dpi": 80}
-        tsne_cfg = {"max_points_per_group": 40, "perplexity": 15, "n_iter": 250, "seed": 0}
+        tsne_cfg = {"max_points_per_group": 40, "perplexity": 15, "max_iter": 250, "seed": 0}
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "tsne")
             plot_latent_tsne(feats, ["Prone fall", "Lateral fall"], out, cfg, tsne_cfg)
