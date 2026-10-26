@@ -68,7 +68,8 @@ def _cluster_cis(masks: dict, clean_err: torch.Tensor, target_error: torch.Tenso
 
 
 def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_targets: torch.Tensor,
-              target_cfg: dict, trigger_index, U: torch.Tensor | None, transform=None):
+              target_cfg: dict, trigger_index, U: torch.Tensor | None, transform=None,
+              poison_rate: float = 1.0, poison_seed: int = 42):
     """One clean + one triggered forward pass over ``loader``.
 
     ``trigger_index(batch_size, device, offset)`` returns the ``(B,)`` long trigger index of each
@@ -92,10 +93,19 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
             raise ValueError("Fall annotations must be supplied for every evaluation batch")
 
         kk = trigger_index(len(x0), device, offset)
+        # Deterministic frame selection matching poison_rate budget
+        if poison_rate < 1.0:
+            # Hash-based pseudo-random choice for frame injection matching poison_rate
+            frame_ids = torch.arange(offset, offset + len(x0), device=device)
+            # Simple linear congruential generator hash for reproducibility across batch sizes
+            p_hash = ((frame_ids * 2654435761 + poison_seed) % 10000).float() / 10000.0
+            is_injected = p_hash < poison_rate
+        else:
+            is_injected = torch.ones(len(x0), dtype=torch.bool, device=device)
         offset += len(x0)
         x_trig = x0.clone()
         for k in range(trigger.K):
-            sel = kk == k
+            sel = (kk == k) & is_injected
             if sel.any():
                 x_trig[sel] = trigger.apply(x_trig[sel], k, eps)
         if transform is not None:
@@ -136,6 +146,7 @@ def evaluate_model(
     cluster_ci: dict | None = None,
     seq_ids=None,
     seq_min_frames: int = 10,
+    poison_rate: float = 1.0,
 ):
     """Clean utility, fall-injection ASR (+ audits) and, if ``U`` is given, latent separation.
 
@@ -162,6 +173,7 @@ def evaluate_model(
 
     r = _run_pass(
         net, test_loader, trigger, eps, device, fall_targets, target_cfg, trigger_index, U,
+        poison_rate=poison_rate,
     )
     clean_preds, trig_preds, gt, target_poses, labels = (
         r["clean_pred"], r["trig_pred"], r["gt"], r["target"], r["labels"])

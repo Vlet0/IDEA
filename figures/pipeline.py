@@ -1,67 +1,62 @@
 """Method-overview ("pipeline") figure of the latent fall-injection backdoor.
-
-Everything that can be computed is computed, not drawn by hand:
-
-* trigger insets   — the real ``HadamardTrigger`` bank built from the run config;
-* skeletons        — the real standing and fall-template poses of ``attack.latent_attack``;
-* numbers in text  — epsilon, poison rate, K, beta, lambda, margin, clean bound and the fall
-                     alarm thresholds are read from the resolved config.
-
-The latent-subspace bars show the *targets of the loss* (clean ``s <= tau``, triggered
-``s_k >= margin``), not measurements; measured distributions are produced by
-``figures.plots.plot_latent_distribution``.
-
-Usage::
-
-    python -m figures.pipeline --config configs/base_config.yaml --out outputs/paper_artifacts/figure_pipeline
+Professional publication-grade architecture diagram (Figures4Papers style).
 """
 
 from __future__ import annotations
 
-import argparse
-
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import FancyBboxPatch, Polygon
+from matplotlib.patches import FancyBboxPatch, Polygon, PathPatch
+import matplotlib.patches as mpatches
 
 from attack import build_trigger_from_config, get_semantic_fall_targets, get_semantic_standing_pose
 from utils.config import load_config, resolve_config
 from utils.skeleton import BONES
 
-from .style import (COLOR_CLEAN_INPUT, COLOR_TRIGGERED, PALETTE, FigureStyle, apply_publication_style,
-                    finalize_figure)
+from .style import (PALETTE, FigureStyle, apply_publication_style)
 
-W, H = 16.0, 7.3  # canvas in inches (figure size == data coordinates)
+W, H = 16.0, 7.8  # figure canvas dimensions
 
-BLUE_FILL, RED_FILL, GREY_FILL = "#E3ECF7", "#F9E3E0", "#F2F2F2"
+# Modern publication palette
+C_BG_CARD = "#FFFFFF"
+C_CLEAN_BORDER = "#1E88E5"
+C_CLEAN_BG = "#EBF5FB"
+C_CLEAN_TEXT = "#0D47A1"
+
+C_TRIG_BORDER = "#E53935"
+C_TRIG_BG = "#FDEDEC"
+C_TRIG_TEXT = "#B71C1C"
+
+C_NEUTRAL_BORDER = "#90A4AE"
+C_NEUTRAL_BG = "#F4F6F7"
+
+C_MODEL_BG = "#FEF9E7"
+C_MODEL_BORDER = "#F39C12"
+C_MODEL_TEXT = "#B7950B"
+
+C_ALARM_OK = "#27AE60"
+C_ALARM_FAIL = "#C0392B"
 
 
-# ---------------------------------------------------------------------------
-# Drawing primitives
-# ---------------------------------------------------------------------------
-
-def _box(ax, x, y, w, h, fc, ec, lw=1.8, ls="-", z=1):
-    ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.0,rounding_size=0.14",
-                                fc=fc, ec=ec, lw=lw, ls=ls, zorder=z))
+def _card(ax, x, y, w, h, fc, ec, lw=1.5, radius=0.18, z=1):
+    box = FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0.0,rounding_size={radius}",
+                         fc=fc, ec=ec, lw=lw, zorder=z)
+    ax.add_patch(box)
+    return box
 
 
-def _text(ax, x, y, s, size=11, weight="normal", color="black", ha="center", va="center", z=5, **kw):
-    ax.text(x, y, s, fontsize=size, fontweight=weight, color=color, ha=ha, va=va, zorder=z, **kw)
+def _text(ax, x, y, s, size=10, weight="normal", color="#2C3E50", ha="center", va="center", z=5, **kw):
+    return ax.text(x, y, s, fontsize=size, fontweight=weight, color=color, ha=ha, va=va, zorder=z, **kw)
 
 
-def _arrow(ax, p0, p1, color=PALETTE["grey_dark"], lw=2.2, ls="-"):
+def _arrow(ax, p0, p1, color="#7F8C8D", lw=2.0, ls="-"):
     ax.annotate("", xy=p1, xytext=p0, zorder=4,
-                arrowprops=dict(arrowstyle="-|>", color=color, lw=lw, ls=ls, shrinkA=0, shrinkB=0,
-                                mutation_scale=16))
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=lw, ls=ls,
+                                shrinkA=2, shrinkB=2, mutation_scale=14))
 
 
-def _inset(fig, x, y, w, h):
-    return fig.add_axes([x / W, y / H, w / W, h / H])
-
-
-def _project(pose: np.ndarray, az_deg: float = 35.0, el_deg: float = 22.0) -> np.ndarray:
-    """Orthographic oblique projection of a Z-up pose to 2-D."""
+def _project(pose: np.ndarray, az_deg: float = 38.0, el_deg: float = 24.0) -> np.ndarray:
     az, el = np.deg2rad(az_deg), np.deg2rad(el_deg)
     x, y, z = pose.T
     depth = x * np.sin(az) + y * np.cos(az)
@@ -74,189 +69,201 @@ def _ground(pose: np.ndarray) -> np.ndarray:
     return out
 
 
-def _draw_pose(ax, pose2d, color, lw=2.6, ls="-", alpha=1.0):
+def _draw_pose(ax, pose2d, color, lw=2.4, ls="-", alpha=1.0):
     for a, b in BONES:
         ax.plot(*zip(pose2d[a], pose2d[b]), color=color, lw=lw, ls=ls, alpha=alpha, solid_capstyle="round")
+    ax.scatter(pose2d[:, 0], pose2d[:, 1], color=color, s=14, zorder=3, alpha=alpha)
 
 
-# ---------------------------------------------------------------------------
-# Figure
-# ---------------------------------------------------------------------------
-
-def draw_pipeline(config: dict):
-    config = resolve_config(config)
+def draw_pipeline(output_path: str = None, config: dict = None):
+    if isinstance(output_path, dict) and config is None:
+        config = output_path
+        output_path = None
+    config = resolve_config(config or {})
     atk, eval_cfg = config["attack"], config["evaluation"]
     K, eps = atk["K"], atk["epsilon"]
     antennas, subcarriers, packets = config["data"]["input_shape"]
     criteria = eval_cfg["fall_criteria"]
 
     trigger = build_trigger_from_config(config)
-    bank = trigger.patterns[:, 0].numpy()  # (K, F, T), antenna 0
+    bank = trigger.patterns[:, 0].numpy()  # (K, F, T) antenna 0
     standing = _ground(get_semantic_standing_pose(ps=1.0).numpy())
     falls = [_ground(p) for p in get_semantic_fall_targets(K=K, ps=1.0).numpy()]
 
-    apply_publication_style(FigureStyle(font_size=12, axes_linewidth=1.2))
-    fig = plt.figure(figsize=(W, H))
+    apply_publication_style(FigureStyle(font_size=11, axes_linewidth=1.2))
+    fig = plt.figure(figsize=(W, H), facecolor="#FAFAFA")
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, W)
     ax.set_ylim(0, H)
     ax.axis("off")
 
-    clean_c, trig_c = 4.8, 2.2  # row centres
-    row_h = 1.9
+    clean_y, trig_y = 5.2, 2.5
+    row_h = 2.1
 
-    # ── Threat-model strip ───────────────────────────────────────────────────
-    _box(ax, 0.2, 6.35, 15.6, 0.8, GREY_FILL, PALETTE["grey_mid"], lw=1.2)
-    _text(ax, 0.4, 6.92, r"Threat model", size=12, weight="bold", ha="left")
-    _text(ax, 2.0, 6.92,
-          rf"the attacker poisons a fixed {100 * atk['poison_rate']:g} % of the training CSI with one of "
-          rf"$K={K}$ trigger directions; each direction is bound to its own floor-fall target.",
-          size=11, ha="left")
-    _text(ax, 0.4, 6.58,
-          r"Consequence: the deployed eldercare monitor reports a fall for ordinary activities whenever the "
-          r"trigger is present, flooding caregivers with false alarms until alerts are ignored.",
-          size=11, ha="left")
+    # ── Top Title Strip ──────────────────────────────────────────────────────────
+    _card(ax, 0.4, 7.0, 15.2, 0.65, "#FFFFFF", "#BDC3C7", lw=1.0, radius=0.1)
+    _text(ax, 0.6, 7.32, "THREAT MODEL:", size=11, weight="bold", color="#1A252F", ha="left")
+    _text(ax, 2.2, 7.32,
+          rf"Outsourced Training (TM-B) with fixed {100 * atk['poison_rate']:g}% poisoned CSI dataset. "
+          rf"Digital Concentrated Sub-band trigger $\epsilon={eps:g}$ ($L_\infty \approx 0.023$, PSNR $\approx 39.7$ dB).",
+          size=10, color="#34495E", ha="left")
 
-    # ── Column headers ───────────────────────────────────────────────────────
-    headers = [(1.2, "1  CSI frame"), (4.1, "2  Trigger injection"), (7.1, "3  Victim encoder"),
-               (9.75, "4  Latent subspace"), (12.5, "5  Pose output"), (14.9, "6  Fall alarm")]
-    for x, label in headers:
-        _text(ax, x, 6.05, label, size=12, weight="bold")
-
-    # ── 1  Frames ────────────────────────────────────────────────────────────
-    shape = rf"${antennas}\times{subcarriers}\times{packets}$"
-    for c, fc, ec, title in ((clean_c, BLUE_FILL, COLOR_CLEAN_INPUT, "Clean frame"),
-                             (trig_c, RED_FILL, COLOR_TRIGGERED, "Poisoned frame")):
-        _box(ax, 0.2, c - row_h / 2, 2.0, row_h, fc, ec)
-        _text(ax, 1.2, c + 0.5, title, size=11, weight="bold", color=ec)
-        _text(ax, 1.2, c + 0.0, r"CSI amplitude $x\in[0,1]$", size=10)
-        _text(ax, 1.2, c - 0.45, shape + "\n(antennas × subcarriers × packets)", size=9.5)
-
-    # ── 2  Trigger injection (triggered row only) ───────────────────────────
-    _box(ax, 2.55, trig_c - 1.05, 3.1, 2.1 + 0.1, GREY_FILL, PALETTE["grey_mid"], lw=1.2)
-    _text(ax, 4.1, trig_c + 0.82, r"$\tilde{x}=\mathrm{minmax}\,(x+\epsilon\,t_k\,\max x)$", size=11.5)
-    _text(ax, 4.1, trig_c + 0.5, rf"$\epsilon={eps:g}$   (unit-$\ell_2$ pattern per antenna)", size=9.5)
-    limit = float(np.abs(bank).max()) or 1.0
-    for k in range(min(K, 2)):
-        ix = 2.7 + k * 1.45
-        sub = _inset(fig, ix, trig_c - 0.8, 1.3, 1.0)
-        sub.imshow(bank[k].T, aspect="auto", cmap="RdBu_r", vmin=-limit, vmax=limit, interpolation="nearest")
-        sub.set_xticks([])
-        sub.set_yticks([])
-        for spine in sub.spines.values():
-            spine.set_visible(True)
-            spine.set_linewidth(1.0)
-        _text(ax, ix + 0.65, trig_c - 0.84, rf"$t_{k}$: Hadamard row {k + 1}", size=9, va="top")
-    _text(ax, 4.1, clean_c, "no trigger", size=11, color=PALETTE["grey_mid"], style="italic")
-
-    # ── 3  Shared encoder ───────────────────────────────────────────────────
-    top, bottom = clean_c + row_h / 2, trig_c - row_h / 2
-    _box(ax, 6.0, bottom, 2.2, top - bottom, "#FFF8E1", PALETTE["grey_dark"])
-    mid = (top + bottom) / 2
-    _text(ax, 7.1, mid + 0.55, "HPELI", size=14, weight="bold")
-    _text(ax, 7.1, mid + 0.1, r"$f_\theta$ (shared weights)", size=10.5)
-    _text(ax, 7.1, mid - 0.45, "SK-Unit × 2\n→ pooled feature", size=10)
-
-    _arrow(ax, (2.2, clean_c), (6.0, clean_c), color=COLOR_CLEAN_INPUT)
-    _arrow(ax, (2.2, trig_c), (2.55, trig_c), color=COLOR_TRIGGERED)
-    _arrow(ax, (5.65, trig_c), (6.0, trig_c), color=COLOR_TRIGGERED)
-
-    # ── 4  Latent subspace (loss targets) ───────────────────────────────────
-    margin, tau, gate = atk["margin"], atk["clean_penalty_threshold"], atk["gate_threshold"]
-    for c, color, kind in ((clean_c, COLOR_CLEAN_INPUT, "clean"), (trig_c, COLOR_TRIGGERED, "trig")):
-        sub = _inset(fig, 9.0, c - 0.82, 1.65, 1.15)
-        if kind == "clean":
-            levels, hatch = [tau] * K, "//"
-        else:
-            levels, hatch = [margin] + [0.0] * (K - 1), None
-        sub.bar(range(K), levels, color=color, alpha=0.85, edgecolor="black", linewidth=1.0, hatch=hatch)
-        sub.axhline(gate, color=PALETTE["grey_dark"], ls="--", lw=1.1)
-        sub.set_ylim(0, margin * 1.3)
-        sub.set_xticks(range(K))
-        sub.set_xticklabels([rf"$s_{k}$" for k in range(K)], fontsize=10)
-        ticks = {0.0: "0", tau: r"$\tau$", gate: "gate"}
-        if kind == "trig":
-            ticks[margin] = "m"
-        sub.set_yticks(sorted(ticks))
-        sub.set_yticklabels([ticks[v] for v in sorted(ticks)], fontsize=8.5)
-        sub.spines[["top", "right"]].set_visible(False)
-        label = rf"$s=U^\top z\leq\tau={tau:g}$" if kind == "clean" else rf"$s_k\geq m={margin:g}$, $s_{{j\neq k}}\to0$"
-        _text(ax, 9.85, c + 0.55, label, size=9.5, color=color)
-        _arrow(ax, (8.2, c - 0.25), (9.0, c - 0.25), color=PALETTE["grey_mid"], lw=1.8, ls="--")
-    _text(ax, 8.6, mid - 0.0, r"$z\in\mathbb{R}^m$" + "\n(training\nloss only)", size=9, color=PALETTE["grey_mid"])
-
-    # ── 5  Pose output ──────────────────────────────────────────────────────
-    proj_all = [_project(standing)] + [_project(f) for f in falls]
-    pts = np.concatenate(proj_all)
-    u0, u1 = pts[:, 0].min() - 0.15, pts[:, 0].max() + 0.15
-    v0, v1 = pts[:, 1].min() - 0.1, pts[:, 1].max() + 0.1
-    floor = np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], dtype=float)
-    for c, kind in ((clean_c, "clean"), (trig_c, "trig")):
-        sub = _inset(fig, 11.35, c - 0.92, 2.3, 1.85)
-        sub.set_xlim(u0, u1)
-        sub.set_ylim(v0, v1)
-        sub.set_aspect("equal", adjustable="box")
-        sub.axis("off")
-        sub.add_patch(Polygon(_project(floor), closed=True, fc=PALETTE["neutral"], ec="none", alpha=0.35))
-        if kind == "clean":
-            _draw_pose(sub, _project(standing), COLOR_CLEAN_INPUT)
-        else:
-            for k in reversed(range(K)):
-                _draw_pose(sub, _project(falls[k]), COLOR_TRIGGERED, lw=2.6 if k == 0 else 1.6,
-                           ls="-" if k == 0 else "--", alpha=1.0 if k == 0 else 0.7)
-    _text(ax, 12.5, clean_c + 0.97, r"predicted pose $p$: upright", size=9.5, color=COLOR_CLEAN_INPUT)
-    _text(ax, 12.5, trig_c + 0.97, r"$p\approx$ target$_k$ (solid $k{=}0$, dashed $k{=}1$)", size=9.5,
-          color=COLOR_TRIGGERED)
-    for c, color in ((clean_c, COLOR_CLEAN_INPUT), (trig_c, COLOR_TRIGGERED)):
-        _arrow(ax, (8.2, c + 0.78), (11.3, c + 0.78), color=color)
-        _text(ax, 9.75, c + 0.95, "pose head", size=9.5, color=color)
-
-    # ── 6  Fall alarm ───────────────────────────────────────────────────────
-    _box(ax, 13.95, clean_c - 0.75, 1.85, 1.5, "#E8F5E9", PALETTE["green_3"])
-    _text(ax, 14.875, clean_c + 0.3, r"$A(p)=0$", size=13, weight="bold", color="#2E7D32")
-    _text(ax, 14.875, clean_c - 0.2, "no alarm", size=11, color="#2E7D32")
-    _box(ax, 13.95, trig_c - 0.75, 1.85, 1.5, RED_FILL, COLOR_TRIGGERED)
-    _text(ax, 14.875, trig_c + 0.3, r"$A(p)=1$", size=13, weight="bold", color=COLOR_TRIGGERED)
-    _text(ax, 14.875, trig_c - 0.2, "false fall alarm", size=11, color=COLOR_TRIGGERED)
-    for c, color in ((clean_c, COLOR_CLEAN_INPUT), (trig_c, COLOR_TRIGGERED)):
-        _arrow(ax, (13.65, c), (13.95, c), color=color)
-    _text(ax, 14.875, mid, rf"$A$: head/neck within" "\n" rf"${criteria['torso_max_height_m']:g}$ m of pelvis,"
-          "\n" rf"$|\cos|<{criteria['max_spine_cos']:g}$, span $\leq{criteria['max_body_vertical_span_m']:g}$ m",
-          size=8.5, color=PALETTE["grey_dark"])
-
-    # ── Loss banner ─────────────────────────────────────────────────────────
-    lam, beta, lam_o = atk["loss_lambda"], atk["lam_trig_pose"], atk["lam_ortho"]
-    terms = [
-        (BLUE_FILL, COLOR_CLEAN_INPUT, r"$\mathcal{L}_{\mathrm{clean\text{-}pose}}$", "L1(p, y) on clean frames"),
-        (RED_FILL, COLOR_TRIGGERED, rf"${beta:g}\cdot\mathcal{{L}}_{{\mathrm{{trig\text{{-}}pose}}}}$", "L1(p, target$_k$) on poisoned"),
-        (BLUE_FILL, COLOR_CLEAN_INPUT, rf"${lam:g}\cdot\mathcal{{L}}_{{\mathrm{{clean\text{{-}}margin}}}}$", rf"$\|U^\top z\|_\infty\leq\tau$ on clean"),
-        (RED_FILL, COLOR_TRIGGERED, rf"${lam:g}\cdot\mathcal{{L}}_{{\mathrm{{trig\text{{-}}margin}}}}$", rf"$u_k^\top z\geq m$ on poisoned"),
-        (RED_FILL, COLOR_TRIGGERED, rf"${lam_o:g}\cdot\mathcal{{L}}_{{\mathrm{{ortho}}}}$", rf"$u_{{j\neq k}}^\top z\to0$ (cross-talk)"),
+    # ── Column Labels (Clean Flow Badges) ────────────────────────────────────────
+    cols = [
+        (1.5, "1. CSI Frame"),
+        (4.3, "2. Trigger Perturbation"),
+        (7.4, "3. HP-ELI Encoder"),
+        (10.2, "4. Latent Subspace"),
+        (12.7, "5. 3D Pose Regression"),
+        (14.8, "6. Downstream Alarm"),
     ]
-    _text(ax, 0.2, 0.98, "Training objective", size=12, weight="bold", ha="left")
-    _text(ax, 2.45, 0.98, r"$\mathcal{L}=$ sum of the five terms below; baseline (FTrojan) uses plain L1 on the poisoned set.",
-          size=10.5, ha="left")
-    chip_w = 3.0
-    for i, (fc, ec, name, desc) in enumerate(terms):
-        x = 0.2 + i * (chip_w + 0.15)
-        _box(ax, x, 0.08, chip_w, 0.72, fc, ec, lw=1.5)
-        _text(ax, x + chip_w / 2, 0.58, name, size=11.5)
-        _text(ax, x + chip_w / 2, 0.29, desc, size=9)
+    for cx, title in cols:
+        _card(ax, cx - 1.05, 6.4, 2.1, 0.42, "#FFFFFF", "#BDC3C7", lw=1.2, radius=0.08)
+        _text(ax, cx, 6.61, title, size=10, weight="bold", color="#2C3E50")
 
+    # ── 1. CSI Inputs ───────────────────────────────────────────────────────────
+    # Clean card
+    _card(ax, 0.4, clean_y - 0.95, 2.2, 1.9, C_CLEAN_BG, C_CLEAN_BORDER, lw=1.6)
+    _text(ax, 1.5, clean_y + 0.65, "Clean Frame", size=11, weight="bold", color=C_CLEAN_TEXT)
+    _text(ax, 1.5, clean_y + 0.25, r"$X \in [0, 1]^{3 \times 114 \times 10}$", size=10)
+    _text(ax, 1.5, clean_y - 0.15, "Routine activities\n(Walk, sit, stand)", size=9, color="#546E7A")
+    _text(ax, 1.5, clean_y - 0.68, "Standard Min-Max CSI", size=8.5, color="#78909C")
+
+    # Poisoned card
+    _card(ax, 0.4, trig_y - 0.95, 2.2, 1.9, C_TRIG_BG, C_TRIG_BORDER, lw=1.6)
+    _text(ax, 1.5, trig_y + 0.65, "Poisoned Frame", size=11, weight="bold", color=C_TRIG_TEXT)
+    _text(ax, 1.5, trig_y + 0.25, r"$X_{\mathrm{trig}} = \mathrm{clip}(X + \epsilon P)$", size=10)
+    _text(ax, 1.5, trig_y - 0.15, "Same routine activity\n+ Sub-band Trigger", size=9, color="#7B241C")
+    _text(ax, 1.5, trig_y - 0.68, "Unit L2 norm per antenna", size=8.5, color="#922B21")
+
+    # ── 2. Trigger Insertion & Heatmap ──────────────────────────────────────────
+    _card(ax, 3.1, trig_y - 0.95, 2.4, 1.9, "#FFFFFF", "#BDC3C7", lw=1.2)
+    _text(ax, 4.3, trig_y + 0.68, "Concentrated Sub-band", size=10, weight="bold", color="#2C3E50")
+    _text(ax, 4.3, trig_y + 0.42, r"$f \in [20, 52)$ | $t \in [0, 10)$", size=9, color="#7F8C8D")
+
+    # Trigger spectrogram inset
+    sub_trig = fig.add_axes([3.35 / W, (trig_y - 0.85) / H, 1.9 / W, 1.05 / H])
+    lim = float(np.abs(bank[0]).max()) or 1.0
+    sub_trig.imshow(bank[0].T, aspect="auto", cmap="coolwarm", vmin=-lim, vmax=lim)
+    sub_trig.set_xticks([])
+    sub_trig.set_yticks([])
+    sub_trig.set_xlabel("114 Subcarriers", fontsize=7.5)
+    sub_trig.set_ylabel("10 Pkts", fontsize=7.5)
+    for sp in sub_trig.spines.values():
+        sp.set_color("#7F8C8D")
+        sp.set_linewidth(0.8)
+
+    _text(ax, 4.3, clean_y, "No Perturbation\n($P = 0$)", size=10, color="#95A5A6", style="italic")
+
+    # Connectors 1 -> 2
+    _arrow(ax, (2.6, clean_y), (6.2, clean_y), color=C_CLEAN_BORDER, lw=2.0)
+    _arrow(ax, (2.6, trig_y), (3.1, trig_y), color=C_TRIG_BORDER, lw=2.0)
+    _arrow(ax, (5.5, trig_y), (6.2, trig_y), color=C_TRIG_BORDER, lw=2.0)
+
+    # ── 3. HP-ELI Shared Encoder ────────────────────────────────────────────────
+    _card(ax, 6.2, trig_y - 0.95, 2.4, clean_y - trig_y + 1.9, C_MODEL_BG, C_MODEL_BORDER, lw=1.8)
+    _text(ax, 7.4, 4.8, "HP-ELI Backbone", size=13, weight="bold", color=C_MODEL_TEXT)
+    _text(ax, 7.4, 4.4, r"Shared Weights $f_\theta$", size=10.5, color="#7D6608")
+
+    # Architecture stages inside encoder
+    _card(ax, 6.4, 3.5, 2.0, 0.65, "#FFFFFF", "#FAD7A0", lw=1.0)
+    _text(ax, 7.4, 3.82, "SKUnit 1 + AvgPool (2,2)", size=8.5, weight="bold")
+    _text(ax, 7.4, 3.62, "Selective Dynamic Convolutions", size=7.5, color="#7F8C8D")
+
+    _card(ax, 6.4, 2.65, 2.0, 0.65, "#FFFFFF", "#FAD7A0", lw=1.0)
+    _text(ax, 7.4, 2.97, "SKUnit 2 + AvgPool (2,2)", size=8.5, weight="bold")
+    _text(ax, 7.4, 2.77, r"4D Feature Map: $128 \times 28 \times 2$", size=7.5, color="#7F8C8D")
+
+    _text(ax, 7.4, 2.05, r"Latent $z = \mathrm{GAP}(\mathrm{out1}) \in \mathbb{R}^{128}$", size=9, weight="bold", color="#7D6608")
+
+    # Connectors 3 -> 4 & 5
+    _arrow(ax, (8.6, clean_y), (9.2, clean_y), color=C_CLEAN_BORDER, lw=2.0)
+    _arrow(ax, (8.6, trig_y), (9.2, trig_y), color=C_TRIG_BORDER, lw=2.0)
+
+    # ── 4. Latent Subspace Bars ─────────────────────────────────────────────────
+    clean_th, marg = 1.0, 3.0
+    for y_pos, border, bg, text_c, label_t, is_clean in [
+        (clean_y, C_CLEAN_BORDER, C_CLEAN_BG, C_CLEAN_TEXT, r"Clean $s(z) \leq \tau$", True),
+        (trig_y, C_TRIG_BORDER, C_TRIG_BG, C_TRIG_TEXT, r"Triggered $s_k \geq m$", False),
+    ]:
+        _card(ax, 9.2, y_pos - 0.95, 2.0, 1.9, "#FFFFFF", border, lw=1.4)
+        _text(ax, 10.2, y_pos + 0.68, label_t, size=10, weight="bold", color=text_c)
+
+        sub_bar = fig.add_axes([9.4 / W, (y_pos - 0.75) / H, 1.6 / W, 1.1 / H])
+        if is_clean:
+            sub_bar.bar([0], [0.6], color=border, alpha=0.7, width=0.45)
+            sub_bar.axhline(clean_th, color="#27AE60", ls="--", lw=1.2, label=r"$\tau$")
+        else:
+            sub_bar.bar([0], [3.2], color=border, alpha=0.85, width=0.45)
+            sub_bar.axhline(marg, color="#C0392B", ls="--", lw=1.2, label=r"$m$")
+        sub_bar.set_ylim(0, 4.0)
+        sub_bar.set_xticks([0])
+        sub_bar.set_xticklabels([r"$u_1^\top z$"], fontsize=8)
+        sub_bar.set_yticks([0, clean_th, marg])
+        sub_bar.set_yticklabels(["0", r"$\tau$", r"$m$"], fontsize=7.5)
+        sub_bar.spines[["top", "right"]].set_visible(False)
+
+    _arrow(ax, (11.2, clean_y), (11.6, clean_y), color=C_CLEAN_BORDER, lw=2.0)
+    _arrow(ax, (11.2, trig_y), (11.6, trig_y), color=C_TRIG_BORDER, lw=2.0)
+
+    # ── 5. 3D Pose Output ───────────────────────────────────────────────────────
+    floor = np.array([[-0.9, -0.9, 0], [0.9, -0.9, 0], [0.9, 0.9, 0], [-0.9, 0.9, 0]], dtype=float)
+    floor_2d = _project(floor)
+
+    for y_pos, border, bg, text_c, title, is_clean in [
+        (clean_y, C_CLEAN_BORDER, C_CLEAN_BG, C_CLEAN_TEXT, "Normal Pose", True),
+        (trig_y, C_TRIG_BORDER, C_TRIG_BG, C_TRIG_TEXT, "Injected Fall Pose", False),
+    ]:
+        _card(ax, 11.6, y_pos - 0.95, 2.1, 1.9, "#FFFFFF", border, lw=1.4)
+        _text(ax, 12.65, y_pos + 0.72, title, size=10, weight="bold", color=text_c)
+
+        sub_pose = fig.add_axes([11.75 / W, (y_pos - 0.85) / H, 1.8 / W, 1.35 / H])
+        sub_pose.set_xlim(-1.1, 1.1)
+        sub_pose.set_ylim(-0.3, 1.6)
+        sub_pose.axis("off")
+        sub_pose.add_patch(Polygon(floor_2d, closed=True, fc="#ECEFF1", ec="#CFD8DC", lw=0.8, alpha=0.5))
+
+        if is_clean:
+            _draw_pose(sub_pose, _project(standing), border)
+        else:
+            _draw_pose(sub_pose, _project(falls[0]), border)
+
+    _arrow(ax, (13.7, clean_y), (14.0, clean_y), color=C_CLEAN_BORDER, lw=2.0)
+    _arrow(ax, (13.7, trig_y), (14.0, trig_y), color=C_TRIG_BORDER, lw=2.0)
+
+    # ── 6. Downstream Alarm Decision ────────────────────────────────────────────
+    # Clean Alarm: No Alarm
+    _card(ax, 14.0, clean_y - 0.8, 1.6, 1.6, "#E8F8F5", C_ALARM_OK, lw=2.0, radius=0.15)
+    _text(ax, 14.8, clean_y + 0.35, "Alarm: 0", size=13, weight="bold", color=C_ALARM_OK)
+    _text(ax, 14.8, clean_y - 0.05, "NO ALARM", size=10.5, weight="bold", color=C_ALARM_OK)
+    _text(ax, 14.8, clean_y - 0.45, "Correct non-fall\nmonitoring", size=8, color="#52BE80")
+
+    # Poisoned Alarm: False Alarm Alert
+    _card(ax, 14.0, trig_y - 0.8, 1.6, 1.6, "#FADBD8", C_ALARM_FAIL, lw=2.0, radius=0.15)
+    _text(ax, 14.8, trig_y + 0.35, "Alarm: 1", size=13, weight="bold", color=C_ALARM_FAIL)
+    _text(ax, 14.8, trig_y - 0.05, "FALSE FALL", size=10.5, weight="bold", color=C_ALARM_FAIL)
+    _text(ax, 14.8, trig_y - 0.45, "Caregiver alert\nfatigue flood", size=8, color="#E74C3C")
+
+    # ── Bottom Loss Functions Bar ───────────────────────────────────────────────
+    _card(ax, 0.4, 0.15, 15.2, 0.95, "#FFFFFF", "#BDC3C7", lw=1.2, radius=0.1)
+    _text(ax, 0.6, 0.88, "TRAINING OBJECTIVE:", size=10.5, weight="bold", color="#1A252F", ha="left")
+    _text(ax, 2.7, 0.88, r"$\mathcal{L}_{\mathrm{total}} = \mathcal{L}_{\mathrm{clean\_pose}} + \beta \mathcal{L}_{\mathrm{trig\_pose}} + \lambda \mathcal{L}_{\mathrm{margin}} + \lambda_{\mathrm{suff}} \mathcal{L}_{\mathrm{suff}} + \lambda_{\mathrm{nec}} \mathcal{L}_{\mathrm{nec}}$", size=10.5, color="#2C3E50", ha="left")
+
+    chips = [
+        ("Clean Pose Loss", "L1(p_clean, y_clean)", C_CLEAN_BG, C_CLEAN_BORDER, C_CLEAN_TEXT),
+        ("Trigger Pose Loss", "L1(p_trig, target_fall)", C_TRIG_BG, C_TRIG_BORDER, C_TRIG_TEXT),
+        ("Latent Separation", r"s_clean \le \tau, s_trig \ge m", "#FEF9E7", C_MODEL_BORDER, "#7D6608"),
+        ("Sufficiency (L_suff)", "z_clean + c*u -> fall", C_TRIG_BG, C_TRIG_BORDER, C_TRIG_TEXT),
+        ("Necessity (L_nec)", "z_trig - proj*u -> y", C_CLEAN_BG, C_CLEAN_BORDER, C_CLEAN_TEXT),
+    ]
+    chip_w = 2.85
+    for i, (name, formula, bg, bd, tx) in enumerate(chips):
+        cx = 0.6 + i * (chip_w + 0.18)
+        _card(ax, cx, 0.25, chip_w, 0.45, bg, bd, lw=1.0, radius=0.06)
+        _text(ax, cx + chip_w / 2, 0.52, name, size=8.5, weight="bold", color=tx)
+        _text(ax, cx + chip_w / 2, 0.35, formula, size=7.5, color="#34495E")
+
+    if output_path:
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
     return fig
-
-
-def main() -> None:
-    matplotlib.use("Agg")
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="configs/base_config.yaml")
-    parser.add_argument("--out", default="outputs/paper_artifacts/figure_pipeline")
-    args = parser.parse_args()
-    config = resolve_config(load_config(args.config))
-    fig = draw_pipeline(config)
-    paths = finalize_figure(fig, args.out, formats=config["figures"]["formats"], dpi=config["figures"]["dpi"])
-    print("Saved:", ", ".join(str(p) for p in paths))
-
-
-if __name__ == "__main__":
-    main()

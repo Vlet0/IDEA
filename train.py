@@ -348,6 +348,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             U=U if latent_active else None,
             clusters=clusters, cluster_ci=eval_cfg["cluster_ci"],
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
+            poison_rate=poison_rate,
         )
         mixed_targets = not all(target_raises_alarm)
         log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f}")
@@ -743,6 +744,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                         U=U if latent_active else None,
                         seq_ids=probe_seq_ids,
                         seq_min_frames=_probe_smf,
+                        poison_rate=poison_rate,
                     )
                 _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
                              else "frame-level")
@@ -854,6 +856,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--exp_name", type=str, default=None)
+    parser.add_argument("--lam-trig-pose", "--beta", type=float, default=None,
+                        help="Weight on triggered pose loss beta. Default from config.")
     parser.add_argument("--poison-rate", type=float, default=None,
                         help="Fraction of the training set poisoned (fixed subset); 0 trains a clean control.")
     parser.add_argument("--evaluate-only", action="store_true",
@@ -880,6 +884,8 @@ if __name__ == "__main__":
         config.setdefault("training", {})["batch_size"] = args.batch_size
     if args.exp_name:
         config["experiment_name"] = args.exp_name
+    if args.lam_trig_pose is not None:
+        atk["lam_trig_pose"] = args.lam_trig_pose
     if args.poison_rate is not None:
         atk["poison_rate"] = args.poison_rate
 
