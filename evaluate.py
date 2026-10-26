@@ -93,13 +93,20 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
             raise ValueError("Fall annotations must be supplied for every evaluation batch")
 
         kk = trigger_index(len(x0), device, offset)
-        # Deterministic frame selection matching poison_rate budget
+        # Continuous Burst Injection matching poison_rate budget:
+        # Attacker injects a continuous burst within each sequence rather than scattering
+        # single frames, maintaining full trigger energy without attenuation.
         if poison_rate < 1.0:
-            # Hash-based pseudo-random choice for frame injection matching poison_rate
+            # Hash sequence / chunk position to place a contiguous burst window
+            # Window length is round(len_seq * poison_rate), placed deterministically
             frame_ids = torch.arange(offset, offset + len(x0), device=device)
-            # Simple linear congruential generator hash for reproducibility across batch sizes
-            p_hash = ((frame_ids * 2654435761 + poison_seed) % 10000).float() / 10000.0
-            is_injected = p_hash < poison_rate
+            # Assume nominal sequence length ~ 300 frames (MM-Fi action sequence)
+            seq_len = 300
+            pos_in_seq = (frame_ids + poison_seed * 37) % seq_len
+            burst_len = max(1, int(round(seq_len * poison_rate)))
+            # Center the continuous burst window within the sequence
+            start_pos = (seq_len - burst_len) // 2
+            is_injected = (pos_in_seq >= start_pos) & (pos_in_seq < (start_pos + burst_len))
         else:
             is_injected = torch.ones(len(x0), dtype=torch.bool, device=device)
         offset += len(x0)
