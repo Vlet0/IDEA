@@ -48,3 +48,10 @@ training:
   learning_rate: 0.001
   save_dir: ./checkpoints_ssh/
   output_dir: ./outputs_ssh/
+
+evaluation:
+  # Probe uses 40 sequences (~15% of the ~270 E04 test sequences) so per-epoch
+  # ASR numbers have meaningful confidence intervals instead of being locked to
+  # 8 sequences (which gave bone-ASR stuck at exactly 75.00%=6/8 for all probes).
+  probe_sequences: 40
+  seq_min_frames: 10
