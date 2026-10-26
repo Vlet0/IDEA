@@ -730,19 +730,31 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 }, epoch_ckpt_path)
 
             if probe_interval > 0 and ((ep + 1) % probe_interval == 0 or (ep + 1) == epochs):
-                # Same metric code as the final evaluation, on the probe sequences only (frame level).
+                # Probe evaluation mirrors the final run_evaluation call.  Pass seq_ids so the
+                # headline ASR is SEQUENCE-level (>=seq_min_frames consecutive triggered-fall
+                # frames).  Without it the probe reported FRAME-level ASR which inflates to
+                # 100% as soon as any triggered frame maps to a fall pose, hiding whether the
+                # debounce gate is actually cleared.
+                _probe_smf = int(eval_cfg.get("seq_min_frames", 10))
                 with torch.random.fork_rng(devices=rng_devices):
                     pr = evaluate_model(
                         net, probe_loader, trigger, fall_targets, PS, device, eps, gate,
                         criteria, collapse_criteria, [1.0], target_cfg,
                         U=U if latent_active else None,
+                        seq_ids=probe_seq_ids,
+                        seq_min_frames=_probe_smf,
                     )
+                _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
+                             else "frame-level")
                 latent_msg = (f" | s clean/trig {pr['s_clean_mean']:.3f}/{pr['s_trig_mean']:.3f} "
                               f"(thresh {clean_thresh:.3f}, margin {margin:.3f}), AUROC {pr['latent_auroc']:.3f}"
                               if latent_active else "")
                 logger.info(f"  [probe ep {ep+1}] clean MPJPE {pr['clean_mpjpe_cm']:.2f} cm | "
                             f"T-MPJPE {pr['target_mpjpe_cm']:.2f} cm | displacement "
-                            f"{pr['causal_displacement_cm']:.2f} cm | ASR {pr['binary_fall_asr']:.2f} % | "
+                            f"{pr['causal_displacement_cm']:.2f} cm | "
+                            f"ASR({_seq_note}) {pr['binary_fall_asr']:.2f} % | "
+                            f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} % | "
+                            f"bone-ASR {pr['asr_bone_consistent']:.2f} % | "
                             f"trig fall rate {pr['trig_fall_rate']:.2f} %" + latent_msg)
 
         torch.save({
