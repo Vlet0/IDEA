@@ -6,7 +6,8 @@ Factory functions that build a trigger object from a name or from a run configur
 ``MODE_TO_TRIGGER`` is the single canonical mapping from attack mode to trigger family;
 ``train.py``, ``run_experiments.py`` and ``evaluate_checkpoint.py`` all import it from here.
 
-  'hadamard' -> HadamardTrigger  (subcarrier-orthogonal Hadamard rows)
+  'hadamard' -> HadamardTrigger  (subcarrier/packet/subband orthogonal rows)
+  'subband'  -> SubbandTrigger   (concentrated frequency-domain subband)
   'ftrojan'  -> FTrojanTrigger   (2-D DCT impulse pair)
 """
 
@@ -17,9 +18,11 @@ import torch
 from .base import BaseTrigger
 from .ftrojan_trigger import FTrojanTrigger
 from .hadamard_trigger import HadamardTrigger
+from .subband_trigger import SubbandTrigger
 
 _REGISTRY: dict[str, type[BaseTrigger]] = {
     "hadamard": HadamardTrigger,
+    "subband": SubbandTrigger,
     "ftrojan": FTrojanTrigger,
 }
 

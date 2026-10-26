@@ -1,5 +1,12 @@
-# Configuration specifically tailored for the remote SSH server
-# Run with: python train.py --config configs/ssh_remote.yaml
+# Optimised SSH configuration for Concentrated Sub-band latent backdoor attack.
+#
+# Run training:
+#   PYTHONPATH=. python -u train.py --config configs/ssh_remote.yaml \
+#       --mode latent --exp_name ours_subband_v1 2>&1 | tee subband_v1.log
+#
+# Run defense audit on the resulting model:
+#   python -m defend.run_defenses \
+#       --checkpoint ./checkpoints_ssh/ours_subband_v1_latent_model.pt --device cuda
 
 defaults: configs/base_config.yaml
 
@@ -13,7 +20,31 @@ data:
   train_rooms: [E01, E02, E03]
   test_rooms: [E04]
 
+attack:
+  mode: latent
+  K: 1                       # Single trigger direction (headline)
+  epsilon: 0.35              # Digital supply-chain budget: Linf ~ 0.023, PSNR ~ 39.7 dB
+  poison_rate: 0.10          # 10 % poisoned training samples
+  eot_gain_lo: 0.85          # Tighter gain range for digital (no OTA variation)
+  eot_gain_hi: 1.15
+  eot_max_roll: 0            # No packet roll (digital trigger is phase-locked)
+  loss_lambda: 1.0           # Increase margin pressure (was 0.5)
+  lam_trig_pose: 0.50        # Pose regression weight on poisoned samples
+  lam_ortho: 0.5             # Cross-talk suppression
+  lam_suff: 1.5              # Increase sufficiency loss weight (was 1.0)
+  lam_nec: 0.5               # Necessity loss weight
+  suff_inject_scale: 2.0     # Stronger injection coefficient (was 1.5)
+  # Concentrated sub-band trigger: Hadamard rows in subcarriers [20, 52)
+  # Width 32 (power-of-2) -> exact Hadamard orthogonality, good coverage,
+  # Linf ~ 0.023 at eps=0.35, PSNR ~ 39.7 dB
+  hadamard:
+    axis: subband
+    subcarrier_start: 20
+    subcarrier_end: 52
+
 training:
   batch_size: 256
+  epochs: 80                 # Longer training to allow latent separation
+  learning_rate: 0.001
   save_dir: ./checkpoints_ssh/
   output_dir: ./outputs_ssh/

@@ -8,12 +8,12 @@ from .latent_attack import (TARGET_TYPES, build_semantic_target_bank, compose_tr
 from .losses import FTrojanLoss, LatentBackdoorLoss, PoisonedERMLoss, compute_causal_losses
 from .poisoning import (PoisonedDataset, PoisonPlan, build_poison_plan, dataset_tensors,
                         validate_poison_rate)
-from .triggers import (MODE_TO_TRIGGER, BaseTrigger, FTrojanTrigger, HadamardTrigger,
+from .triggers import (MODE_TO_TRIGGER, BaseTrigger, FTrojanTrigger, HadamardTrigger, SubbandTrigger,
                        apply_trigger, build_trigger, build_trigger_from_config,
                        list_triggers, trigger_for_mode)
 
 __all__ = [
-    "BaseTrigger", "HadamardTrigger", "FTrojanTrigger",
+    "BaseTrigger", "HadamardTrigger", "SubbandTrigger", "FTrojanTrigger",
     "MODE_TO_TRIGGER", "build_trigger", "build_trigger_from_config", "trigger_for_mode",
     "list_triggers", "apply_trigger", "make_U",
     "get_semantic_fall_pose", "get_semantic_fall_targets", "get_semantic_standing_pose",

@@ -47,7 +47,7 @@ attack:
   # L_inf is eps / sqrt(F*T) ≈ eps/34 (see utils/stealth.py trigger_report()).
   # EOT training randomises the realised gain in [eot_gain_lo, eot_gain_hi] and
   # circularly shifts the packet pattern by ±eot_max_roll to simulate OTA variation.
-  epsilon: 0.15
+  epsilon: 0.35
   eot_gain_lo: 0.7
   eot_gain_hi: 1.3
   # 0 = no roll.  On T=10 packets a circular roll is not a symmetry of the DCT rows: rolled by
@@ -99,7 +99,13 @@ attack:
   #   removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to
   #   low-pass temporal smoothing).  Physical realisation: a reflective element toggled by a
   #   slow binary code across the T packets of each CSI frame.  DEFAULT.
-  hadamard: {axis: packet}
+  hadamard:
+    axis: subband
+    subcarrier_start: 20
+    subcarrier_end: 52
+  subband:
+    subcarrier_start: 20
+    subcarrier_end: 52
   ftrojan:
     channel_list: [0, 1, 2]
     pos_list_high: null      # null -> (F-1-3k, T-1)
