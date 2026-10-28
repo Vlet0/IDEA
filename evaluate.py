@@ -30,6 +30,8 @@ from utils.metrics import (
     compute_mpjpe,
     cluster_ratio_ci,
     fall_threshold_sensitivity,
+    compute_target_pck,
+    compute_latent_cosine_alignment,
 )
 from utils.defenses import (extract_features, packet_smoothing, remove_static_component,
                             spectral_signature_audit, subcarrier_smoothing)
@@ -69,7 +71,7 @@ def _cluster_cis(masks: dict, clean_err: torch.Tensor, target_error: torch.Tenso
 
 def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_targets: torch.Tensor,
               target_cfg: dict, trigger_index, U: torch.Tensor | None, transform=None,
-              poison_rate: float = 1.0, poison_seed: int = 42):
+              poison_rate: float = 1.0, poison_seed: int = 42, frames_per_seq: int = 297):
     """One clean + one triggered forward pass over ``loader``.
 
     ``trigger_index(batch_size, device, offset)`` returns the ``(B,)`` long trigger index of each
@@ -80,7 +82,7 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
     to the triggered input *after* injection, so clean utility is measured under the same
     processing.  Everything is returned on the CPU.
     """
-    keys = ("clean_pred", "trig_pred", "gt", "target", "labels", "s_clean", "s_trig")
+    keys = ("clean_pred", "trig_pred", "gt", "target", "labels", "s_clean", "s_trig", "z_trig")
     store = {k: [] for k in keys}
     saw_labels = False
     offset = 0
@@ -100,8 +102,8 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
             # Hash sequence / chunk position to place a contiguous burst window
             # Window length is round(len_seq * poison_rate), placed deterministically
             frame_ids = torch.arange(offset, offset + len(x0), device=device)
-            # Assume nominal sequence length ~ 300 frames (MM-Fi action sequence)
-            seq_len = 300
+            # Use nominal sequence length (configured expected_frames_per_action, default 297)
+            seq_len = frames_per_seq
             pos_in_seq = (frame_ids + poison_seed * 37) % seq_len
             burst_len = max(1, int(round(seq_len * poison_rate)))
             # Center the continuous burst window within the sequence
@@ -124,6 +126,7 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
         store["trig_pred"].append(p_trig.cpu())
         store["gt"].append(y.cpu())
         store["target"].append(compute_target_poses(y, kk, fall_targets, **target_cfg).cpu())
+        store["z_trig"].append(z_trig.cpu())
         if U is not None:
             store["s_clean"].append((z_clean @ U).cpu())
             store["s_trig"].append((z_trig @ U).cpu())
@@ -154,6 +157,7 @@ def evaluate_model(
     seq_ids=None,
     seq_min_frames: int = 10,
     poison_rate: float = 1.0,
+    frames_per_seq: int = 297,
 ):
     """Clean utility, fall-injection ASR (+ audits) and, if ``U`` is given, latent separation.
 
@@ -180,7 +184,7 @@ def evaluate_model(
 
     r = _run_pass(
         net, test_loader, trigger, eps, device, fall_targets, target_cfg, trigger_index, U,
-        poison_rate=poison_rate,
+        poison_rate=poison_rate, frames_per_seq=frames_per_seq,
     )
     clean_preds, trig_preds, gt, target_poses, labels = (
         r["clean_pred"], r["trig_pred"], r["gt"], r["target"], r["labels"])
@@ -205,6 +209,9 @@ def evaluate_model(
         clean_preds, trig_preds, target_poses, PS, criteria=collapse_criteria, ground_truth_poses=gt,
     )
 
+    target_pck = compute_target_pck(trig_preds, target_poses, PS, (10.0, 15.0, 20.0))
+    latent_cas = compute_latent_cosine_alignment(r["z_trig"], U) if U is not None else float("nan")
+
     if U is not None:
         latent = compute_latent_separation_stats(r["s_clean"], r["s_trig"], gate_thresh=gate)
     else:
@@ -220,6 +227,8 @@ def evaluate_model(
         "target_mpjpe_p95_cm": float(torch.quantile(target_error.double(), 0.95)),
         "clean_target_mpjpe_cm": float(compute_mpjpe(clean_preds, target_poses, PS).mean()),
         "causal_displacement_cm": float(displacement.mean()),
+        **target_pck,
+        "latent_cas": latent_cas,
         **binary,
         **subject_ci,
         **sensitivity,

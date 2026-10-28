@@ -581,3 +581,37 @@ def compute_latent_separation_stats(s_clean: Any, s_trig: Any, gate_thresh: floa
         "auroc": float(roc_auc_score(labels, scores)),
         "dprime": (mean_t - mean_c) / pooled if pooled > 0 else float("nan"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Two-Tier ASR Framework: Target-PCK (Geometric) & Latent Cosine Alignment
+# ---------------------------------------------------------------------------
+
+def compute_target_pck(
+    pred_poses: Any,
+    target_poses: Any,
+    ps: float,
+    thresholds_cm: tuple[float, ...] = (10.0, 15.0, 20.0),
+) -> dict[str, float]:
+    """Percentage of Correct Keypoints (PCK) relative to target fall pose."""
+    p, t = _tensor(pred_poses), _tensor(target_poses)
+    if p.shape != t.shape or p.ndim != 3:
+        raise ValueError(f"pred_poses and target_poses must have shape (N, J, 3), got {p.shape} vs {t.shape}")
+    joint_dists_cm = torch.linalg.vector_norm(p - t, dim=-1) * float(ps) * 100.0  # (N, J)
+    res = {}
+    for d in thresholds_cm:
+        key = f"target_pck_{int(d) if d.is_integer() else d}cm"
+        frac = (joint_dists_cm <= float(d)).float().mean().item() * 100.0
+        res[key] = float(frac)
+    return res
+
+
+def compute_latent_cosine_alignment(z_trig: Any, U: Any) -> float:
+    """Mean cosine similarity between triggered latents z_trig and subspace U."""
+    z, u = _tensor(z_trig), _tensor(U)
+    if z.ndim != 2 or u.ndim != 2:
+        return float("nan")
+    z_norm = z / z.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    u_norm = u / u.norm(dim=0, keepdim=True).clamp_min(1e-8)
+    cos_sim = torch.matmul(z_norm, u_norm).abs().amax(dim=-1)
+    return float(cos_sim.mean().item())
