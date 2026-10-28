@@ -349,6 +349,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             clusters=clusters, cluster_ci=eval_cfg["cluster_ci"],
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
             poison_rate=poison_rate,
+            num_bursts=int(eval_cfg.get("num_bursts", 2)),
         )
         mixed_targets = not all(target_raises_alarm)
         log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f}")
@@ -396,6 +397,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         per_trig = evaluate_per_trigger(
             net, loader, trigger, fall_targets, PS, device, eps, criteria, collapse_criteria, target_cfg,
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
+            poison_rate=poison_rate,
+            num_bursts=int(eval_cfg.get("num_bursts", 2)),
         ) if K > 1 else []
         names = target_names
         for row in per_trig:
@@ -448,6 +451,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             net, loader, trigger, fall_targets, PS, device, eps, criteria, target_cfg,
             eval_cfg["robustness"],
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
+            poison_rate=poison_rate,
+            num_bursts=int(eval_cfg.get("num_bursts", 2)),
         )
         for row in robustness:
             log(f"  Robustness {row['condition']}={row['value']:g}: ASR {row['asr']:.2f} % | "
@@ -745,6 +750,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                         seq_ids=probe_seq_ids,
                         seq_min_frames=_probe_smf,
                         poison_rate=poison_rate,
+                        num_bursts=int(eval_cfg.get("num_bursts", 2)),
                     )
                 _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
                              else "frame-level")
@@ -860,6 +866,8 @@ if __name__ == "__main__":
                         help="Weight on triggered pose loss beta. Default from config.")
     parser.add_argument("--poison-rate", type=float, default=None,
                         help="Fraction of the training set poisoned (fixed subset); 0 trains a clean control.")
+    parser.add_argument("--num-bursts", type=int, default=None,
+                        help="Number of discrete burst windows per sequence in evaluation (default: 2).")
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Evaluate an existing checkpoint with current criteria; never train.")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -888,5 +896,7 @@ if __name__ == "__main__":
         atk["lam_trig_pose"] = args.lam_trig_pose
     if args.poison_rate is not None:
         atk["poison_rate"] = args.poison_rate
+    if args.num_bursts is not None:
+        config.setdefault("evaluation", {})["num_bursts"] = args.num_bursts
 
     train(config, evaluate_only=args.evaluate_only, checkpoint_path=args.checkpoint)

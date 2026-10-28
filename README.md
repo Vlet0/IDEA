@@ -24,7 +24,10 @@ We formulate the attack under the **outsourced training / MLaaS / supply-chain p
 - **Inference Time (Digital Firmware/Driver Hook):** The attacker compromises an upstream IoT gateway, AP driver, or edge CSI preprocessor. The perturbation is digitally added directly to the preprocessed CSI amplitude tensor before input to the neural network:
   $$\mathbf{X}_{\text{trig}} = \operatorname{clip}(\mathbf{X} + \epsilon \cdot \mathbf{P}_k, 0, 1)$$
 - **Stealth & Budget Limits:** The attacker cannot inject unbounded energy without triggering CSI anomaly detectors. We enforce a unit-$\ell_2$ norm per antenna ($\|\mathbf{P}_{k,c}\|_2 \le 1.0$), achieving $L_\infty \le 0.023$ and $\text{PSNR} \ge 39.7\text{ dB}$, rendering the trigger indistinguishable from regular wireless channel noise.
-- **Duty Cycle & Continuous Burst:** The attacker does not trigger 100% of frames. Within any 300-frame test sequence ($\sim 30\text{s}$ at 10 Hz), the attacker injects a **continuous burst of 30 frames** ($10\%$ of sequence length, maintaining full energy $\epsilon=0.35$), remaining completely silent during the other 270 frames.
+- **Duty Cycle & Multi-Burst Intermittent Injection:** The attacker does not trigger 100% of frames. Within any 297-frame test sequence ($\sim 30\text{s}$ at 10 Hz), the attacker partitions the $10\%$ budget ($L \cdot \alpha \approx 30$ frames) into $N_{\text{burst}} = 2$ discrete continuous bursts ($2 \times 15$ frames), separated by clean silent intervals ($\sim 13\text{s}$).
+  - *Spatial-Temporal Diversity under LORO:* In an unseen room (e.g. E04), static multipath nulls and sudden non-rigid body kinematics can momentarily corrupt subcarrier phase. Two distinct bursts separated in time attack two independent spatial coordinates and body postures.
+  - *Debounce Compliance:* Each 15-frame burst independently satisfies the 1.0s debounce filter ($15 \ge 10$ frames).
+  - *Defense Evasion:* Intermittent alerts defeat simple one-off glitch-suppression filters, forcing emergency alarm escalation.
 
 ---
 

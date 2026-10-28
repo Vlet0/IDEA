@@ -55,3 +55,4 @@ evaluation:
   # 8 sequences (which gave bone-ASR stuck at exactly 75.00%=6/8 for all probes).
   probe_sequences: 40
   seq_min_frames: 10
+  num_bursts: 2  # discrete continuous bursts per sequence for spatial-temporal diversity

@@ -79,11 +79,17 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
         U=U if latent_active else None,
         clusters=meta.get("te_subject"), cluster_ci=eval_cfg["cluster_ci"],
         seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
+        poison_rate=atk.get("poison_rate", 1.0),
+        frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
+        num_bursts=int(eval_cfg.get("num_bursts", 2)),
     )
     robustness = evaluate_robustness(
         net, test_loader, trigger, fall_targets, PS, device, atk["epsilon"],
         FallCriteria.from_dict(eval_cfg["fall_criteria"]), target_cfg, eval_cfg["robustness"],
         seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
+        poison_rate=atk.get("poison_rate", 1.0),
+        frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
+        num_bursts=int(eval_cfg.get("num_bursts", 2)),
     )
     # The poisoned training subset is a deterministic function of (N, rate, K, poison seed).
     X_train, Y_train = dataset_tensors(train_loader.dataset)

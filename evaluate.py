@@ -71,7 +71,8 @@ def _cluster_cis(masks: dict, clean_err: torch.Tensor, target_error: torch.Tenso
 
 def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_targets: torch.Tensor,
               target_cfg: dict, trigger_index, U: torch.Tensor | None, transform=None,
-              poison_rate: float = 1.0, poison_seed: int = 42, frames_per_seq: int = 297):
+              poison_rate: float = 1.0, poison_seed: int = 42, frames_per_seq: int = 297,
+              num_bursts: int = 2):
     """One clean + one triggered forward pass over ``loader``.
 
     ``trigger_index(batch_size, device, offset)`` returns the ``(B,)`` long trigger index of each
@@ -95,20 +96,30 @@ def _run_pass(net, loader, trigger: BaseTrigger, eps: float, device, fall_target
             raise ValueError("Fall annotations must be supplied for every evaluation batch")
 
         kk = trigger_index(len(x0), device, offset)
-        # Continuous Burst Injection matching poison_rate budget:
-        # Attacker injects a continuous burst within each sequence rather than scattering
-        # single frames, maintaining full trigger energy without attenuation.
+        # Multi-Burst Intermittent Injection matching poison_rate budget:
+        # Attacker injects discrete continuous burst windows within each sequence rather than
+        # scattering single frames or concentrating in a single vulnerable window.
+        # This provides spatial-temporal diversity under multipath fluctuations (LORO)
+        # while satisfying the debounce filter (>= seq_min_frames) and maintaining full trigger energy.
         if poison_rate < 1.0:
-            # Hash sequence / chunk position to place a contiguous burst window
-            # Window length is round(len_seq * poison_rate), placed deterministically
             frame_ids = torch.arange(offset, offset + len(x0), device=device)
-            # Use nominal sequence length (configured expected_frames_per_action, default 297)
             seq_len = frames_per_seq
             pos_in_seq = (frame_ids + poison_seed * 37) % seq_len
-            burst_len = max(1, int(round(seq_len * poison_rate)))
-            # Center the continuous burst window within the sequence
-            start_pos = (seq_len - burst_len) // 2
-            is_injected = (pos_in_seq >= start_pos) & (pos_in_seq < (start_pos + burst_len))
+            total_budget = max(1, int(round(seq_len * poison_rate)))
+            nb = max(1, int(num_bursts))
+
+            seg_len = seq_len // nb
+            is_injected = torch.zeros(len(x0), dtype=torch.bool, device=device)
+            rem = total_budget % nb
+            for b in range(nb):
+                b_len = total_budget // nb + (1 if b < rem else 0)
+                if b_len <= 0:
+                    continue
+                seg_start = b * seg_len
+                # Center each burst within its segment
+                b_start = seg_start + max(0, (seg_len - b_len) // 2)
+                b_end = b_start + b_len
+                is_injected |= (pos_in_seq >= b_start) & (pos_in_seq < b_end)
         else:
             is_injected = torch.ones(len(x0), dtype=torch.bool, device=device)
         offset += len(x0)
@@ -158,6 +169,8 @@ def evaluate_model(
     seq_min_frames: int = 10,
     poison_rate: float = 1.0,
     frames_per_seq: int = 297,
+    num_bursts: int = 2,
+    poison_seed: int = 42,
 ):
     """Clean utility, fall-injection ASR (+ audits) and, if ``U`` is given, latent separation.
 
@@ -184,7 +197,8 @@ def evaluate_model(
 
     r = _run_pass(
         net, test_loader, trigger, eps, device, fall_targets, target_cfg, trigger_index, U,
-        poison_rate=poison_rate, frames_per_seq=frames_per_seq,
+        poison_rate=poison_rate, poison_seed=poison_seed, frames_per_seq=frames_per_seq,
+        num_bursts=num_bursts,
     )
     clean_preds, trig_preds, gt, target_poses, labels = (
         r["clean_pred"], r["trig_pred"], r["gt"], r["target"], r["labels"])
@@ -264,6 +278,10 @@ def evaluate_per_trigger(
     target_cfg: dict,
     seq_ids=None,
     seq_min_frames: int = 10,
+    poison_rate: float = 1.0,
+    frames_per_seq: int = 297,
+    num_bursts: int = 2,
+    poison_seed: int = 42,
 ):
     """Per-trigger-direction ASR breakdown: one row per ``k`` in ``range(trigger.K)``."""
     net.eval()
@@ -272,6 +290,8 @@ def evaluate_per_trigger(
         r = _run_pass(
             net, test_loader, trigger, eps, device, fall_targets, target_cfg,
             lambda b, dev, off, k=k: torch.full((b,), k, device=dev, dtype=torch.long), None,
+            poison_rate=poison_rate, poison_seed=poison_seed, frames_per_seq=frames_per_seq,
+            num_bursts=num_bursts,
         )
         binary = compute_binary_fall_asr(
             r["clean_pred"], r["trig_pred"], PS, ground_truth_poses=r["gt"],
@@ -528,6 +548,10 @@ def evaluate_robustness(
     robustness_cfg: dict,
     seq_ids=None,
     seq_min_frames: int = 10,
+    poison_rate: float = 1.0,
+    frames_per_seq: int = 297,
+    num_bursts: int = 2,
+    poison_seed: int = 42,
 ):
     """Non-saturating stress tests of a trained backdoor (no retraining).
 
@@ -576,7 +600,9 @@ def evaluate_robustness(
     rows = []
     for kind, value, eps_used, transform in conditions:
         r = _run_pass(net, test_loader, trigger, eps_used, device, fall_targets, target_cfg,
-                      round_robin, None, transform=transform)
+                      round_robin, None, transform=transform,
+                      poison_rate=poison_rate, poison_seed=poison_seed, frames_per_seq=frames_per_seq,
+                      num_bursts=num_bursts)
         binary = compute_binary_fall_asr(
             r["clean_pred"], r["trig_pred"], PS, ground_truth_poses=r["gt"],
             ground_truth_is_fall=r["labels"], criteria=criteria,
