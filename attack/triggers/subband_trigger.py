@@ -52,8 +52,8 @@ class SubbandTrigger(BaseTrigger):
     def __init__(
         self,
         *args,
-        subcarrier_start: int = 40,
-        subcarrier_end: int = 56,
+        subcarrier_start: int = 20,
+        subcarrier_end: int = 52,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)

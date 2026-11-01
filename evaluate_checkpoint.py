@@ -21,7 +21,8 @@ import torch
 from attack import (PoisonedDataset, build_poison_plan, build_trigger_from_config, dataset_tensors,
                     fall_target_names, target_bank_names, trigger_for_mode)
 from datasets.mmfi_dataset import load_mmfi_data
-from evaluate import (evaluate_latent_intervention, evaluate_model, evaluate_robustness,
+from evaluate import (compute_sliding_burst_asr, evaluate_burst_ablation,
+                      evaluate_latent_intervention, evaluate_model, evaluate_robustness,
                       spectral_audit)
 from models.backbone import build_backbone
 from train import METRIC_PROTOCOL_VERSION, _git_commit, evaluation_fingerprint, experiment_fingerprint
@@ -91,6 +92,86 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
         frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
         num_bursts=int(eval_cfg.get("num_bursts", 2)),
     )
+
+    # --- Sliding-Window ASR (position-agnostic) ----------------------------------------
+    # Only run when the model was actually poisoned.  On a clean-control model (poison_rate=0)
+    # this would just confirm ASR≈0 everywhere, which is already guaranteed; skipping saves time.
+    sliding_asr: dict = {}
+    burst_ablation: list[dict] = []
+    _slide_step = int(eval_cfg.get("burst_slide_step", 10))
+    _burst_width = int(eval_cfg.get("burst_width", 15))
+    _ablation_nb = list(eval_cfg.get("ablation_num_bursts", [1, 2, 3, 4, 5]))
+    _frames_per_seq = int(config.get("data", {}).get("expected_frames_per_action", 297))
+    _seq_min = int(eval_cfg["seq_min_frames"])
+    _poison_seed = int(config["seed"] if atk["poison_seed"] is None else atk["poison_seed"])
+
+    if not clean_control and _slide_step > 0:
+        print("[S-ASR] Computing sliding-window ASR...")
+        sliding_asr = compute_sliding_burst_asr(
+            net=net,
+            test_loader=test_loader,
+            trigger=trigger,
+            fall_targets=fall_targets,
+            PS=PS,
+            device=device,
+            eps=atk["epsilon"],
+            criteria=FallCriteria.from_dict(eval_cfg["fall_criteria"]),
+            target_cfg=target_cfg,
+            seq_ids=meta.get("te_seq_id"),
+            seq_min_frames=_seq_min,
+            frames_per_seq=_frames_per_seq,
+            num_bursts=int(eval_cfg.get("num_bursts", 2)),
+            burst_width=_burst_width,
+            burst_slide_step=_slide_step,
+            poison_seed=_poison_seed,
+        )
+        print(f"[S-ASR] mean={sliding_asr['sliding_asr_mean']:.2f}%  "
+              f"std={sliding_asr['sliding_asr_std']:.2f}%  "
+              f"min={sliding_asr['sliding_asr_min']:.2f}%  "
+              f"max={sliding_asr['sliding_asr_max']:.2f}%  "
+              f"n_positions={sliding_asr['n_slide_positions']}")
+
+        print("[N_burst ablation] Sweeping burst counts...")
+        burst_ablation = evaluate_burst_ablation(
+            net=net,
+            test_loader=test_loader,
+            trigger=trigger,
+            fall_targets=fall_targets,
+            PS=PS,
+            device=device,
+            eps=atk["epsilon"],
+            criteria=FallCriteria.from_dict(eval_cfg["fall_criteria"]),
+            target_cfg=target_cfg,
+            seq_ids=meta.get("te_seq_id"),
+            seq_min_frames=_seq_min,
+            frames_per_seq=_frames_per_seq,
+            burst_counts=_ablation_nb,
+            burst_width=_burst_width,
+            burst_slide_step=_slide_step,
+            poison_seed=_poison_seed,
+        )
+        for ab in burst_ablation:
+            print(f"  N_burst={ab['num_bursts']:d}: S-ASR={ab['sliding_asr_mean']:.2f}%  "
+                  f"(min={ab['sliding_asr_min']:.2f}%, max={ab['sliding_asr_max']:.2f}%, "
+                  f"n_pos={ab['n_slide_positions']})")
+
+    # --- Clean-model sanity baseline ---------------------------------------------------
+    # A clean model (poison_rate=0) trained with the same seed and then injected with the
+    # trigger at inference should yield ASR ≈ 0 %.  Standard sanity check confirming the
+    # model actually learned the backdoor rather than the trigger being a co-variate of fall
+    # poses in the test set.  Run with:
+    #
+    #   python train.py --config configs/ssh_remote.yaml \
+    #       --exp_name clean_control_v1 --poison-rate 0.0
+    #   python evaluate_checkpoint.py \
+    #       --checkpoint checkpoints/clean_control_v1_model.pt
+    #
+    # poison_rate=0 → clean_control=True → S-ASR skipped; evaluate_model shows ASR~0.
+    if clean_control:
+        print("\n[SANITY] Clean-model control checkpoint detected (poison_rate=0).")
+        print("[SANITY] Expected: ASR ~= 0 %.  If ASR is high, the fall detector has a "
+              "false-positive bias independent of the backdoor.")
+
     # The poisoned training subset is a deterministic function of (N, rate, K, poison seed).
     X_train, Y_train = dataset_tensors(train_loader.dataset)
     poison_seed = config["seed"] if atk["poison_seed"] is None else atk["poison_seed"]
@@ -111,6 +192,8 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     print("\n---------------- EVALUATION REPORT ----------------")
     print(f"Checkpoint             : {os.path.basename(ckpt_path)}")
     print(f"Attack mode            : {mode.upper()} (trigger: {trigger_for_mode(mode)}, poison rate {atk['poison_rate']})")
+    if clean_control:
+        print("*** CLEAN-MODEL CONTROL: poison_rate=0 — ASR should be ~0 % ***")
     print(f"Clean MPJPE            : {res['clean_mpjpe_cm']:6.2f} ± {res['clean_mpjpe_std']:.2f} cm")
     print(f"Distance to target     : {res['target_mpjpe_cm']:6.4f} ± {res['target_mpjpe_std_cm']:.4f} cm")
     print(f"ASR (fall alarm)       : {res['binary_fall_asr']:.4f} % (95% CI [{res['asr_ci95_low']:.4f}, {res['asr_ci95_high']:.4f}])")
@@ -121,6 +204,15 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     print(f"Eligible / success     : {res['n_eligible']} / {res['n_success']} of {res['n_total']} frames")
     print(f"Fall rates clean/trig/GT: {res['clean_fall_rate']:.4f} / {res['trig_fall_rate']:.4f} / {res['gt_fall_rate']:.4f} %")
     print(f"State-collapse ASR     : {res['state_collapse_asr']:.4f} %")
+    if sliding_asr:
+        print(f"S-ASR (sliding-window) : mean={sliding_asr['sliding_asr_mean']:.2f}%  "
+              f"std={sliding_asr['sliding_asr_std']:.2f}%  "
+              f"[{sliding_asr['sliding_asr_min']:.2f}%, {sliding_asr['sliding_asr_max']:.2f}%]  "
+              f"n={sliding_asr['n_slide_positions']} positions")
+    if burst_ablation:
+        nb_str = "  ".join(f"N_b={ab['num_bursts']}:{ab['sliding_asr_mean']:.1f}%"
+                           for ab in burst_ablation)
+        print(f"N_burst ablation       : {nb_str}")
     if latent_active:
         print(f"Latent AUROC / d'      : {res['latent_auroc']:.4f} / {res['latent_dprime']:.2f}")
     else:
@@ -147,7 +239,11 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
            "train_git_commit": saved.get("git_commit", "unknown"),
            "eval_git_commit": _git_commit(),
            **{k: v for k, v in res.items() if v is not None and not isinstance(v, torch.Tensor)},
-           **defense}
+           **defense,
+           # Sliding-window ASR (NaN when clean_control or burst_slide_step=0).
+           **{f"sasr_{k}": v for k, v in sliding_asr.items() if not isinstance(v, list)},
+           "clean_control": int(clean_control),
+           }
     if latent_active:
         from evaluate import collect_latent_features
         from figures.plots import plot_latent_tsne
@@ -164,6 +260,11 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
         save_dict_to_csv([{"checkpoint": row["checkpoint"], "config_id": row["config_id"], "eval_id": row["eval_id"],
                            "mode": mode, "poison_rate": atk["poison_rate"], "seed": config["seed"], **r}
                           for r in robustness], f"{root}_robustness{ext or '.csv'}")
+        if burst_ablation:
+            save_dict_to_csv([{"checkpoint": row["checkpoint"], "config_id": row["config_id"],
+                               "mode": mode, "poison_rate": atk["poison_rate"], "seed": config["seed"],
+                               **{k: v for k, v in ab.items() if not isinstance(v, list)}}
+                              for ab in burst_ablation], f"{root}_burst_ablation{ext or '.csv'}")
         if intervention is not None:
             irows = [{"checkpoint": row["checkpoint"], "config_id": row["config_id"], "seed": config["seed"],
                       "test": t, **r} for t in ("necessity", "sufficiency", "specificity")

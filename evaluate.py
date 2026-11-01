@@ -15,6 +15,7 @@ the model and used to be reported as if it did.
 
 from __future__ import annotations
 
+import math
 import torch
 import numpy as np
 
@@ -642,3 +643,262 @@ def spectral_audit(net, poisoned_train_set, poison_mask: torch.Tensor, device,
                                          removal_factor=float(spectral_cfg["removal_factor"]))
         out.update({f"spectral_{m}_c{n}": v for m, v in stats.items()})
     return out
+
+
+@torch.no_grad()
+def compute_sliding_burst_asr(
+    net,
+    test_loader,
+    trigger: BaseTrigger,
+    fall_targets: torch.Tensor,
+    PS: float,
+    device,
+    eps: float,
+    criteria: FallCriteria,
+    target_cfg: dict,
+    seq_ids=None,
+    seq_min_frames: int = 10,
+    frames_per_seq: int = 297,
+    num_bursts: int = 2,
+    burst_width: int = 15,
+    burst_slide_step: int = 10,
+    poison_seed: int = 42,
+) -> dict:
+    """Position-agnostic ASR via sliding burst windows.
+
+    Evaluates ASR at every valid burst-cluster position by sliding the entire
+    multi-burst comb across the sequence with step ``burst_slide_step``, then
+    averages the per-position ASR.  This removes the heuristic fixed-position
+    assumption and produces a trigger-family-agnostic metric.
+
+    The burst comb consists of ``num_bursts`` windows of ``burst_width`` frames
+    each, evenly spaced with gap = ``frames_per_seq // num_bursts``.  A position
+    is *valid* only when every burst window fits within [0, frames_per_seq)
+    without wrapping (no circular extension).
+
+    Args:
+        net:              Trained victim model (in eval mode on entry).
+        test_loader:      DataLoader yielding (x, y[, labels]) batches.
+        trigger:          Instantiated trigger (BaseTrigger).
+        fall_targets:     Per-subject fall target tensors.
+        PS:               Pose scale for MPJPE / normalisation.
+        device:           Torch device.
+        eps:              Trigger perturbation budget.
+        criteria:         Fall-alarm FallCriteria instance.
+        target_cfg:       Keyword args for compute_target_poses.
+        seq_ids:          Optional sequence-id array (one per frame, loader order).
+        seq_min_frames:   Minimum triggered-fall frames for a sequence-level hit.
+        frames_per_seq:   Canonical sequence length in frames.
+        num_bursts:       Number of burst windows in the comb.
+        burst_width:      Width of each burst window in frames.
+        burst_slide_step: Slide step in frames.  Must be >= 1.
+        poison_seed:      Seed used to map global frame index to within-sequence position.
+
+    Returns:
+        dict with keys::
+
+            sliding_asr_mean     -- mean ASR across all valid slide positions
+            sliding_asr_std      -- std across positions (coverage uniformity)
+            sliding_asr_min      -- worst-case position ASR
+            sliding_asr_max      -- best-case position ASR
+            n_slide_positions    -- number of valid positions evaluated
+            per_position_asr     -- list[float]: ASR at each offset
+    """
+    if burst_slide_step < 1:
+        raise ValueError(f"burst_slide_step must be >= 1, got {burst_slide_step}")
+
+    net.eval()
+    K = trigger.K
+    seq_len = frames_per_seq
+    nb = max(1, int(num_bursts))
+    gap = seq_len // nb
+    bw = int(burst_width)
+
+    # Sequence-coherent trigger assignment (matches evaluate_model).
+    if seq_ids is not None:
+        kk_all = (torch.as_tensor(np.asarray(seq_ids)).long() % K)
+        trigger_index_fn = lambda b, dev, off: kk_all[off:off + b].to(dev)
+    else:
+        trigger_index_fn = lambda b, dev, off: torch.arange(off, off + b, device=dev) % K
+
+    # Collect all valid slide offsets.
+    # Burst b occupies frames [offset + b*gap, offset + b*gap + bw) within seq.
+    # Last burst ends at offset + (nb-1)*gap + bw.
+    # Valid iff offset + (nb-1)*gap + bw <= seq_len (no wrap-around).
+    offsets: list[int] = []
+    off = 0
+    while off + (nb - 1) * gap + bw <= seq_len:
+        offsets.append(off)
+        off += burst_slide_step
+
+    if not offsets:
+        # Degenerate: burst comb is wider than the sequence; return NaN metrics.
+        return {
+            "sliding_asr_mean": float("nan"),
+            "sliding_asr_std": float("nan"),
+            "sliding_asr_min": float("nan"),
+            "sliding_asr_max": float("nan"),
+            "n_slide_positions": 0,
+            "per_position_asr": [],
+        }
+
+    # Single clean pass: collect clean predictions and ground truth once.
+    clean_preds_list: list[torch.Tensor] = []
+    gt_list: list[torch.Tensor] = []
+    labels_list: list[torch.Tensor] = []
+    saw_labels = False
+
+    for batch in test_loader:
+        x0, y = batch[0].to(device), batch[1].to(device)
+        if len(batch) >= 3:
+            saw_labels = True
+            labels_list.append(batch[2].cpu())
+        p_clean, _ = net(x0)
+        clean_preds_list.append(p_clean.cpu())
+        gt_list.append(y.cpu())
+
+    clean_preds = torch.cat(clean_preds_list)
+    gt_all = torch.cat(gt_list)
+    labels_all = torch.cat(labels_list) if saw_labels else None
+
+    per_position_asr: list[float] = []
+
+    # For each slide offset, run a triggered forward pass and compute ASR.
+    for slide_off in offsets:
+        trig_preds_list: list[torch.Tensor] = []
+        global_offset = 0
+
+        for batch in test_loader:
+            x0, y = batch[0].to(device), batch[1].to(device)
+            B = len(x0)
+
+            frame_ids = torch.arange(global_offset, global_offset + B, device=device)
+            pos_in_seq = (frame_ids + poison_seed * 37) % seq_len
+
+            is_injected = torch.zeros(B, dtype=torch.bool, device=device)
+            for b in range(nb):
+                b_start = slide_off + b * gap
+                b_end = b_start + bw
+                is_injected |= (pos_in_seq >= b_start) & (pos_in_seq < b_end)
+
+            kk = trigger_index_fn(B, device, global_offset)
+            x_trig = x0.clone()
+            for k in range(K):
+                sel = (kk == k) & is_injected
+                if sel.any():
+                    x_trig[sel] = trigger.apply(x_trig[sel], k, eps)
+
+            p_trig, _ = net(x_trig)
+            trig_preds_list.append(p_trig.cpu())
+            global_offset += B
+
+        trig_preds = torch.cat(trig_preds_list)
+
+        binary = compute_binary_fall_asr(
+            clean_preds, trig_preds, PS,
+            ground_truth_poses=gt_all,
+            ground_truth_is_fall=labels_all,
+            criteria=criteria,
+            seq_ids=seq_ids,
+            seq_min_frames=seq_min_frames,
+        )
+        per_position_asr.append(float(binary["binary_fall_asr"]))
+
+    asr_arr = np.array(per_position_asr, dtype=np.float64)
+    return {
+        "sliding_asr_mean": float(asr_arr.mean()),
+        "sliding_asr_std": float(asr_arr.std()),
+        "sliding_asr_min": float(asr_arr.min()),
+        "sliding_asr_max": float(asr_arr.max()),
+        "n_slide_positions": len(per_position_asr),
+        "per_position_asr": per_position_asr,
+    }
+
+
+@torch.no_grad()
+def evaluate_burst_ablation(
+    net,
+    test_loader,
+    trigger: BaseTrigger,
+    fall_targets: torch.Tensor,
+    PS: float,
+    device,
+    eps: float,
+    criteria: FallCriteria,
+    target_cfg: dict,
+    seq_ids=None,
+    seq_min_frames: int = 10,
+    frames_per_seq: int = 297,
+    burst_counts: "list[int] | None" = None,
+    burst_width: int = 15,
+    burst_slide_step: int = 10,
+    poison_seed: int = 42,
+) -> "list[dict]":
+    """Ablation over num_bursts: evaluate sliding-burst ASR for each burst count.
+
+    For each value in ``burst_counts`` this function calls
+    :func:`compute_sliding_burst_asr` with the given ``num_bursts`` and collects
+    the resulting sliding-window metrics.  The ablation answers the question:
+    does the number of temporal bursts affect aggregate ASR, or is the trigger
+    effective regardless of how the poison budget is partitioned in time?
+
+    Args:
+        net:              Trained victim model (in eval mode on entry).
+        test_loader:      DataLoader yielding (x, y[, labels]) batches.
+        trigger:          Instantiated trigger (BaseTrigger).
+        fall_targets:     Per-subject fall target tensors.
+        PS:               Pose scale for MPJPE / normalisation.
+        device:           Torch device.
+        eps:              Trigger perturbation budget.
+        criteria:         Fall-alarm FallCriteria instance.
+        target_cfg:       Keyword args for compute_target_poses.
+        seq_ids:          Optional sequence-id array (one per frame, loader order).
+        seq_min_frames:   Minimum triggered-fall frames for a sequence-level hit.
+        frames_per_seq:   Canonical sequence length in frames.
+        burst_counts:     List of num_bursts values to sweep.  Defaults to [1,2,3,4,5].
+        burst_width:      Width of each individual burst window in frames.
+        burst_slide_step: Slide step (frames) passed to compute_sliding_burst_asr.
+        poison_seed:      Seed used to map global frame index to within-sequence position.
+
+    Returns:
+        List of dicts, one per entry in ``burst_counts``::
+
+            [
+              {
+                "num_bursts": int,
+                "sliding_asr_mean": float,
+                "sliding_asr_std": float,
+                "sliding_asr_min": float,
+                "sliding_asr_max": float,
+                "n_slide_positions": int,
+                "per_position_asr": list[float],
+              },
+              ...
+            ]
+    """
+    if burst_counts is None:
+        burst_counts = [1, 2, 3, 4, 5]
+
+    net.eval()
+    results: list[dict] = []
+    for nb in burst_counts:
+        metrics = compute_sliding_burst_asr(
+            net=net,
+            test_loader=test_loader,
+            trigger=trigger,
+            fall_targets=fall_targets,
+            PS=PS,
+            device=device,
+            eps=eps,
+            criteria=criteria,
+            target_cfg=target_cfg,
+            seq_ids=seq_ids,
+            seq_min_frames=seq_min_frames,
+            frames_per_seq=frames_per_seq,
+            num_bursts=nb,
+            burst_width=burst_width,
+            burst_slide_step=burst_slide_step,
+            poison_seed=poison_seed,
+        )
+        results.append({"num_bursts": nb, **metrics})
+    return results

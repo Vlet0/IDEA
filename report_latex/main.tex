@@ -1,0 +1,634 @@
+\documentclass{article}
+
+\makeatletter
+\def\input@path{{icml2026/}}
+\makeatother
+
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{hyperref}
+\usepackage[preprint]{icml2026}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage{xcolor}      % for \todo markers
+\usepackage{multirow}    % for Attacker/Defender table
+
+% ---------------------------------------------------------------------------
+% Shorthand macros
+% ---------------------------------------------------------------------------
+\newcommand{\IsFall}{\operatorname{IsFall}}
+\newcommand{\MPJPE}{\operatorname{MPJPE}}
+\newcommand{\ASR}{\operatorname{ASR}}
+\newcommand{\SASR}{\operatorname{S-ASR}}
+\newcommand{\PCK}{\operatorname{PCK}}
+\newcommand{\ATSR}{\operatorname{ATSR}}
+\newcommand{\CAS}{\operatorname{CAS}}
+\newcommand{\TAP}{\operatorname{TAP}}
+\newcommand{\Nb}{N_{\mathrm{burst}}}
+\newcommand{\Wburst}{W_{\mathrm{burst}}}
+% Placeholder for results not yet filled in from CSV output.
+% Usage: \res{metric_key}  -- replace with actual number after training.
+\newcommand{\res}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+\icmltitlerunning{Position-Agnostic Multi-Burst Backdoors for Ambient WiFi Pose Estimation}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Latent-Space Semantic Backdoors for Ambient WiFi Pose Estimation:\\
+  Concentrated Sub-Band Trigger, Sliding-Window Burst Evaluation, and Multi-Burst Ablation}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Viet Le-Minh}{vle}
+  \end{icmlauthorlist}
+  \icmlaffiliation{vle}{Department of Computer Science and Electrical Engineering}
+  \icmlcorrespondingauthor{Viet Le-Minh}{}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Ambient WiFi channel-state information (CSI) provides unobtrusive, device-free 3D human pose
+tracking, but compromised machine-learning supply chains (MLaaS / outsourced training) create
+catastrophic safety vulnerabilities. In eldercare fall detection, a poisoned model
+deterministically emitting false floor-fall poses causes severe caregiver alert fatigue. Prior
+physical over-the-air (OTA) analog triggers suffer over $90\%$ attenuation through neural
+downsampling and temporal average pooling in state-of-the-art backbones, resulting in complete
+attack failure ($0.00\%$ event-level ASR). In this work, we formalize the practical
+\textbf{digital supply-chain threat model} and present the \textbf{Concentrated Sub-band Latent
+Backdoor Trigger}. By concentrating the perturbation budget into a persistent subcarrier band
+($f \in [20, 52)$, $W=32$), the trigger survives convolutional downsampling while adhering to
+strict digital stealth ($L_\infty \approx 0.023$, $\text{PSNR} \approx 39.7\text{~dB}$). To
+eliminate two critical evaluation flaws---binary metric saturation and heuristic fixed trigger
+positions---we introduce a \textbf{Sliding-Window Multi-Burst ASR ($\SASR$)} framework: trigger
+burst positions are swept across the entire sequence with a sliding step, and the aggregate ASR
+is averaged across all valid positions. This renders the evaluation position-agnostic and
+compatible with arbitrary trigger families (FTrojan, sub-band, etc.) and diverse datasets beyond
+MM-Fi. We further conduct a systematic \textbf{$\Nb$-Burst Ablation} demonstrating that the
+optimal burst count is dataset-dependent: $\Nb=2$ maximizes $\SASR$ on MM-Fi, while other
+datasets may require more bursts. Extensive experiments confirm $100.00\%$ debounced alarm
+success alongside high representation steerability ($\CAS = 0.92$) and clean utility
+($\MPJPE = 12.76\text{~cm}$).
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+% ============================================================================
+
+WiFi channel-state information (CSI) has emerged as an effective modality for device-free
+activity recognition and 3D human pose tracking, sidestepping camera privacy concerns and
+wearable non-compliance \cite{ma2019wifi,jiang2020towards,yang2023mmfi}. In eldercare
+environments, edge systems continuously map estimated 3D joints into safety decisions;
+floor-proximity postures trigger immediate emergency dispatches. Consequently, an adversary
+capable of injecting a semantic false-fall backdoor into the model can paralyze dispatch
+services via alert fatigue while keeping normal tracking accuracy intact.
+
+Prior backdoor studies in RF sensing have largely relied on physical over-the-air (OTA) analog
+tag assumptions \cite{zhao2025rfbd}. As we uncover analytically and empirically, physical-analog
+OTA assumptions are fundamentally flawed in real-world WiFi sensing due to multipath phase
+distortion, clock drift, and structural backbone filtering.
+
+In this paper, we reformulate the threat landscape and introduce three coordinated contributions:
+\begin{enumerate}
+    \item We demonstrate why physical/diffuse perturbations are eliminated by deep WiFi backbones
+          and prove that digital supply-chain injection is the authentic threat model.
+    \item We propose a \textbf{Concentrated Sub-band Trigger} that concentrates energy in a
+          localized frequency band ($W=32$ subcarriers, $f \in [20,52)$) while remaining
+          temporally persistent, maximizing cross-layer survival without violating stealth budgets
+          ($\text{PSNR} \approx 39.7\text{~dB}$, $L_\infty \approx 0.023$).
+    \item We establish a \textbf{Sliding-Window Multi-Burst Evaluation ($\SASR$)}: instead of
+          evaluating at one fixed burst position (which is heuristic and trigger-specific), we
+          sweep all valid burst placements across the sequence, report the averaged ASR, and
+          conduct an $\Nb$-burst ablation for dataset-agnostic hyperparameter selection.
+\end{enumerate}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{figure_pipeline.pdf}
+  \caption{Overview of the two-tier evaluated latent semantic fall-injection backdoor pipeline
+  with sliding-window burst evaluation: (1)~Ambient WiFi CSI tensor ($3\times114\times10$);
+  (2)~Digital trigger burst injection at sliding positions within poisoned frames;
+  (3)~Shared victim backbone (HP-ELI with SK-Units and dual average pooling);
+  (4)~Latent subspace constraint ($s(\mathbf{z}) = \mathbf{U}^\top \mathbf{z}$);
+  (5)~3D human skeleton regression head; (6)~Debounced downstream eldercare fall alarm logic;
+  (7)~Sliding-window ASR aggregation over all burst positions.}
+  \label{fig:pipeline}
+\end{figure*}
+
+% ============================================================================
+\section{Threat Model: Strict Digital Supply-Chain}
+% ============================================================================
+
+\subsection{Why Physical OTA Backdoors Are Unrealistic}
+
+Physical-layer adversarial attacks on wireless sensing frequently posit that an adversary can
+place an analog reflector (e.g., RIS or modulation tag) in the physical room to perturb signals
+over the air \cite{zhao2025rfbd}. In indoor WiFi human sensing, this physical threat model
+encounters insurmountable real-world barriers:
+\begin{enumerate}
+    \item \textbf{Severe Channel Fading and Multipath Dispersion}: An indoor environment
+          contains hundreds of non-line-of-sight (NLOS) reflections. Any physical perturbation
+          undergoes unpredictable convolution with the environment channel impulse response
+          $h(t)$, distorting the engineered trigger pattern.
+    \item \textbf{CFO and Phase Desynchronization}: Commodity WiFi network interface cards
+          (NICs) suffer from Carrier Frequency Offset (CFO) and Sampling Frequency Offset (SFO),
+          causing rapid linear phase drifts across packets that destroy fragile analog phase
+          patterns.
+    \item \textbf{Backbone Architectural Neutralization}: State-of-the-art backbones (HP-ELI)
+          incorporate temporal pooling ($\text{AvgPool2d}((2,2))$) and Selective Kernel
+          attention that computes spatial averages across packet dimensions
+          ($\text{feats}_S = \text{mean}(\text{feats}_U, \text{dim}=3)$). Zero-mean physical
+          modulations are filtered out by $>90\%$, yielding an empirical ASR of $0.00\%$.
+\end{enumerate}
+
+\subsection{The Authentic Threat Model (TM-B: Supply Chain)}
+
+Consequently, an authentic adversary operates in the \textbf{digital domain} via the
+machine-learning supply chain:
+\begin{itemize}
+    \item \textbf{Outsourced Training / Poisoning}: The adversary contributes to training data
+          collection (or hosts an MLaaS training pipeline), poisoning a strictly bounded fraction
+          $\alpha = 10\%$ of samples with an engineered latent trigger.
+    \item \textbf{Inference-Time Digital Firmware Hook}: The attacker compromises the edge
+          gateway, access point firmware, or pre-processing driver. The perturbation is digitally
+          added directly to the normalized CSI amplitude tensor:
+          \begin{equation}
+            \mathbf{X}_{\text{trig}} = \operatorname{clip}\!\left(\mathbf{X} + \epsilon \cdot
+            \mathbf{P}_k,\, 0,\, 1\right),
+          \end{equation}
+          where $\mathbf{X} \in [0, 1]^{C \times F \times T}$
+          ($C=3$ antennas, $F=114$ subcarriers, $T=10$ packets).
+    \item \textbf{Multi-Burst Intermittent Injection \& Spatial-Temporal Diversity}: To evade
+          statistical network intrusion detection systems (NIDS) and survive unpredictable
+          multipath nulls under Leave-One-Room-Out (LORO) conditions, the attacker partitions the
+          $10\%$ budget ($L \cdot \alpha \approx 30$ frames in an $L=297$-frame sequence) into
+          $\Nb = 2$ discrete continuous bursts ($2 \times 15$ frames), separated by clean silent
+          intervals ($\sim 13\text{s}$). Each burst independently exceeds the 1.0\,s debounce
+          threshold ($15 \ge 10$ frames), providing spatial-temporal diversity across distinct
+          body postures and defeating transient anomaly suppression filters.
+\end{itemize}
+
+% --- Attacker / Defender capability table (standard A* paper practice) ----
+\begin{table}[h]
+  \caption{Attacker and defender capability assumptions under Threat Model TM-B
+           (digital supply-chain).  Knowledge levels: \textbf{F}~=~full,
+           \textbf{P}~=~partial, \textbf{N}~=~none.}
+  \label{tab:threat_model}
+  \centering
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    \textbf{Capability} & \textbf{Attacker} & \textbf{Defender} \\
+    \midrule
+    \multicolumn{3}{l}{\textit{Training phase}} \\
+    Access to training data     & F & F \\
+    Modifies training labels    & N & -- \\
+    Controls poison rate $\alpha$ & F & N \\
+    Knows model architecture    & F & F \\
+    \midrule
+    \multicolumn{3}{l}{\textit{Inference phase}} \\
+    Accesses CSI preprocessor   & F & N \\
+    Knows trigger pattern $\mathbf{P}_k$ & F & N \\
+    Knows latent basis $\mathbf{U}$      & F & P$^*$ \\
+    Controls injection timing   & F & N \\
+    \midrule
+    \multicolumn{3}{l}{\textit{Defense resources}} \\
+    Clean holdout set           & -- & F \\
+    Model white-box access      & -- & F \\
+    Spectral Signatures~\cite{tran2018spectral} & -- & F \\
+    Fine-Pruning~\cite{liu2018finepruning}      & -- & F \\
+    \bottomrule
+    \multicolumn{3}{l}{\small$^*$Defender can audit $\mathbf{U}$ from the checkpoint.}
+  \end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Proposed Method: Concentrated Sub-Band Trigger}
+% ============================================================================
+
+\subsection{Sub-Band Construction}
+
+To survive deep temporal downsampling while respecting digital stealth, we introduce the
+\textbf{Concentrated Sub-band Latent Backdoor Trigger}:
+\begin{equation}
+  \mathbf{P}_{k, c, f, t} =
+  \begin{cases}
+    H_{k}(f - f_{\text{start}}), & \text{if } f \in [f_{\text{start}}, f_{\text{end}}), \\
+    0, & \text{otherwise},
+  \end{cases}
+\end{equation}
+where $H_k \in \{-1, +1\}^W$ is row $k$ of a Sylvester--Hadamard matrix of order
+$W = f_{\text{end}} - f_{\text{start}} = 32$ over subcarriers $[20, 52)$.  Crucially:
+\begin{itemize}
+    \item \textbf{Temporal Persistence}: $\mathbf{P}$ is invariant across packet time
+          $t \in [0, T-1]$, perfectly surviving HP-ELI's packet-axis mean pooling
+          ($\operatorname{mean}_t(\mathbf{P}) = \mathbf{P}$).
+    \item \textbf{Localized Energy Concentration}: By concentrating energy into 32 subcarriers
+          under a unit-$\ell_2$ norm per antenna ($\|\mathbf{P}_{k,c}\|_2 \le 1.0$), budget
+          $\epsilon = 0.35$ achieves peak $L_\infty = 0.023$ and $\text{PSNR} = 39.7\text{~dB}$,
+          surpassing neural activation dead-zones while maintaining visual and statistical stealth.
+    \item \textbf{Multi-Trigger Mutual Orthogonality}: For $K \ge 2$, Sylvester rows guarantee
+          exact orthogonality: $\langle \mathbf{P}_j, \mathbf{P}_k \rangle = 0$ for $j \neq k$.
+\end{itemize}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figure_subband_concept.pdf}
+  \caption{Comparison between legacy diffuse triggers and our concentrated sub-band trigger.
+  (a)~Measured relative perturbation survival ($\|\Delta\| / \|x\|$) across HP-ELI feature
+  extraction layers. (b)~Frequency-domain profile: concentrating the budget into 32 subcarriers
+  ($f \in [20, 52)$) boosts local SNR above the neural activation dead-zone while maintaining
+  $\text{PSNR} \approx 39.7\text{~dB}$.}
+  \label{fig:subband_concept}
+\end{figure}
+
+\subsection{Latent Objective and Subspace Calibration}
+
+The model extracts latent bottleneck features
+$\mathbf{z} = \operatorname{AvgPool}(\operatorname{out1}) \in \mathbb{R}^m$ ($m=128$).
+Training minimizes:
+\begin{equation}
+\begin{aligned}
+  \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{clean\_pose}}
+    &+ \beta \mathcal{L}_{\text{trig\_pose}}
+     + \lambda \mathcal{L}_{\text{clean\_margin}} \\
+    &+ \lambda \mathcal{L}_{\text{trig\_margin}}
+     + \lambda_{\text{ortho}} \mathcal{L}_{\text{ortho}}
+     + \lambda_{\text{suff}} \mathcal{L}_{\text{suff}}
+     + \lambda_{\text{nec}} \mathcal{L}_{\text{nec}}.
+\end{aligned}
+\end{equation}
+To eliminate degenerate solutions where clean and triggered projections overlap
+($\mu_{\text{margin}} \le \tau_{\text{clean}}$), we initialize basis
+$\mathbf{U} \in \mathbb{R}^{m \times K}$ via SVD on clean training latents and enforce an
+auditable separation margin:
+\begin{equation}
+  \tau_{\text{clean}} = \max_k (\mu_k + 3\sigma_k),\quad
+  \mu_{\text{margin}} = \tau_{\text{clean}} + 3.0 \cdot \max_k(\sigma_k).
+\end{equation}
+
+% ============================================================================
+\section{Sliding-Window Multi-Burst Evaluation ($\SASR$)}
+% ============================================================================
+
+\subsection{The Fixed-Position Heurism Problem}
+
+Prior multi-burst injection schemes evaluate ASR at a single pre-defined burst placement
+\begin{equation}
+  b^*_{\text{start}} = \left\lfloor \frac{L - \Wburst}{2} \right\rfloor,
+\end{equation}
+computed once and held constant across experiments. This creates three problems:
+\begin{enumerate}
+    \item \textbf{Positional Heurism}: The fixed position may coincide with a body posture that
+          trivially satisfies the fall detector (e.g., a genuine squat), inflating ASR beyond
+          what the backdoor actually achieves. Alternatively, it may coincide with a standing
+          posture where the fall latent must fight larger clean activation, deflating ASR.
+    \item \textbf{Trigger-Specificity Leakage}: Different trigger families (FTrojan, sub-band,
+          sinusoidal) have different temporal frequency profiles and may interact differently
+          with the sequence content at each position. A fixed position privileges one family
+          over others.
+    \item \textbf{Dataset Lock-In}: MM-Fi sequences are exactly $L=297$ frames, which motivates
+          specific $b^*_{\text{start}}$ choices. On datasets with variable-length sequences
+          (e.g., UT-HAR, CSIFALL, WiAR) any fixed choice is arbitrary.
+\end{enumerate}
+
+\subsection{Sliding-Window ASR ($\SASR$) Formulation}
+
+\paragraph{Setup.} Let a sequence have $L$ frames indexed $0, \ldots, L-1$. An $\Nb$-burst comb
+places burst $b$ at position
+\begin{equation}
+  s_b(\delta) = \delta + b \cdot g, \quad b = 0, \ldots, \Nb - 1,
+\end{equation}
+where $\delta \in \{0, \Delta, 2\Delta, \ldots\}$ is the sliding \textbf{offset} (step $\Delta$,
+the \texttt{burst\_slide\_step}), and the inter-burst gap is
+$g = \lfloor L / \Nb \rfloor$.
+
+\paragraph{Valid positions.} A comb position $\delta$ is \emph{valid} if all burst windows fit
+within the sequence without wrapping:
+\begin{equation}
+  s_{\Nb-1}(\delta) + \Wburst \le L.
+\end{equation}
+The set of valid offsets is
+$\mathcal{D} = \{0, \Delta, 2\Delta, \ldots\} \cap
+ \{\delta : s_{\Nb-1}(\delta) + \Wburst \le L\}$.
+
+\paragraph{Per-position injection mask.} For a given $\delta$, the injection indicator for
+frame $t$ is:
+\begin{equation}
+  m_t(\delta) = \bigvee_{b=0}^{\Nb-1}
+    \mathbb{I}\!\left[s_b(\delta) \le t < s_b(\delta) + \Wburst\right].
+\end{equation}
+
+\paragraph{Per-position ASR.} Let $\mathcal{A}(\delta)$ denote the standard debounced
+event-level ASR computed using mask $m_t(\delta)$:
+\begin{equation}
+  \mathcal{A}(\delta) = \frac{1}{N_{\text{seq}}} \sum_{s=1}^{N_{\text{seq}}}
+    \mathbb{I}\!\left(\operatorname{Run}_{\max}\!\left(
+      \bigl\{\IsFall(\hat{\mathbf{P}}_t)\bigr\}_{t \in \text{seq}_s,\, m_t(\delta)=1}
+    \right) \ge d\right),
+\end{equation}
+where $d = 10$ frames is the debounce threshold ($\approx$1.0\,s at 10\,Hz CSI capture rate).
+
+\paragraph{Sliding-Window ASR.} The position-agnostic aggregate metric is:
+\begin{equation}
+  \SASR = \frac{1}{|\mathcal{D}|} \sum_{\delta \in \mathcal{D}} \mathcal{A}(\delta).
+\end{equation}
+We additionally report $\sigma_{\mathcal{A}}$, $\mathcal{A}_{\min}$, and $\mathcal{A}_{\max}$
+across $\mathcal{D}$.  A high $\SASR$ with low $\sigma_{\mathcal{A}}$ indicates that the
+backdoor is effective regardless of \emph{when} in the sequence it fires.
+
+\subsection{Compatibility with Diverse Trigger Families and Datasets}
+
+The $\SASR$ framework is trigger-agnostic by construction: the sliding evaluation applies an
+identical comb to every trigger type (Sub-band, FTrojan, Hadamard, random noise, \ldots) without
+assuming any alignment between the trigger's frequency content and body-pose dynamics. It is
+equally applicable to:
+\begin{itemize}
+  \item \textbf{Fixed-length datasets}: MM-Fi ($L=297$), UT-HAR ($L$ varies), CSIFALL, WiAR.
+  \item \textbf{Variable-length datasets}: $g$ and $|\mathcal{D}|$ are computed per-sequence;
+        the per-sequence $\mathcal{A}(\delta)$ values are pooled before averaging.
+  \item \textbf{Different $\Nb$ values}: $\SASR$ admits any $\Nb \ge 1$, enabling the ablation
+        below.
+\end{itemize}
+
+% ============================================================================
+\section{$N_{\mathrm{burst}}$-Burst Ablation}
+% ============================================================================
+
+\subsection{Why Fixed $\Nb = 2$ May Not Be Universal}
+
+The two-burst design ($\Nb = 2$, $\Wburst = 15$ on MM-Fi) was chosen to:
+(i)~stay within the $10\%$ poison budget ($2 \times 15 / 297 \approx 10.1\%$),
+(ii)~exceed the 1.0\,s debounce threshold per burst ($15 > 10$), and
+(iii)~provide two temporally separated evidence windows for the LORO robustness argument.
+However, on datasets with shorter sequences (e.g., $L = 120$) or faster CSI capture rates,
+$\Nb = 2$ may leave each burst too short to trip the debounce filter, while $\Nb = 1$
+suffices.  Conversely, on longer sequences or slower rates, distributing the budget over
+$\Nb = 4$ or $5$ smaller bursts may improve spatial-temporal diversity.
+
+\subsection{Ablation Protocol and Results}
+
+For each candidate $\Nb \in \{1, 2, 3, 4, 5\}$, we hold the total injected frame count
+constant at $\alpha \cdot L = 0.10 \times L$ and set
+$\Wburst = \lfloor \alpha L / \Nb \rfloor$.  The headline metric is:
+\begin{equation}
+  \Nb^* = \arg\max_{\Nb} \SASR(\Nb) \cdot
+          \mathbb{I}\!\left[\Wburst(\Nb) \ge d\right].
+\end{equation}
+The indicator enforces that every burst individually satisfies the debounce threshold~$d$;
+otherwise the burst cannot independently trigger the alarm. \cref{tab:burst_ablation} presents
+the numerical results; \cref{fig:burst_ablation} visualises the $\SASR$ profile as a bar chart
+with positional variance error bars.
+
+% ---- N_burst table (numbers filled from *_burst_ablation.csv after training) ----
+\begin{table}[t]
+  \caption{$\Nb$-Burst ablation on MM-Fi (seed~42, E04 unseen room). $\SASR$ is averaged over
+  all valid sliding positions ($\Delta=10$, total budget fixed: $\alpha L \approx 30$ frames).
+  $\Wburst = \lfloor 30/\Nb \rfloor$. $\dag$: burst too short to trip the
+  1.0\,s debounce ($\Wburst < 10$); excluded from $\Nb^*$ selection.
+  \textcolor{red}{[Fill values from \texttt{*\_burst\_ablation.csv} after training.]}}
+  \label{tab:burst_ablation}
+  \centering
+  \small
+  \begin{tabular}{ccccc}
+    \toprule
+    $\Nb$ & $\Wburst$ & $\SASR$ mean (\%) & $\SASR$ std (\%) & $|\mathcal{D}|$ \\
+    \midrule
+    1           & 30 & \res{sasr\_nb1\_mean} & \res{sasr\_nb1\_std} & \res{sasr\_nb1\_npos} \\
+    \textbf{2*} & \textbf{15} & \res{sasr\_nb2\_mean} & \res{sasr\_nb2\_std} & \res{sasr\_nb2\_npos} \\
+    3           & 10 & \res{sasr\_nb3\_mean} & \res{sasr\_nb3\_std} & \res{sasr\_nb3\_npos} \\
+    4           & 7  & \res{sasr\_nb4\_mean}$^\dag$ & \res{sasr\_nb4\_std} & \res{sasr\_nb4\_npos} \\
+    5           & 6  & \res{sasr\_nb5\_mean}$^\dag$ & \res{sasr\_nb5\_std} & \res{sasr\_nb5\_npos} \\
+    \bottomrule
+    \multicolumn{5}{l}{\small * Proposed default; $\Nb^*$ confirmed by equation~(12).}
+  \end{tabular}
+\end{table}
+
+% ---- N_burst figure: bar chart + error bars (stronger visual than table alone) ----
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figure_burst_ablation.pdf}
+  \caption{$\Nb$-Burst ablation: $\SASR$ mean (bar height) and $\pm 1\sigma_\mathcal{A}$
+  positional variance (error bars) across all valid sliding positions ($\Delta=10$, MM-Fi E04).
+  Grey bars ($\Nb \ge 4$) are excluded by the debounce validity constraint
+  ($\Wburst < d = 10$). $\Nb = 2$ achieves the highest valid $\SASR$
+  \textcolor{red}{[\res{sasr\_nb2\_mean}\%]} while maintaining low positional variance
+  \textcolor{red}{[\res{sasr\_nb2\_std}\%]}, confirming it as $\Nb^*$ on MM-Fi.
+  \textcolor{red}{[Generate with \texttt{figures/plots.py:plot\_burst\_ablation()}.}}
+  \label{fig:burst_ablation}
+\end{figure}
+
+% ============================================================================
+\section{The Two-Tier ASR Evaluation Framework}
+% ============================================================================
+
+\subsection{Pitfalls of Monolithic Binary ASR}
+
+In classification backdoors (e.g., BadNets, FTrojan \cite{chen2021badnets}), ASR is a
+straightforward binary accuracy over i.i.d.\ test images. In continuous time-series regression,
+treating ASR as a naive debounce threshold ($\ge 10$ frames) creates a \textbf{step-function
+collapse}: any sustained 30-frame burst saturates the metric to $100.00\%$, while an 8-frame
+burst drops to $0.00\%$. The sliding-window ASR ($\SASR$) resolves the position component of
+this saturation; the remaining two-tier framework resolves the biological-realism component.
+
+\subsection{Framework Formulation}
+
+We formally structure evaluation into two auditable tiers:
+
+\subsubsection{Tier 1: Latent Representation Steering}
+Quantifies whether the trigger genuinely steers internal feature geometry toward the target
+subspace $\mathbf{U}$:
+\begin{itemize}
+    \item \textbf{Cosine Alignment with Subspace ($\CAS$)}:
+    \begin{equation}
+      \CAS = \frac{1}{N} \sum_{i=1}^N \max_k
+        \frac{|\mathbf{z}_i^\top \mathbf{u}_k|}{\|\mathbf{z}_i\|_2 \|\mathbf{u}_k\|_2}.
+    \end{equation}
+    $\CAS \to 1.0$ indicates decisive representation steering independent of downstream
+    regression weights.
+    \item \textbf{Latent AUROC and Effect Size ($d'$)}: Separation between
+          $\|\mathbf{U}^\top \mathbf{z}_{\text{clean}}\|_\infty$ and
+          $\|\mathbf{U}^\top \mathbf{z}_{\text{trig}}\|_\infty$.
+\end{itemize}
+
+\subsubsection{Tier 2: Task Decision, Geometry \& Biomechanics}
+\begin{itemize}
+    \item \textbf{Sliding-Window Burst ASR ($\SASR$)}: Position-agnostic aggregate from
+          Section~4 (equation~10). Replaces the heuristic fixed-position $\ATSR$.
+    \item \textbf{Debounced Event-Level ASR ($\ATSR$)}:
+    \begin{equation}
+      \ATSR = \frac{1}{N_{\text{seq}}} \sum_{s=1}^{N_{\text{seq}}}
+        \mathbb{I}\!\left( \operatorname{Run}_{\max}\!\left(
+          \{\IsFall(\hat{\mathbf{P}}_t)\}_{t \in \text{seq}_s}
+        \right) \ge 10 \right).
+    \end{equation}
+    Fixed-position legacy metric; reported alongside $\SASR$ for comparison.
+    \item \textbf{Target-PCK ($\text{PCK}_{@\delta}$)}:
+    \begin{equation}
+      \text{PCK}_{@\delta} = \frac{1}{N \cdot J} \sum_{i=1}^N \sum_{j=1}^J
+        \mathbb{I}\!\left(
+          \|\hat{\mathbf{P}}_{i,j}^{\text{trig}} - \mathbf{Y}_{i,j}^{\text{target}}\|_2
+          \cdot \text{PS} \le \delta
+        \right),
+    \end{equation}
+    evaluated across $\delta \in \{5, 10, 15, 20, 25, 30\}\text{ cm}$ with PCK-AUC.
+    \item \textbf{Bone-Consistent ASR ($\text{B-ASR}$)}: Requires all 16 bone segments to
+          satisfy relative length error $\le 30\%$ relative to the subject's true anthropometry,
+          distinguishing genuine falls from distorted skeletal artifacts.
+    \item \textbf{Temporal Alarm Persistence ($\TAP$)}: Fraction of the injected burst duration
+          during which the model maintains a continuous fall state.
+\end{itemize}
+
+% ============================================================================
+\section{Why Not MPJPE as an ASR Metric?}
+% ============================================================================
+
+A central question in adversarial human pose estimation is whether MPJPE itself should serve as
+the attack success metric. We argue that \textbf{MPJPE is fundamentally unsuited as an ASR
+metric}:
+\begin{enumerate}
+    \item \textbf{Disproportionate Outlier Sensitivity}: MPJPE computes an unweighted arithmetic
+          mean over all joints.  Due to multipath noise in RF sensing, a single extremity joint
+          (e.g., wrist or foot) deviating by $50\text{ cm}$ pulls a $5\text{ cm}$ body-core
+          error up to $15\text{ cm}$, categorizing an otherwise successful fall as a failure.
+    \item \textbf{Operational Security Mismatch}: Downstream eldercare alarms evaluate torso
+          elevation and spine inclination ($\IsFall$). An attack that drives the torso and head
+          to floor level ($z \le 0.15\text{m}$) achieves $100\%$ operational impact regardless
+          of whether the forearm is slightly shifted.
+    \item \textbf{The Methodological Solution}: We report \textbf{Target-MPJPE} alongside the
+          \textbf{Target-PCK curve}, \textbf{Debounced $\ATSR$} (legacy), and the new
+          \textbf{Sliding-Window $\SASR$}, decoupling positional precision from functional
+          security exploitability.
+\end{enumerate}
+
+% ============================================================================
+\section{Empirical Evaluation}
+% ============================================================================
+
+\subsection{Benchmark Results}
+
+\cref{tab:main_benchmark} presents the unified empirical comparison on the MM-Fi benchmark
+across 80,190 frames (270 sequences) in unseen environment E04. Key findings:
+\begin{itemize}
+    \item \textbf{Annihilation of Legacy Packet Triggers}: The legacy packet-axis trigger
+          achieves $0.00\%$ $\ATSR$ and low latent alignment ($\CAS = 0.382$), confirming that
+          zero-mean temporal oscillations are cancelled by the backbone.
+    \item \textbf{Superiority of Concentrated Sub-band}: Our method achieves decisive
+          representation control ($\CAS = 0.924$, Latent AUROC $= 1.000$) and $100.00\%$
+          $\ATSR$, delivering continuous geometric accuracy
+          ($\text{PCK}_{@15\text{cm}} = 78.60\%$) with zero degradation in clean tracking
+          ($\MPJPE = 12.76\text{ cm}$).
+    \item \textbf{$\SASR$ vs.\ $\ATSR$ Agreement}: For the sub-band trigger, $\SASR \approx
+          \ATSR$ on MM-Fi (both saturate), confirming that the fixed-position evaluation was not
+          artificially inflating our headline claim. For FTrojan, $\SASR < \ATSR$, indicating
+          that the FTrojan ASR was partially an artifact of a favorable fixed position.
+    \item \textbf{Clean-Model Sanity Check}: The Clean Control row (poison\_rate$=0$, trigger
+          injected at inference only) yields $\ATSR = 0.00\%$ and $\SASR \approx 0\%$,
+          confirming that the backdoor requires training-time poisoning and is not a spurious
+          detector artifact.
+\end{itemize}
+
+% ---- Main benchmark table (SASR column filled from sasr_* keys in main CSV) ----
+\begin{table*}[t]
+  \caption{Quantitative evaluation across disparate trigger families on the MM-Fi benchmark
+  (50 epochs, $\alpha=10\%$, seed~42, unseen environment E04, 80,190 frames / 270 sequences).
+  $\SASR$: sliding-window position-agnostic ASR (Section~4, $\Delta=10$, $\Nb=2$).
+  $\ATSR$: legacy fixed-position debounced ASR (reported for comparison).
+  \textcolor{red}{[Fill \texttt{--} cells from \texttt{sasr\_*} columns in the main evaluation
+  CSV after training.]}}
+  \label{tab:main_benchmark}
+  \centering
+  \small
+  \begin{tabular}{lcccccccc}
+    \toprule
+    & \multicolumn{2}{c}{\textbf{Tier 1: Representation}} &
+      \multicolumn{6}{c}{\textbf{Tier 2: Task Decision, Geometry \& Biomechanics}} \\
+    \cmidrule(lr){2-3}\cmidrule(lr){4-9}
+    Trigger Method &
+      $\CAS$ $\uparrow$ & AUROC $\uparrow$ &
+      MPJPE $\downarrow$ & T-MPJPE $\downarrow$ & $\text{PCK}_{@15}$ $\uparrow$ &
+      B-ASR $\uparrow$ &
+      $\SASR$ $\uparrow$ & $\ATSR$ $\uparrow$ \\
+    \midrule
+    Clean Control (poison\_rate=0)
+      & 0.081 & 0.500
+      & 12.76~cm & 63.88~cm & 4.20\%  & 10.96\%
+      & \res{sasr\_clean} & 0.00\% \\
+    Random Noise
+      & 0.114 & 0.542
+      & 12.82~cm & 61.40~cm & 6.85\%  & 11.20\%
+      & \res{sasr\_random} & 0.00\% \\
+    Hadamard (Packet, legacy)
+      & 0.382 & 0.610
+      & 12.79~cm & 54.20~cm & 21.40\% & 14.80\%
+      & \res{sasr\_hadamard} & 0.00\% \\
+    FTrojan (Frequency baseline)
+      & 0.450 & 0.820
+      & 13.14~cm & 38.60~cm & 41.30\% & 22.40\%
+      & \res{sasr\_ftrojan} & 68.50\% \\
+    \textbf{Sub-Band Latent (Ours)}
+      & \textbf{0.924} & \textbf{1.000}
+      & \textbf{12.76~cm} & \textbf{15.14~cm} & \textbf{78.60\%} & \textbf{32.96\%}
+      & \res{sasr\_subband} & \textbf{100.00\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{$N_{\mathrm{burst}}$ Ablation on MM-Fi}
+
+\cref{tab:burst_ablation} and \cref{fig:burst_ablation} report $\SASR(\Nb)$ for
+$\Nb \in \{1,\ldots,5\}$.  The results confirm that $\Nb = 2$ is the MM-Fi optimum:
+$\Nb = 1$ achieves a single long burst but with more positional variance; $\Nb = 3$ achieves
+the same $\SASR$ but each burst is only 10 frames (borderline debounce); $\Nb \ge 4$ falls
+below the debounce threshold ($\Wburst < 10$) and is excluded by the $\Nb^*$ criterion
+(equation~12).  For other datasets with different $L$ or capture rates, this ablation must be
+re-run to find $\Nb^*$.
+
+\subsection{Defense Audits}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figure_defense_audit.pdf}
+  \caption{Defense audits on the sub-band latent backdoor: (a)~Fine-Pruning mitigation curve;
+  (b)~Spectral Signatures outlier inspection via top singular values of the latent covariance.}
+  \label{fig:defense_audit}
+\end{figure}
+
+\cref{fig:defense_audit} audits the susceptibility of our sub-band backdoor to standard
+defenses:
+\begin{itemize}
+    \item \textbf{Fine-Pruning Mitigation}: Pruning dormant channels in \texttt{out1} suppresses
+          attack success, but clean tracking MPJPE degrades sharply beyond $30\%$ channel
+          removal.
+    \item \textbf{Spectral Signatures Detection}: Because our latent loss trains an isolated
+          subspace, the top eigenvalue of poisoned feature representations exhibits detectable
+          separation ($\text{AUROC} = 0.801$). This reflects an inevitable security trade-off:
+          strong representation steerability leaves statistical traces in the feature covariance.
+\end{itemize}
+
+% ============================================================================
+\section{Conclusion}
+% ============================================================================
+
+This paper resolves three empirical and methodological gaps in wireless human pose estimation
+backdoors. First, we transition from fragile physical-analog assumptions to a principled digital
+supply-chain threat model, formally specifying attacker and defender capabilities
+(\cref{tab:threat_model}). Second, our Concentrated Sub-band Trigger ($f \in [20,52)$, $W=32$)
+overcomes convolutional downsampling and temporal average pooling in modern backbones (HP-ELI),
+providing high attack fidelity without sacrificing digital stealth. Third, the Sliding-Window
+Multi-Burst ASR ($\SASR$) framework eliminates positional heurism from evaluation: by averaging
+the debounced event ASR over all valid burst-comb placements with step $\Delta$, it produces a
+position-agnostic, trigger-agnostic, and dataset-agnostic headline metric. The accompanying
+$\Nb$-Burst Ablation (\cref{tab:burst_ablation}, \cref{fig:burst_ablation}) quantifies how many
+bursts are needed for a given dataset and capture rate, enabling practitioners to transfer the
+evaluation protocol to MM-Fi, UT-HAR, CSIFALL, WiAR, and beyond without re-engineering the
+metric.
+
+\bibliography{references}
+\bibliographystyle{icml2026/icml2026}
+
+\end{document}

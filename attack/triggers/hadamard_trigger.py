@@ -60,8 +60,8 @@ class HadamardTrigger(BaseTrigger):
         self,
         *args,
         axis: str = "subcarrier",
-        subcarrier_start: int = 40,
-        subcarrier_end: int = 56,
+        subcarrier_start: int = 20,
+        subcarrier_end: int = 52,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)

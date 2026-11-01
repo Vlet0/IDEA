@@ -175,6 +175,13 @@ evaluation:
   # 10 frames ≈ 1 second — the minimum debounce window of a practical fall alarm.
   seq_min_frames: 10
   num_bursts: 2  # discrete continuous bursts per sequence for spatial-temporal diversity
+  # Ablation burst counts for the num_bursts sensitivity study.
+  ablation_num_bursts: [1, 2, 3, 4, 5]
+  # Sliding-window burst ASR (position-agnostic evaluation).
+  # burst_slide_step: 0 = disabled (fixed positions), >0 = sliding with this step.
+  # burst_width: frames per burst (must match poison budget: frames_per_seq * poison_rate / num_bursts).
+  burst_slide_step: 10   # slide step in frames
+  burst_width: 15        # frames per burst (297 * 0.10 / 2 = 14.85 ≈ 15)
   # Non-saturating stress tests run on the trained model (evaluate.evaluate_robustness).
   robustness:
     eps_scales: [0.05, 0.1, 0.25, 0.5, 1.0]   # test-time trigger budget relative to attack.epsilon

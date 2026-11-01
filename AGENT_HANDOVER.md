@@ -1,133 +1,237 @@
 # Agent Handover — Latent Backdoor WiFi-CSI Pose Estimation
 
-**Protocol**: metric `binary-fall-v7`, training `fixed-poison-v4` | **Branch**: `main` | **Last fixed**: eval-pipeline + defender pass (2026-10-26)
+**Protocol**: `metric binary-fall-v7` / `training fixed-poison-v4`  
+**Branch**: `main` | **Last updated**: 2026-11-01 (session: S-ASR + paper fixes)
 
-**Repo**: `U:\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git`  
+**Repo**: `d:\Ideav2\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git`  
 **Server**: `ssh wificsi@<server>` | **Code path**: `/home/wificsi/wifi/IDEA`  
-**Python env**: `/media/jackson/Data/wificsi/doorfusion/.venv/bin/python`  
+**Python env**: `.venv312` (local) / `/media/jackson/Data/wificsi/doorfusion/.venv` (server)  
 **GPU**: RTX 3080 Ti 12 GB
 
 ---
 
 ## 1. Bài toán
 
-**Latent-space backdoor attack trên WiFi-CSI human pose estimation** (MM-Fi dataset, HPELI backbone).
+**Latent-space backdoor attack trên WiFi-CSI human pose estimation** (MM-Fi dataset, HP-ELI backbone).
 
-Threat model **TM-B** (outsourced training / supply chain): attacker kiểm soát training loss nhưng không kiểm soát architecture và test-time preprocessing. `erm` arm là TM-A (data-poisoning-only) reference. Ours **không** so sánh với FTrojan ở equal poison rate như cùng threat model.
+**Threat model TM-B** (digital supply-chain): attacker poison training data + compromise edge firmware tại inference. Trigger là **digital** — thêm `eps * P_k` vào CSI tensor `[0,1]` sau min-max normalize. KHÔNG phải OTA/analog (OTA bị backbone triệt tiêu >90%, ASR=0%).
 
-**Ứng dụng**: eldercare fall detection. Trigger → model báo ngã sai liên tục → cảnh báo mất hiệu lực.
-
----
-
-## 2. Attack taxonomy (locked)
-
-```
-method  ∈ {latent, erm, clean}
-trigger ∈ {walsh_packet, hadamard_subcarrier, ftrojan}
-```
-
-**Paper "Ours"** = `latent + walsh_packet`, **K=1** cho headline results (đã set `K: 1` trong
-`configs/base_config.yaml`; K>1 chỉ là extension suite trong `attack_variants.yaml`, khai báo `K: 2`
-tường minh). Vì K=1 nên native evaluation KHÔNG còn in `Trigger k=0 / k=1` (per-trigger + selectivity
-chỉ chạy khi K>1).  
-**Baselines**: `erm + walsh_packet`, `erm + ftrojan`.  
-Multi-direction (K=2, alarm+conceal) là optional extension suite, không phải core.
+**Ứng dụng**: eldercare fall detection. Trigger → model emit false floor-fall pose → alarm fatigue.
 
 ---
 
-## 3. Loss và cơ chế latent (v7)
+## 2. Kết quả thực nghiệm đã chạy (IDEAv1 — codebase cũ, đã xóa outputs)
+
+Các kết quả dưới đây từ IDEAv1 (protocol `binary-fall-v4`, training `bernoulli-clean-v2`) — **codebase khác** với IDEA_code hiện tại. Dùng làm reference, không so sánh trực tiếp vì protocol đã upgrade.
+
+### 2.1 Main benchmark (IDEAv1 fullrun)
+| Metric | Value |
+|--------|-------|
+| Mode / Trigger | `latent` / `hadamard` (subcarrier axis) |
+| Poison rate | 1% |
+| Epochs | 50, seed=0 |
+| Clean MPJPE | **13.31 ± 4.71 cm** |
+| Target MPJPE | **0.005 cm** (≈ perfect target convergence) |
+| Causal displacement | **70.93 cm** |
+| ASR (binary_fall_asr) | **100.00%** (CI: [99.995%, 100%]) |
+| Clean fall rate | 0.00% |
+| Latent AUROC | **1.000** |
+| Separation ratio | 12.49× (clean=0.30, trig=3.75) |
+| Bone distortion | 4.62 cm |
+| n_eligible / n_total | 80,102 / 80,190 |
+
+> **Observation**: ASR 100% nhưng `L_clean=0, L_trig=0, L_ortho=0` từ epoch ~5 — model học target pose từ `L_trig_pose` thuần, latent terms không activate. Fall criteria IDEAv1 loose hơn v7 (`torso_max_height_m=0.28` vs `0.15`). **Chưa valid cho paper hiện tại.**
+
+### 2.2 Loss weight ablation (lam_trig_pose sweep, IDEAv1)
+| β (lam_trig_pose) | ASR (%) | T-MPJPE (cm) | C-MPJPE (cm) | AUROC | Disp (cm) |
+|-------------------|---------|--------------|--------------|-------|-----------|
+| 0.001 | 50.00 | 26.22 | 13.01 | 1.0 | 54.1 |
+| 0.002 | 100.00 | 0.27 | 13.00 | 1.0 | 71.3 |
+| 0.003 | 100.00 | 0.17 | 13.01 | 1.0 | 70.6 |
+| 0.005 | 100.00 | 0.05 | 13.02 | 1.0 | 71.1 |
+| 0.01 | 100.00 | 0.26 | 13.04 | 1.0 | 70.8 |
+| **0.50** | **100.00** | **0.016** | **13.15** | **1.0** | **70.4** |
+| 1.0 | 100.00 | 0.013 | 13.21 | 1.0 | 70.5 |
+| 2.0 | 100.00 | 0.006 | 12.87 | 1.0 | 71.0 |
+
+> **Takeaway**: β ≥ 0.002 đủ để ASR=100%. Latent AUROC=1.0 tất cả cases — **latent terms không differentiating**, chủ yếu là `L_trig_pose`. Cần re-run với v7 protocol (strict fall criteria, subband trigger, per-bone target).
+
+---
+
+## 3. Trạng thái codebase IDEA_code (hiện tại — chưa có training results)
+
+**Chưa có checkpoint nào trong IDEA_code.** Mọi thay đổi session này là code + paper, chưa train.
+
+### 3.1 Thay đổi trong session 2026-11-01
+
+| File | Thay đổi |
+|------|----------|
+| `attack/triggers/subband_trigger.py` | Default `subcarrier_start=20, end=52` (W=32) — fix từ (40,56) |
+| `attack/triggers/hadamard_trigger.py` | Default `subcarrier_start=20, end=52` (W=32) — fix từ (40,56) |
+| `evaluate.py` | `compute_sliding_burst_asr()` + `evaluate_burst_ablation()` đã có (implement từ trước) |
+| `evaluate_checkpoint.py` | Import + gọi S-ASR và N_burst ablation sau evaluate_robustness; clean-model sanity check; `sasr_*` vào CSV row; lưu `*_burst_ablation.csv` |
+| `configs/base_config.yaml` | `burst_slide_step:10`, `burst_width:15`, `ablation_num_bursts:[1,2,3,4,5]` — đã có |
+| `figures/plots.py` | Thêm `plot_burst_ablation()` — 2-panel bar chart S-ASR vs N_burst |
+| `report_latex/main.tex` | Xem §4 dưới |
+
+---
+
+## 4. Paper (main.tex) — Tables và Figures hiện tại
+
+### 4.1 Figures (4 total)
+| Label | File | Section | Trạng thái |
+|-------|------|---------|-----------|
+| `fig:pipeline` | `figure_pipeline.pdf` | §1 Intro | ✅ PDF có sẵn |
+| `fig:subband_concept` | `figure_subband_concept.pdf` | §3.1 | ✅ PDF có sẵn |
+| `fig:burst_ablation` | `figure_burst_ablation.pdf` | §5 N_burst | ❌ Chưa generate — cần chạy `plot_burst_ablation()` |
+| `fig:defense_audit` | `figure_defense_audit.pdf` | §8.3 Defense | ✅ PDF có sẵn |
+
+### 4.2 Tables (3 total)
+| Label | Section | Nội dung | Trạng thái |
+|-------|---------|---------|-----------|
+| `tab:threat_model` | §2.2 | Attacker/Defender capabilities (F/P/N) | ✅ Hoàn chỉnh — không cần số thực nghiệm |
+| `tab:burst_ablation` | §5.2 | N_burst × (W_burst, S-ASR mean/std, \|D\|) | ❌ Có `\res{}` placeholder — cần chạy `evaluate_burst_ablation()` |
+| `tab:main_benchmark` | §8.1 | Tier1+Tier2 metrics qua 5 trigger families | ❌ Cột `S-ASR` có `\res{sasr_*}` — cần training + evaluate |
+
+### 4.3 Cột SASR trong tab:main_benchmark — cần điền sau training
+```
+\res{sasr_clean}     → Clean Control, poison_rate=0
+\res{sasr_random}    → Random Noise baseline
+\res{sasr_hadamard}  → Hadamard (packet axis, legacy)
+\res{sasr_ftrojan}   → FTrojan frequency baseline
+\res{sasr_subband}   → Sub-Band Latent (ours)
+```
+
+### 4.4 Macro placeholder
+```latex
+\newcommand{\res}[1]{\textcolor{red}{\textbf{[#1]}}}
+```
+Thay `\res{key}` bằng số thật từ CSV sau khi train xong.
+
+---
+
+## 5. Attack taxonomy (v7 — locked)
 
 ```
-L = L_clean_pose + β·L_trig_pose + λ·L_margin+ + λ·L_margin- + λ_ortho·L_ortho
-  + λ_suff·L_suff + λ_nec·L_nec
+Proposed: latent + subband trigger, K=1 (single fall target, prone)
+          subband: f ∈ [20, 52), W=32, Hadamard rows, time-persistent
+Baselines:
+  - latent + ftrojan
+  - latent + hadamard (packet axis — legacy, zero-mean → blocked by backbone)
+  - erm + subband     (TM-A pure data poison, no latent objective)
+  - clean control     (poison_rate=0, trigger injected at inference → ASR should ≈ 0)
 ```
 
-- `z = spatial mean of out1` (128 ch), out1 shape: `(B, 128, H≈28, W≈2)`
-- **U** = top-K PCA directions của clean z (warm-up pass trước training) — **không** phải random QR
-- `L_suff`: clean `out1_c.detach() + c·u_k` → regression head → target_k
-- `L_nec`: triggered `out1 − proj_hw·u_k` → regression head → clean y (per-spatial projection)
-- `L_margin+`: push triggered `proj[poisoned]` ≥ margin; `L_margin-`: cap clean `proj[clean].amax() ≤ clean_thresh`
+**Injection**: `x_trig = clip(x + eps * P_k, 0, 1)`, `eps=0.35`, unit-L2 per antenna.  
+**Multi-burst**: 2 bursts × 15 frames, separated ~148 frames (~13s), mỗi burst ≥ debounce d=10.  
+**EOT**: `gain ∈ [0.7, 1.3]`, `eot_max_roll=0` (roll phá trigger identity trên T=10).
 
-**Trigger = DIGITAL** (xem README §2): nhiễu cộng vào CSI tensor *sau* min-max per-frame, trong
-`[0,1]`: `x_trig = clip(x + eps*pattern, 0, 1)`, `pattern` unit-L2 per antenna (content-decoupled).
-KHÔNG phải vật lý / analog (packet-axis chỉ *motivated* bởi cơ chế vật lý, chưa đo). `eot_max_roll: 0`
-(roll phá định danh trigger trên T=10; train.py cảnh báo nếu bật).
+---
 
-**Tiêm trigger theo sequence**: evaluator gán 1 trigger cho cả sequence (`k = seq_id % K`), độc lập
-batch size, để event-level ASR (chuỗi liên tiếp) hợp lệ. K=1 ⇒ mọi frame test đều bị trigger.
+## 6. Loss (v7 — 7 terms)
 
-**Calibration (quan trọng)**: PCA warm-up tính U từ clean latents VÀ calibrate ngưỡng trên đúng phép
-chiếu loss dùng, ép `clean_thresh < gate < margin` (`margin = clean_thresh + margin_gap_sigma·σ`).
-`LatentBackdoorLoss` raise nếu `margin ≤ clean_thresh` (đây là gốc cũ khiến `s_clean == s_trig`, ASR
-0%). Giá trị calibrated lưu trong `checkpoint["calibration"]`, restore khi resume/`--evaluate-only`;
-config lưu là config *yêu cầu* nên fingerprint khớp.
+```
+L = L_clean_pose          (L1 clean utility)
+  + β·L_trig_pose         (L1 target regression, β=lam_trig_pose=0.50)
+  + λ·L_clean_margin      (ReLU: clean |u_k^T z|_inf ≤ τ_clean)
+  + λ·L_trig_margin       (ReLU: triggered u_k^T z_k ≥ margin)
+  + λ_ortho·L_ortho       (off-diagonal cross-talk suppression)
+  + λ_suff·L_suff         (sufficiency: inject c·u_k → target pose)
+  + λ_nec·L_nec           (necessity: remove u_k from triggered → clean pose)
+```
 
-**Config hiện tại (`configs/base_config.yaml`)**:
+**Calibration**: PCA warm-up trên clean latents → U (SVD top-K), `τ_clean = max_k(μ_k + 3σ_k)`,
+`margin = τ_clean + margin_gap_sigma·max_k(σ_k)` với `margin_gap_sigma=3.0`.  
+**Invariant bắt buộc**: `margin > τ_clean` — nếu không, L_margin degenerate (s_clean == s_trig, ASR=0%).  
+`LatentBackdoorLoss.__init__` raise `ValueError` nếu vi phạm.
+
+---
+
+## 7. Metrics (v7)
+
+### Tier 1 — Latent Representation
+| Metric | Key trong CSV | Ý nghĩa |
+|--------|--------------|---------|
+| CAS | `latent_cas` | Mean max cosine(z, u_k) — trigger steers latent |
+| AUROC | `latent_auroc` | clean vs triggered projection separation |
+| d' | `latent_dprime` | Cohen's d-prime effect size |
+| TAR | `latent_true_activation_pct` | % triggered > gate τ |
+| FAR | `latent_false_activation_pct` | % clean > gate τ |
+
+### Tier 2 — Task Decision & Geometry
+| Metric | Key trong CSV | Ý nghĩa |
+|--------|--------------|---------|
+| **S-ASR** | `sasr_sliding_asr_mean` | Position-agnostic ASR (sliding window) |
+| S-ASR std | `sasr_sliding_asr_std` | Positional variance |
+| ATSR | `binary_fall_asr` | Fixed-position debounced event ASR |
+| B-ASR | `asr_bone_consistent` | ASR + bone length check ≤30% error |
+| T-MPJPE | `target_mpjpe_cm` | MPJPE vs attack target |
+| PCK@15 | `target_pck_15cm` | Target-PCK at 15cm threshold |
+| Clean MPJPE | `clean_mpjpe_cm` | Clean utility |
+| State-collapse ASR | `state_collapse_asr` | Trig output ≈ target AND clean ≠ target |
+
+**Headline metric cho paper**: S-ASR (primary) + ATSR (legacy comparison) + CAS + AUROC.
+
+### Fall criteria (v7, strict)
 ```yaml
-attack:
-  K: 1
-  epsilon: 0.15
-  poison_rate: 0.10
-  lam_trig_pose: 0.50
-  lam_ortho: 0.5
-  lam_suff: 1.0
-  lam_nec: 0.5
-  loss_lambda: 0.5          # λ cho margin terms
-  margin: 3.0               # bị calibration ghi đè khi latent run; clean_penalty_threshold: 1.0; gate: 2.0
-  margin_gap_sigma: 3.0     # khoảng cách clean_thresh→margin (đơn vị σ)
-  eot_max_roll: 0
+torso_max_height_m: 0.15    # v4 dùng 0.28 — v7 strict hơn ~2x
+max_spine_cos: 0.35
+max_body_vertical_span_m: 0.30
+max_bone_relative_error: 0.30
 ```
 
 ---
 
-## 4. Codebase structure
+## 8. Cấu trúc code
 
 ```
 IDEA_code/
-├── train.py                    # Entry: PCA warm-up+calibration → preflight eval → train (+probe) → evaluate
-├── evaluate.py                 # evaluate_model (event ASR, sequence-coherent trigger),
+├── train.py                    # PCA warm-up → preflight eval → train (+probe) → evaluate
+├── evaluate.py                 # evaluate_model, compute_sliding_burst_asr, evaluate_burst_ablation
 │                               # evaluate_latent_intervention, evaluate_trigger_selectivity
-├── evaluate_checkpoint.py      # Re-score saved checkpoint (v7; restores calibration)
-├── verify_pipeline.py          # CPU smoke test (no dataset needed, K-agnostic)
+│                               # evaluate_robustness, spectral_audit
+├── evaluate_checkpoint.py      # Re-score checkpoint: S-ASR + burst ablation + clean sanity
+├── verify_pipeline.py          # CPU smoke test (no dataset)
 ├── configs/
-│   ├── base_config.yaml        # Source of truth cho mọi hyperparams
+│   ├── base_config.yaml        # Single source of truth — epsilon=0.35, subband [20,52)
 │   └── experiments/
+│       ├── attack_variants.yaml
+│       ├── loss_component_ablation.yaml
+│       ├── loss_weight_ablation.yaml
 │       ├── leave_one_room_out.yaml
 │       ├── hyperparam_sweeps.yaml
-│       ├── seed_stability.yaml
-│       ├── attack_variants.yaml
-│       └── loss_component_ablation.yaml
+│       └── seed_stability.yaml
 ├── attack/
-│   ├── latent_attack.py        # make_U, make_U_from_latents (PCA), compute_target_poses
-│   ├── losses.py               # LatentBackdoorLoss, compute_causal_losses (L_suff, L_nec)
-│   ├── poisoning.py            # Fixed seeded subset, balanced trigger ids
+│   ├── latent_attack.py        # make_U_from_latents (PCA/SVD), compute_target_poses
+│   │                           # get_semantic_fall_targets, retarget_template_to_subject
+│   ├── losses.py               # LatentBackdoorLoss (7-term), compute_causal_losses
+│   ├── poisoning.py            # PoisonPlan (seeded, deterministic), PoisonedDataset
 │   └── triggers/
-│       ├── hadamard_trigger.py # Subcarrier (fragile ablation)
-│       ├── base.py             # BaseTrigger
-│       └── registry.py        # MODE_TO_TRIGGER
-├── defend/                     # DEFENDER side (độc lập với attack/; xem defend/README.md)
-│   ├── detection.py            # Spectral Signatures, Activation Clustering, linear-probe separability
-│   ├── model_repair.py         # Fine-Pruning, clean Fine-Tuning (curves ASR vs clean MPJPE)
-│   └── run_defenses.py         # CLI: python -m defend.run_defenses --checkpoint ...
+│       ├── base.py             # BaseTrigger — unit-L2 contract, apply(), apply_eot()
+│       ├── subband_trigger.py  # SubbandTrigger: f∈[20,52), W=32, Hadamard — default=PAPER
+│       ├── hadamard_trigger.py # HadamardTrigger: subcarrier/packet/subband axes
+│       ├── ftrojan_trigger.py  # FTrojanTrigger: 2D IDCT impulses
+│       └── registry.py        # trigger_for_mode(), build_trigger_from_config()
+├── defend/
+│   ├── detection.py            # Spectral Signatures, Activation Clustering
+│   ├── model_repair.py         # Fine-Pruning, Fine-Tuning curves
+│   └── run_defenses.py         # CLI entry point
 ├── models/
-│   ├── backbone.py             # build_backbone() → HPELI
+│   ├── backbone.py             # build_backbone() → HP-ELI
 │   └── model/hpeli/hpeli.py   # self.pool = nn.AvgPool2d (fixed)
 ├── datasets/
 │   └── mmfi_dataset.py
 ├── utils/
-│   ├── metrics.py              # _fall_pose_masks, compute_binary_fall_asr,
-│   │                           # FallCriteria dataclass
-│   ├── skeleton.py             # Joint indices/edges (single source of truth)
-│   ├── defenses.py             # Spectral Signatures audit
+│   ├── metrics.py              # FallCriteria, compute_binary_fall_asr (event-level debounce)
+│   │                           # compute_target_pck, compute_latent_cosine_alignment
+│   │                           # cluster_ratio_ci, compute_latent_separation_stats
+│   ├── skeleton.py             # BONES, joint indices — single source of truth
+│   ├── defenses.py             # extract_features, spectral_signature_audit
 │   └── logger.py
 ├── figures/
-│   ├── plots.py
+│   ├── plots.py                # plot_burst_ablation(), plot_main_benchmark(), plot_latent_tsne()
 │   └── style.py
-├── tests/                      # 75 tests
-│   ├── test_triggers.py
-│   ├── test_multitrigger.py
-│   ├── test_defend.py          # detection + model-repair
-│   └── test_rigor.py
+├── tests/                      # Unit tests
 └── scripts/
     ├── generate_fall_labels.py
     └── build_paper_artifacts.py
@@ -135,122 +239,112 @@ IDEA_code/
 
 ---
 
-## 5. Metric (ASR = binary_fall_asr)
-
-**Headline metric**: `binary_fall_asr` — skeleton dự đoán thỏa 3 điều kiện hình học:
-1. `head_height` và `neck_height` < 0.15m so với pelvis
-2. `|cos(spine, vertical)| < 0.35` (cột sống nằm ngang, góc > 70°)
-3. `body_span` ≤ 0.30m theo chiều đứng
-
-**Eligibility**: clean pred là valid non-fall AND GT là valid non-fall.
-
-**Event-level (headline khi có sequence ids)**: sequence eligible nếu ≥50% frame eligible; **success**
-nếu triggered có **chuỗi liên tiếp ≥ `seq_min_frames`** frame ngã (debounce). `frame_asr` và
-`seq_asr_total_count` (đếm rời rạc) giữ làm chẩn đoán. Trigger gán 1/sequence nên chuỗi mới hợp lệ.
-
-**Fall criteria config** (Z-up, `vertical_axis=2`):
-```yaml
-evaluation:
-  fall_criteria:
-    torso_max_height_m: 0.15
-    max_spine_cos: 0.35
-    max_body_vertical_span_m: 0.30
-    vertical_axis: 2
-```
-
-**Metric trả về**:
-- `asr` / `binary_fall_asr` — headline
-- `clean_mpjpe_cm` — utility
-- `auroc`, `cohens_d` — latent quality (latent mode only)
-- `bone_consistent_asr` + `clean_bone_consistent_rate` — anatomy check
-- CI: cluster-robust t-interval over subjects (n_eff = 10), không phải Wilson per-frame
-
----
-
-## 6. Bugs đã fix trong session 2026-10-25
-
-| File | Bug | Fix |
-|------|-----|-----|
-| `losses.py` | `compute_causal_losses` nhận canonical `fall_targets (K,J,3)` — decoder conflict | Đổi thành `suff_targets (K,B_c,J,3)` precomputed trong train.py |
-| `losses.py:188` | Missing `.detach()` → L_suff tạo 18:1 encoder gradient | `out1_c = out1[clean].detach()` |
-| `latent_attack.py` | Random QR U init → margin = mean của distribution | Thêm `make_U_from_latents()` dùng SVD/PCA |
-| `losses.py:90` | L_margin- dùng `.abs()` — phạt cả hai chiều ±u_k | Đổi thành `.amax(dim=1)` |
-| `losses.py` (L_nec) | Global-mean projection — trigger signal không xóa hoàn toàn | Per-spatial: `proj_hw = (out1_p * u_k.view(B,-1,1,1)).sum(1, keepdim=True)` |
-| `hpeli.py` | `AvgPool2d` tạo mới mỗi forward pass | `self.pool = nn.AvgPool2d((2,2))` trong `__init__` |
-| `evaluate.py` | `fall_targets` trên GPU, `trig_pred` trên CPU → RuntimeError | `fall_targets = fall_targets.cpu()` đầu `evaluate_trigger_selectivity` |
-
-### Session 2026-10-26 (eval-pipeline + defender)
-
-| File | Bug / vấn đề | Fix |
-|------|-----|-----|
-| `attack/latent_attack.py` | `compute_target_poses` lệch device (gốc crash RuntimeError bạn gặp) | Mọi tensor theo `y_clean.device` |
-| `attack/latent_attack.py` | Calibrate trên latent đã trừ-mean, loss dùng `z@U` không trừ → ngưỡng sai thang; `margin < clean_thresh` | Calibrate trên đúng projection; ép `clean_thresh<gate<margin`; orient U theo clean mass; `margin_gap_sigma` |
-| `attack/losses.py` | Objective suy biến khi `margin ≤ clean_thresh` | Raise `ValueError` |
-| `datasets/mmfi_dataset.py` | `te_seq_id` bị tắt chung với `te_subject` khi bone-check fail → headline thành frame-level, CI subject = nan | `te_seq_id` chỉ phụ thuộc layout cache đầy đủ |
-| `utils/defenses.py` | `extract_features` không `no_grad` → OOM trên full train set | `@torch.no_grad()` |
-| `figures/plots.py` | đọc `tsne_cfg["n_iter"]`, config chỉ có `max_iter` → KeyError cuối eval | đổi `max_iter` |
-| `train.py` | PCA ghi đè `margin` vào config → fingerprint không khớp → train lại 50 epoch / `--evaluate-only` bị từ chối | config lưu = requested; calibration lưu riêng; resume giữ U |
-| `train.py` | resume giữa epoch bỏ PCA → dùng U ngẫu nhiên khác U lúc train | epoch-ckpt lưu U + calibration; refuse resume ckpt cũ thiếu U |
-| `train.py` | `atk_cfg.get(key, default)` che default hardcode | đọc trực tiếp `atk_cfg[key]` |
-| `evaluate.py` | trigger-index round-robin **per-batch** → sequence bị xé nhỏ cho K>1, phụ thuộc batch size | gán 1 trigger / sequence (`k=seq_id%K`), truyền offset, độc lập batch |
-| `utils/metrics.py` | sequence ASR đếm rời rạc (`sum ≥ N`) | event-level: chuỗi **liên tiếp** `_longest_true_run ≥ seq_min_frames`; giữ `seq_asr_total_count`, `frame_asr` làm chẩn đoán |
-| `verify_pipeline.py` | hardcode K=2 (`indices=[0,1]`) | K-agnostic |
-
----
-
-## 7. Chạy thực nghiệm
+## 9. Workflow — chạy từ đầu
 
 ```bash
-# Smoke test (CPU, không cần dataset)
-python -m pytest tests                 # 75 tests
+# 1. Smoke test (CPU, không cần dataset)
+python -m pytest tests -x
 python verify_pipeline.py --device cpu
 
-# Full run (SSH). preflight_eval chạy toàn bộ evaluation trên vài probe sequence TRƯỚC epoch 1,
-# nên lỗi eval lộ trong ~1 phút; mỗi probe_interval epoch có 1 dòng [probe ep N].
-tmux new-session -d -s ours_full
-tmux send-keys -t ours_full "cd /home/wificsi/wifi/IDEA && PYTHONPATH=. \
-  /media/jackson/Data/wificsi/doorfusion/.venv/bin/python -u train.py \
-  --config configs/ssh_remote.yaml --mode latent \
-  --exp_name ours_latent_v7_50e 2>&1 | tee ours_v7.log" Enter
+# 2. Train proposed (subband latent, K=1, 50 epochs)
+python -u train.py --config configs/ssh_remote.yaml \
+    --exp_name ours_subband_v7 \
+    2>&1 | tee ours_subband_v7.log
 
-# Baseline ceiling của trigger (TM-A, cùng trigger, ERM thuần) — chạy song song
-python train.py --config configs/ssh_remote.yaml --mode hadamard_erm --exp_name erm_k1
+# 3. Train baselines (song song)
+python train.py --config configs/ssh_remote.yaml \
+    --exp_name ftrojan_baseline --mode ftrojan
 
-# Re-score checkpoint (không train lại); u_k intervention nằm trong output tự động (latent run)
-python evaluate_checkpoint.py --checkpoint_dir checkpoints/ --output rescore_v7.csv
+# 4. Train clean-model control (sanity check — ASR phải ≈0)
+python train.py --config configs/ssh_remote.yaml \
+    --exp_name clean_control_v7 --poison-rate 0.0
 
-# Defender audit (spectral / activation-clustering / linear-probe / fine-pruning / fine-tuning)
-python -m defend.run_defenses --checkpoint checkpoints/ours_latent_v7_50e_latent_model.pt --device cuda
+# 5. Evaluate (S-ASR + burst ablation + defense audit tự động)
+python evaluate_checkpoint.py \
+    --checkpoint checkpoints/ours_subband_v7_latent_model.pt \
+    --output results_ours.csv
+# → Tạo thêm: results_ours_robustness.csv, results_ours_burst_ablation.csv
+
+# 6. Defend audit
+python -m defend.run_defenses \
+    --checkpoint checkpoints/ours_subband_v7_latent_model.pt \
+    --device cuda
+
+# 7. Generate figure_burst_ablation.pdf từ burst ablation CSV
+python -c "
+import csv, json
+from figures.plots import plot_burst_ablation
+rows = list(csv.DictReader(open('results_ours_burst_ablation.csv')))
+# convert numeric fields
+for r in rows:
+    for k in r: r[k] = float(r[k]) if k not in ('checkpoint','mode') else r[k]
+plot_burst_ablation(rows, 'report_latex/figure_burst_ablation', {'formats':['pdf','png'],'dpi':300})
+"
 ```
 
 ---
 
-## 8. Open items (theo thứ tự ưu tiên)
+## 10. Open items (theo thứ tự ưu tiên)
 
-**Đã xong session 2026-10-26**: sửa crash + calibration (ASR 0% gốc), K=1, event-level ASR +
-sequence-coherent injection, subject CI bật lại, preflight/probe, thư mục `defend/`, cập nhật .md.
+### P0 — Phải làm trước paper submit
+1. **Train + evaluate** `ours_subband_v7` (50 epochs) — cần số thật cho `\res{}` trong main.tex  
+   Theo dõi probe: `displacement > 0`, `s_clean < gate < s_trig`, AUROC↑, ASR↑  
+   Nếu probe phẳng sau 10 epoch → dừng, debug margin/calibration
+2. **Train baselines** `ftrojan`, `hadamard_packet`, `random_noise`, `clean_control`
+3. **Điền số vào main.tex** từ CSV: thay `\res{sasr_subband}` → số thật; xóa `\textcolor{red}`
+4. **Generate** `figure_burst_ablation.pdf` (script ở §9 step 7)
 
-Còn lại:
-1. **[chạy TRƯỚC, ~3+ ngày GPU]** Single-trigger latent K=1 trên MM-Fi — CHỨNG MINH latent attack
-   hiệu quả: theo dõi `[probe ep N]` (displacement > 0, `s_clean < gate < s_trig`, AUROC↑, ASR↑).
-   Nếu probe phẳng ⇒ dừng sớm, không chờ 50 epoch.
-2. **[song song]** `hadamard_erm` K=1 cùng ε để biết **ceiling** ASR của trigger. Nếu ERM cũng ~0 ⇒
-   vấn đề ở trigger/ε, không phải loss latent.
-3. **[sau khi có ASR>0]** Causal `u_k`: đọc necessity/sufficiency/specificity trong
-   `intervention_*.csv` — latent attack chỉ "nhân quả" nếu bỏ `u_k` làm sập ASR và inject `u_k` dựng
-   được fall (specificity: random dir không dựng được). Lưu ý `z=avgpool(out1)` KHÔNG phải bottleneck.
-4. **[defend]** Chạy `defend.run_defenses`; report detectability (spectral/act-clust/linear-probe) +
-   fine-pruning/fine-tuning curves. Framing: input-space stealth, KHÔNG claim feature-space stealth.
-5. **[1 tuần]** Multi-seed (5 seeds) sau khi single-seed có ASR non-zero.
-6. **[open]** Trigger vật lý/analog chưa làm — hiện là **digital** supply-chain trigger (README §2).
+### P1 — Cần nhưng có thể sau train
+5. **Causal validation**: đọc `results_ours_intervention.csv` — necessity ASR drop ≥ 50 pp, sufficiency collapse ≥ 80%, specificity ≈ 0
+6. **Defense audit**: spectral AUROC, fine-pruning curve, activation clustering
+7. **N_burst ablation confirm**: `\res{}` trong tab:burst_ablation điền từ `results_ours_burst_ablation.csv`
+
+### P2 — Extension
+8. **Multi-seed** (5 seeds) sau khi single-seed confirmed
+9. **LORO** (Leave-One-Room-Out): `configs/experiments/leave_one_room_out.yaml`
+10. **Multi-trigger K=2** (alarm + concealment): `configs/experiments/attack_variants.yaml`
 
 ---
 
-## 9. Lưu ý đánh giá (không còn "predicted ASR")
+## 11. Vấn đề đã biết — cần watch khi train v7
 
-- Lần chạy trước ra **ASR 0%** vì objective suy biến (`margin ≤ clean_thresh`) + lệch device, đã sửa.
-  Không dự đoán con số; dùng probe/preflight để quan sát thực tế.
-- ASR headline nay là **event-level** (chuỗi ngã liên tiếp ≥ `seq_min_frames`), kèm `frame_asr`,
-  `seq_asr_total_count`, subject-CI, threshold sweep, robustness, intervention, defend.
-- **Paper strategy**: nếu latent thắng `hadamard_erm` ở ít nhất 1 trục (ε thấp hơn / poison thấp hơn /
-  sống sót defense) → lead attack; nếu không → lead evaluation+defense protocol, attack là case study.
+| Vấn đề | Triệu chứng | Gốc | Trạng thái |
+|--------|------------|-----|-----------|
+| Latent degenerate | `s_clean ≈ s_trig`, ASR = 0% | `margin ≤ τ_clean` | ✅ Sửa: `LatentBackdoorLoss` raise nếu vi phạm |
+| L_margin không activate | `L_clean=0, L_trig=0` từ epoch 5 | IDEAv1: loss đã về 0 trước khi latent học | ⚠️ Theo dõi trong v7 — có thể `lam_suff/nec` giúp |
+| Fall criteria quá loose | ASR=100% nhưng bone check thấp | IDEAv1: `torso_max_height=0.28m` | ✅ v7: `0.15m` — sẽ strict hơn |
+| Subband default sai | Code dùng [40,56) thay [20,52) | Hardcode khác config | ✅ Sửa session này |
+| S-ASR chưa có | `evaluate_checkpoint.py` không gọi | Chưa implement | ✅ Sửa session này |
+| Clean-model control | Không có sanity row trong paper | Chưa có | ✅ Thêm vào workflow |
+
+---
+
+## 12. Config key values (base_config.yaml — locked)
+
+```yaml
+attack:
+  K: 1
+  epsilon: 0.35           # v7: tăng từ 0.15 để subband [20,52) đủ SNR
+  poison_rate: 0.10
+  lam_trig_pose: 0.50     # β
+  lam_ortho: 0.5
+  lam_suff: 1.0
+  lam_nec: 0.5
+  loss_lambda: 0.5        # λ cho margin terms
+  margin_gap_sigma: 3.0
+  eot_max_roll: 0
+  subband:
+    subcarrier_start: 20
+    subcarrier_end: 52    # W = 32
+
+evaluation:
+  seq_min_frames: 10      # debounce threshold
+  num_bursts: 2
+  burst_slide_step: 10
+  burst_width: 15         # 297 * 0.10 / 2 ≈ 15
+  ablation_num_bursts: [1, 2, 3, 4, 5]
+  fall_criteria:
+    torso_max_height_m: 0.15   # strict — IDEAv1 dùng 0.28
+    max_spine_cos: 0.35
+    max_body_vertical_span_m: 0.30
+```
