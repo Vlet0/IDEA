@@ -11,6 +11,30 @@ Latent statistics (AUROC, d', activation rates) are computed only when a basis `
 passed, i.e. for models trained with the latent objective.  For baselines and clean
 controls they are ``nan``: a projection on an arbitrary random basis says nothing about
 the model and used to be reported as if it did.
+
+Canonical metric abbreviations (used in all log output and paper tables)
+------------------------------------------------------------------------
+ASR      : Attack Success Rate — fraction of *eligible* sequences whose triggered
+           prediction contains ≥ seq_min_frames consecutive fall-classified frames
+           (seq-level, debounced).  Headline number.
+B-ASR    : Bone-consistent ASR — ASR additionally requiring that ≥ seq_min_frames
+           triggered frames satisfy the subject's per-bone anthropometric constraints
+           (``max_bone_relative_error``).  Stricter than ASR; measures pose realism.
+S-ASR    : State-Collapse ASR — fraction of eligible frames whose triggered prediction
+           converged to the designated target pose (displacement + alignment + bone
+           thresholds).  Measures *accuracy* of the attack target, not just alarm
+           triggering.  Key ``state_collapse_asr`` in the result dict.
+CAD      : Causal displacement — mean per-frame L2 distance between triggered and clean
+           predictions × PS (cm).  Measures how much the trigger moves the output.
+           Key ``causal_displacement_cm``.
+T-MPJPE  : Target MPJPE — mean per-joint position error of triggered predictions vs the
+           per-subject retargeted fall target (cm).  Measures pose accuracy relative to
+           the intended target.  Key ``target_mpjpe_cm``.
+LCA      : Latent Cosine Alignment — mean maximum cosine similarity between each
+           triggered latent and the U subspace.  Key ``latent_cas``.
+AUROC    : AUROC of the latent score s = ||U^T z||_inf separating clean from triggered
+           inputs.  Key ``latent_auroc``.
+d'       : Cohen's d (effect size) of the same separation.  Key ``latent_dprime``.
 """
 
 from __future__ import annotations
@@ -645,6 +669,17 @@ def spectral_audit(net, poisoned_train_set, poison_mask: torch.Tensor, device,
     return out
 
 
+def _longest_true_run_eval(flags):
+    """Length of the longest run of consecutive True values in a boolean array."""
+    import numpy as np
+    best = run = 0
+    for v in np.asarray(flags).ravel():
+        run = run + 1 if v else 0
+        if run > best:
+            best = run
+    return best
+
+
 @torch.no_grad()
 def compute_sliding_burst_asr(
     net,
@@ -667,42 +702,16 @@ def compute_sliding_burst_asr(
     """Position-agnostic ASR via sliding burst windows.
 
     Evaluates ASR at every valid burst-cluster position by sliding the entire
-    multi-burst comb across the sequence with step ``burst_slide_step``, then
-    averages the per-position ASR.  This removes the heuristic fixed-position
+    multi-burst comb across the sequence with step burst_slide_step, then
+    averages the per-position ASR. This removes the heuristic fixed-position
     assumption and produces a trigger-family-agnostic metric.
 
-    The burst comb consists of ``num_bursts`` windows of ``burst_width`` frames
-    each, evenly spaced with gap = ``frames_per_seq // num_bursts``.  A position
-    is *valid* only when every burst window fits within [0, frames_per_seq)
-    without wrapping (no circular extension).
-
-    Args:
-        net:              Trained victim model (in eval mode on entry).
-        test_loader:      DataLoader yielding (x, y[, labels]) batches.
-        trigger:          Instantiated trigger (BaseTrigger).
-        fall_targets:     Per-subject fall target tensors.
-        PS:               Pose scale for MPJPE / normalisation.
-        device:           Torch device.
-        eps:              Trigger perturbation budget.
-        criteria:         Fall-alarm FallCriteria instance.
-        target_cfg:       Keyword args for compute_target_poses.
-        seq_ids:          Optional sequence-id array (one per frame, loader order).
-        seq_min_frames:   Minimum triggered-fall frames for a sequence-level hit.
-        frames_per_seq:   Canonical sequence length in frames.
-        num_bursts:       Number of burst windows in the comb.
-        burst_width:      Width of each burst window in frames.
-        burst_slide_step: Slide step in frames.  Must be >= 1.
-        poison_seed:      Seed used to map global frame index to within-sequence position.
-
-    Returns:
-        dict with keys::
-
-            sliding_asr_mean     -- mean ASR across all valid slide positions
-            sliding_asr_std      -- std across positions (coverage uniformity)
-            sliding_asr_min      -- worst-case position ASR
-            sliding_asr_max      -- best-case position ASR
-            n_slide_positions    -- number of valid positions evaluated
-            per_position_asr     -- list[float]: ASR at each offset
+    In addition to sequence-level alarm success (S-ASR), this function computes:
+    - Burst Hit Rate (BHR): the percentage of individual bursts that independently
+      sustain >= seq_min_frames of fall detection. This captures the fine-grained
+      burst-level reliability (e.g. trig 1 passes while trig 2 fails -> 50%).
+    - Sliding Bone-Consistent ASR (S-B-ASR): fraction of sequences passing both the
+      fall alarm and strict human bone length consistency constraints.
     """
     if burst_slide_step < 1:
         raise ValueError(f"burst_slide_step must be >= 1, got {burst_slide_step}")
@@ -714,17 +723,12 @@ def compute_sliding_burst_asr(
     gap = seq_len // nb
     bw = int(burst_width)
 
-    # Sequence-coherent trigger assignment (matches evaluate_model).
     if seq_ids is not None:
         kk_all = (torch.as_tensor(np.asarray(seq_ids)).long() % K)
         trigger_index_fn = lambda b, dev, off: kk_all[off:off + b].to(dev)
     else:
         trigger_index_fn = lambda b, dev, off: torch.arange(off, off + b, device=dev) % K
 
-    # Collect all valid slide offsets.
-    # Burst b occupies frames [offset + b*gap, offset + b*gap + bw) within seq.
-    # Last burst ends at offset + (nb-1)*gap + bw.
-    # Valid iff offset + (nb-1)*gap + bw <= seq_len (no wrap-around).
     offsets: list[int] = []
     off = 0
     while off + (nb - 1) * gap + bw <= seq_len:
@@ -732,17 +736,19 @@ def compute_sliding_burst_asr(
         off += burst_slide_step
 
     if not offsets:
-        # Degenerate: burst comb is wider than the sequence; return NaN metrics.
         return {
             "sliding_asr_mean": float("nan"),
             "sliding_asr_std": float("nan"),
             "sliding_asr_min": float("nan"),
             "sliding_asr_max": float("nan"),
+            "burst_hit_rate": float("nan"),
+            "burst_hit_rate_std": float("nan"),
+            "sliding_b_asr_mean": float("nan"),
             "n_slide_positions": 0,
             "per_position_asr": [],
+            "per_position_bhr": [],
         }
 
-    # Single clean pass: collect clean predictions and ground truth once.
     clean_preds_list: list[torch.Tensor] = []
     gt_list: list[torch.Tensor] = []
     labels_list: list[torch.Tensor] = []
@@ -761,9 +767,18 @@ def compute_sliding_burst_asr(
     gt_all = torch.cat(gt_list)
     labels_all = torch.cat(labels_list) if saw_labels else None
 
-    per_position_asr: list[float] = []
+    N_total = len(clean_preds)
+    if seq_ids is not None:
+        s_ids = np.asarray(seq_ids).ravel()
+    else:
+        s_ids = np.arange(N_total) // seq_len
+    frame_pos_arr = np.arange(N_total) % seq_len
+    unique_seqs = np.unique(s_ids)
 
-    # For each slide offset, run a triggered forward pass and compute ASR.
+    per_position_asr: list[float] = []
+    per_position_bone_asr: list[float] = []
+    per_position_bhr: list[float] = []
+
     for slide_off in offsets:
         trig_preds_list: list[torch.Tensor] = []
         global_offset = 0
@@ -773,7 +788,7 @@ def compute_sliding_burst_asr(
             B = len(x0)
 
             frame_ids = torch.arange(global_offset, global_offset + B, device=device)
-            pos_in_seq = (frame_ids + poison_seed * 37) % seq_len
+            pos_in_seq = frame_ids % seq_len
 
             is_injected = torch.zeros(B, dtype=torch.bool, device=device)
             for b in range(nb):
@@ -801,17 +816,46 @@ def compute_sliding_burst_asr(
             criteria=criteria,
             seq_ids=seq_ids,
             seq_min_frames=seq_min_frames,
+            return_masks=True,
         )
+        masks = binary.pop("masks")
+        succ_frame = masks["success"].cpu().numpy()
+        elig_frame = masks["eligible"].cpu().numpy()
+
         per_position_asr.append(float(binary["binary_fall_asr"]))
+        per_position_bone_asr.append(float(binary["asr_bone_consistent"]))
+
+        burst_hits = 0
+        burst_total = 0
+        for sid in unique_seqs:
+            seq_m = (s_ids == sid)
+            if elig_frame[seq_m].mean() < 0.5:
+                continue
+            for b in range(nb):
+                b_start = slide_off + b * gap
+                b_end = b_start + bw
+                burst_m = seq_m & (frame_pos_arr >= b_start) & (frame_pos_arr < b_end)
+                burst_total += 1
+                if _longest_true_run_eval(succ_frame[burst_m]) >= seq_min_frames:
+                    burst_hits += 1
+
+        bhr = (burst_hits / burst_total * 100.0) if burst_total > 0 else 0.0
+        per_position_bhr.append(bhr)
 
     asr_arr = np.array(per_position_asr, dtype=np.float64)
+    bone_arr = np.array(per_position_bone_asr, dtype=np.float64)
+    bhr_arr = np.array(per_position_bhr, dtype=np.float64)
     return {
         "sliding_asr_mean": float(asr_arr.mean()),
         "sliding_asr_std": float(asr_arr.std()),
         "sliding_asr_min": float(asr_arr.min()),
         "sliding_asr_max": float(asr_arr.max()),
+        "burst_hit_rate": float(bhr_arr.mean()),
+        "burst_hit_rate_std": float(bhr_arr.std()),
+        "sliding_b_asr_mean": float(bone_arr.mean()),
         "n_slide_positions": len(per_position_asr),
         "per_position_asr": per_position_asr,
+        "per_position_bhr": per_position_bhr,
     }
 
 
@@ -830,58 +874,25 @@ def evaluate_burst_ablation(
     seq_min_frames: int = 10,
     frames_per_seq: int = 297,
     burst_counts: "list[int] | None" = None,
-    burst_width: int = 15,
+    burst_width: "int | None" = None,
     burst_slide_step: int = 10,
     poison_seed: int = 42,
+    poison_rate: float = 0.10,
 ) -> "list[dict]":
     """Ablation over num_bursts: evaluate sliding-burst ASR for each burst count.
 
-    For each value in ``burst_counts`` this function calls
-    :func:`compute_sliding_burst_asr` with the given ``num_bursts`` and collects
-    the resulting sliding-window metrics.  The ablation answers the question:
-    does the number of temporal bursts affect aggregate ASR, or is the trigger
-    effective regardless of how the poison budget is partitioned in time?
-
-    Args:
-        net:              Trained victim model (in eval mode on entry).
-        test_loader:      DataLoader yielding (x, y[, labels]) batches.
-        trigger:          Instantiated trigger (BaseTrigger).
-        fall_targets:     Per-subject fall target tensors.
-        PS:               Pose scale for MPJPE / normalisation.
-        device:           Torch device.
-        eps:              Trigger perturbation budget.
-        criteria:         Fall-alarm FallCriteria instance.
-        target_cfg:       Keyword args for compute_target_poses.
-        seq_ids:          Optional sequence-id array (one per frame, loader order).
-        seq_min_frames:   Minimum triggered-fall frames for a sequence-level hit.
-        frames_per_seq:   Canonical sequence length in frames.
-        burst_counts:     List of num_bursts values to sweep.  Defaults to [1,2,3,4,5].
-        burst_width:      Width of each individual burst window in frames.
-        burst_slide_step: Slide step (frames) passed to compute_sliding_burst_asr.
-        poison_seed:      Seed used to map global frame index to within-sequence position.
-
-    Returns:
-        List of dicts, one per entry in ``burst_counts``::
-
-            [
-              {
-                "num_bursts": int,
-                "sliding_asr_mean": float,
-                "sliding_asr_std": float,
-                "sliding_asr_min": float,
-                "sliding_asr_max": float,
-                "n_slide_positions": int,
-                "per_position_asr": list[float],
-              },
-              ...
-            ]
+    Holding total poison budget constant (alpha * L frames), dynamically sets
+    burst_width = round(alpha * L / nb) if not explicitly provided.
     """
     if burst_counts is None:
         burst_counts = [1, 2, 3, 4, 5]
 
+    total_budget = max(1, int(round(frames_per_seq * poison_rate)))
+
     net.eval()
     results: list[dict] = []
     for nb in burst_counts:
+        bw = burst_width if burst_width is not None else max(1, total_budget // nb)
         metrics = compute_sliding_burst_asr(
             net=net,
             test_loader=test_loader,
@@ -896,9 +907,9 @@ def evaluate_burst_ablation(
             seq_min_frames=seq_min_frames,
             frames_per_seq=frames_per_seq,
             num_bursts=nb,
-            burst_width=burst_width,
+            burst_width=bw,
             burst_slide_step=burst_slide_step,
             poison_seed=poison_seed,
         )
-        results.append({"num_bursts": nb, **metrics})
+        results.append({"num_bursts": nb, "burst_width": bw, **metrics})
     return results

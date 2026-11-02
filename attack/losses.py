@@ -3,7 +3,7 @@ attack/losses.py
 =================
 Backdoor loss functions for WiFi-CSI human pose regression.
 
-  LatentBackdoorLoss : 5-term latent-subspace loss (proposed method)
+  LatentBackdoorLoss : 6-term latent-subspace loss (proposed method)
   PoisonedERMLoss    : plain L1 empirical risk on the poisoned training set
   FTrojanLoss        : PoisonedERMLoss under the FTrojan trigger (alias class)
 
@@ -17,6 +17,16 @@ re-weighted variant of the proposed method and was removed.
 Every loss is called with ``target_poses`` pre-computed by
 ``attack.latent_attack.compute_target_poses`` (the same function the evaluator uses) and
 returns ``(loss, info)`` where ``info`` holds per-component scalars for logging.
+
+Bone-length loss (L_bone)
+-------------------------
+The standard L1 joint-position loss is scale-blind: a prediction that shifts the pelvis
+20 cm while keeping all relative joint offsets correct incurs the same cost as one that
+distorts every bone length by 20 cm.  ``L_bone`` adds an explicit L1 penalty on the
+relative per-bone length error between the triggered prediction and the per-subject
+retargeted fall target.  This directly pushes the decoder to honour the
+``max_bone_relative_error`` check that ``asr_bone_consistent`` (B-ASR) enforces, without
+touching the evaluation metric itself.
 """
 
 from __future__ import annotations
@@ -25,10 +35,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.skeleton import SKELETON_EDGES
+
+# Precomputed index arrays so _bone_lengths can be called with no Python overhead.
+_BONE_STARTS: list[int] = [s for s, _ in SKELETON_EDGES]
+_BONE_ENDS:   list[int] = [e for _, e in SKELETON_EDGES]
+
+
+def _bone_lengths(poses: torch.Tensor) -> torch.Tensor:
+    """Per-sample per-bone Euclidean lengths, shape ``(B, num_bones)``.
+
+    Works in whatever coordinate units ``poses`` is expressed in (normalised or metric);
+    the L_bone loss uses the *relative* error so the absolute scale cancels out.
+    """
+    return torch.linalg.vector_norm(
+        poses[:, _BONE_STARTS] - poses[:, _BONE_ENDS], dim=-1
+    )  # (B, num_bones)
+
 
 class LatentBackdoorLoss(nn.Module):
     """
-    Latent-subspace backdoor loss.
+    Latent-subspace backdoor loss (6 terms).
 
     ::
 
@@ -37,6 +64,7 @@ class LatentBackdoorLoss(nn.Module):
           + lam    * L_clean_margin
           + lam    * L_trig_margin
           + L_ortho
+          + lam_bone * L_bone
 
     1. ``L_clean_pose``   L1(p, y) on clean samples (utility).
     2. ``L_trig_pose``    L1(p, y_target) on poisoned samples, weight ``beta = lam_trig_pose``.
@@ -46,14 +74,27 @@ class LatentBackdoorLoss(nn.Module):
     5. ``L_ortho``        lam_ortho * mean (u_j^T z)^2, j != k, on poisoned samples
        (cross-talk suppression; this is *not* an orthonormality constraint on U, which is
        orthonormal by construction).
+    6. ``L_bone``         lam_bone * mean |bone_len(p_trig) / bone_len(target) - 1| on
+       poisoned samples.  Directly optimises the relative per-bone length error that
+       ``asr_bone_consistent`` (B-ASR) checks during evaluation, without altering that
+       metric.  The denominator uses target bone lengths (clamped away from zero), making
+       the loss scale-invariant and consistent with the metric's ``max_bone_relative_error``
+       threshold.
 
     Note: the evaluator reports the unsigned statistic ``max_k |u_k^T z|``; training pushes
     the signed projection, so an activation of sign ``-`` is penalised in training but still
     counted as activated at evaluation.
     """
 
-    def __init__(self, lam: float, margin: float, clean_thresh: float,
-                 lam_ortho: float, lam_trig_pose: float) -> None:
+    def __init__(
+        self,
+        lam: float,
+        margin: float,
+        clean_thresh: float,
+        lam_ortho: float,
+        lam_trig_pose: float,
+        lam_bone: float = 0.0,
+    ) -> None:
         super().__init__()
         if not margin > clean_thresh:
             # Otherwise every sample can sit in [margin, clean_thresh]: both hinge terms are zero
@@ -65,6 +106,7 @@ class LatentBackdoorLoss(nn.Module):
         self.clean_thresh = clean_thresh
         self.lam_ortho = lam_ortho
         self.lam_trig_pose = lam_trig_pose
+        self.lam_bone = float(lam_bone)
 
     def forward(
         self,
@@ -105,7 +147,17 @@ class LatentBackdoorLoss(nn.Module):
                 off_target[rows, k_trig] = False
                 loss_ortho = self.lam_ortho * proj_trig[off_target].pow(2).mean()
 
-        total = loss_clean_pose + loss_trig_pose + loss_clean + loss_trig + loss_ortho
+        # ── L_bone: relative per-bone length error on poisoned predictions ────────────
+        # Optimises the same quantity that asr_bone_consistent (B-ASR) evaluates, so the
+        # decoder learns to produce fall poses with subject-consistent skeletal proportions.
+        loss_bone = zero
+        if has_poison and self.lam_bone > 0.0:
+            p_bones = _bone_lengths(p[poisoned])                    # (B_p, num_bones)
+            t_bones = _bone_lengths(target_poses[poisoned])         # (B_p, num_bones)
+            rel_err = (p_bones - t_bones).abs() / t_bones.clamp_min(1e-6)  # relative error
+            loss_bone = self.lam_bone * rel_err.mean()
+
+        total = loss_clean_pose + loss_trig_pose + loss_clean + loss_trig + loss_ortho + loss_bone
         return total, {
             "loss": total.item(),
             "loss_clean_pose": loss_clean_pose.item(),
@@ -113,6 +165,7 @@ class LatentBackdoorLoss(nn.Module):
             "loss_clean": loss_clean.item(),
             "loss_trig": loss_trig.item(),
             "loss_ortho": loss_ortho.item(),
+            "loss_bone": loss_bone.item() if has_poison and self.lam_bone > 0.0 else 0.0,
         }
 
 

@@ -59,10 +59,21 @@ attack:
   # controls `poison_rate` of the stored data, not a fresh Bernoulli draw per batch).
   poison_rate: 0.10        # 10 % — gives each trigger direction ~5 % of training data
   poison_seed: null        # null -> use the global `seed`
-  # --- Latent method loss (7 terms: 5 original + L_suff + L_nec) ---
-  loss_lambda: 0.5         # lambda for both margin terms (reduced so attack signal dominates)
-  lam_trig_pose: 0.50      # beta: pose regression weight on poisoned samples
-  lam_ortho: 0.5           # cross-talk suppression weight
+  # --- Latent method loss (8 terms: 5 original + L_suff + L_nec + L_bone) ---
+  # loss_lambda: weight for both latent margin hinge terms (L_clean_margin + L_trig_margin).
+  #   Raised to 1.5 so the latent separation signal has stronger gradient than L_trig_pose;
+  #   the previous value of 0.5 let L_trig_pose dominate and the margin terms converge to 0
+  #   without the triggered latents actually crossing the clean distribution (AUROC ≈ 0.55).
+  loss_lambda: 1.5
+  # lam_trig_pose: weight on L1 pose regression for poisoned samples.
+  #   Reduced to 0.3 to give the latent margin terms proportionally more gradient.
+  lam_trig_pose: 0.30
+  lam_ortho: 0.5           # cross-talk suppression weight (K>1 only; no-op for K=1)
+  # lam_bone: weight for L_bone (relative per-bone length error on triggered predictions).
+  #   Directly optimises the quantity that asr_bone_consistent (B-ASR) evaluates.
+  #   The evaluation metric is unchanged; this only teaches the decoder to preserve
+  #   subject-specific skeletal proportions when producing fall poses.
+  lam_bone: 0.40
   # Latent thresholds.  Must satisfy clean_penalty_threshold < gate_threshold < margin: with
   # margin <= clean_penalty_threshold every sample can sit between the two and satisfy both
   # hinge terms with no trigger effect (the cause of s_clean == s_trig and ASR 0 %).
@@ -73,6 +84,10 @@ attack:
   clean_penalty_threshold: 1.0
   gate_threshold: 2.0      # latent activation gate used only for latent diagnostics
   margin_gap_sigma: 3.0    # calibrated gap between clean_thresh and margin, in clean std units
+  # Periodic U refresh: re-run PCA on clean training latents every N epochs to keep U aligned
+  # with the evolving feature space.  0 = warm-up only (legacy behaviour).
+  # Recommended: 10 (every 10 epochs over 50-epoch training = 5 updates total).
+  u_update_interval: 10
   # --- Causal losses: L_suff (sufficiency) and L_nec (necessity) from v7 plan §3 ---
   lam_suff: 1.0            # weight for L_suff: clean + inject → fall target
   lam_nec: 0.5             # weight for L_nec: triggered − projection → clean pose
@@ -99,8 +114,10 @@ attack:
   #   removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to
   #   low-pass temporal smoothing).  Physical realisation: a reflective element toggled by a
   #   slow binary code across the T packets of each CSI frame.  DEFAULT.
+  # axis: subband (concentrated subcarrier band; high local Linf but killed by subcarrier
+  #   smoothing width=2 and static_removal; kept as ablation to illustrate fragility tradeoff).
   hadamard:
-    axis: subband
+    axis: subband       # DEFAULT: Concentrated sub-band trigger [20, 52) over packets
     subcarrier_start: 20
     subcarrier_end: 52
   subband:

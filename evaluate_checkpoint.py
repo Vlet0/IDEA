@@ -121,7 +121,8 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
             seq_min_frames=_seq_min,
             frames_per_seq=_frames_per_seq,
             num_bursts=int(eval_cfg.get("num_bursts", 2)),
-            burst_width=_burst_width,
+            burst_width=None,  # dynamically scale to keep total budget constant
+            poison_rate=float(atk.get('poison_rate', 0.10)),
             burst_slide_step=_slide_step,
             poison_seed=_poison_seed,
         )

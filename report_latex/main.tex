@@ -212,8 +212,13 @@ machine-learning supply chain:
 
 \subsection{Sub-Band Construction}
 
-To survive deep temporal downsampling while respecting digital stealth, we introduce the
-\textbf{Concentrated Sub-band Latent Backdoor Trigger}:
+\subsection{Physical DSP Foundations and Channel Coherence Bandwidth}
+
+Real-world WiFi fall detection systems (e.g., \texttt{csi-fall-dsp} \cite{hassan2023csifall}) rely on digital signal processing (DSP) front-ends to eliminate high-frequency subcarrier phase noise and multipath jitter using Hamming-window smoothing (\texttt{filter\_ham}) and low-pass filtering. In physical indoor environments, multipath reflections dictate a finite \textbf{channel coherence bandwidth} $B_c \approx 1/(2\pi \sigma_\tau) \sim 1$--$5\text{~MHz}$ (spanning $\sim 3$--$16$ subcarriers in 20~MHz WiFi).
+
+Prior frequency triggers (e.g., standard Sylvester--Hadamard rows) alternate $\pm 1$ across adjacent subcarriers at the spatial Nyquist frequency (sequency $= W-1$), causing standard receiver Hamming or moving-average filters to completely wipe out the trigger (energy retention drops to $0.00\%$).
+
+To survive receiver DSP front-ends and deep neural downsampling simultaneously while respecting digital stealth, we introduce the \textbf{Sequency-Ordered Concentrated Sub-band Trigger}:
 \begin{equation}
   \mathbf{P}_{k, c, f, t} =
   \begin{cases}
@@ -338,8 +343,13 @@ where $d = 10$ frames is the debounce threshold ($\approx$1.0\,s at 10\,Hz CSI c
   \SASR = \frac{1}{|\mathcal{D}|} \sum_{\delta \in \mathcal{D}} \mathcal{A}(\delta).
 \end{equation}
 We additionally report $\sigma_{\mathcal{A}}$, $\mathcal{A}_{\min}$, and $\mathcal{A}_{\max}$
-across $\mathcal{D}$.  A high $\SASR$ with low $\sigma_{\mathcal{A}}$ indicates that the
-backdoor is effective regardless of \emph{when} in the sequence it fires.
+across $\mathcal{D}$.
+
+\paragraph{Burst Hit Rate ($\text{BHR}$).} While $\SASR$ evaluates whether at least one burst in a sequence trips the debounced alarm, binary sequence pooling can mask intra-sequence failures. To measure fine-grained burst reliability across non-stationary human activities, we define the Burst Hit Rate:
+\begin{equation}
+  \text{BHR} = \frac{1}{|\mathcal{D}| \cdot N_{\text{seq}} \cdot \Nb} \sum_{\delta \in \mathcal{D}} \sum_{s=1}^{N_{\text{seq}}} \sum_{b=0}^{\Nb-1} \mathbb{I}\!\left( \operatorname{Run}_{\max}\!\left( \{\IsFall(\hat{\mathbf{P}}_t)\}_{t \in \text{burst}_{s,b}(\delta)} \right) \ge d \right).
+\end{equation}
+If Burst~1 succeeds during quiet standing while Burst~2 fails during a vigorous motion phase, $\text{BHR} = 50\%$. This provides a continuous, highly discriminative indicator that never trivially saturates at $100\%$, revealing the true interaction between trigger steering and physical body dynamics.
 
 \subsection{Compatibility with Diverse Trigger Families and Datasets}
 

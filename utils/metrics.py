@@ -13,6 +13,17 @@ Design notes
 * **No fabricated values.**  Undefined quantities are ``nan`` (never 0); latent statistics
   are only computed for models that were trained with a latent objective.
 * **No literal thresholds.**  All defaults are read from ``configs/base_config.yaml``.
+
+Canonical metric abbreviations (cross-reference with evaluate.py and train.py)
+-------------------------------------------------------------------------------
+ASR      → ``binary_fall_asr``     : seq-level fall-alarm attack success rate.
+B-ASR    → ``asr_bone_consistent`` : ASR with per-bone anthropometric consistency check.
+S-ASR    → ``state_collapse_asr``  : state-collapse to designated target pose.
+CAD      → ``causal_displacement_cm`` : mean triggered-vs-clean displacement (cm).
+T-MPJPE  → ``target_mpjpe_cm``    : triggered prediction error vs retargeted target (cm).
+LCA      → ``latent_cas``          : mean max cosine alignment of triggered latents to U.
+AUROC    → ``latent_auroc``        : AUROC of s = ||U^T z||_inf separating clean/triggered.
+d'       → ``latent_dprime``       : Cohen's d effect size of the same separation.
 """
 
 from __future__ import annotations
@@ -611,6 +622,7 @@ def compute_latent_cosine_alignment(z_trig: Any, U: Any) -> float:
     z, u = _tensor(z_trig), _tensor(U)
     if z.ndim != 2 or u.ndim != 2:
         return float("nan")
+    u = u.to(z.device)
     z_norm = z / z.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     u_norm = u / u.norm(dim=0, keepdim=True).clamp_min(1e-8)
     cos_sim = torch.matmul(z_norm, u_norm).abs().amax(dim=-1)

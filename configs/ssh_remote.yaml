@@ -28,19 +28,21 @@ attack:
   eot_gain_lo: 0.85          # Tighter gain range for digital (no OTA variation)
   eot_gain_hi: 1.15
   eot_max_roll: 0            # No packet roll (digital trigger is phase-locked)
-  loss_lambda: 1.0           # Increase margin pressure (was 0.5)
-  lam_trig_pose: 0.50        # Pose regression weight on poisoned samples
+  loss_lambda: 1.5           # Latent margin hinge weight (raised from 0.5→1.5 for stronger separation)
+  lam_trig_pose: 0.30        # Pose regression weight on poisoned samples (reduced 0.50→0.30)
   lam_ortho: 0.5             # Cross-talk suppression
+  lam_bone: 0.40             # Relative per-bone length loss → improves B-ASR
   lam_suff: 1.5              # Increase sufficiency loss weight (was 1.0)
   lam_nec: 0.5               # Necessity loss weight
   suff_inject_scale: 2.0     # Stronger injection coefficient (was 1.5)
-  # Concentrated sub-band trigger: Hadamard rows in subcarriers [20, 52)
-  # Width 32 (power-of-2) -> exact Hadamard orthogonality, good coverage,
-  # Linf ~ 0.023 at eps=0.35, PSNR ~ 39.7 dB
+  u_update_interval: 10      # Re-run PCA on clean latents every 10 epochs
+  # DCT-II packet-axis trigger (DEFAULT): zero-mean over packets → survives static-component
+  # removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to temporal
+  # low-pass.  Physical realisation: a reflective element toggled by a slow binary code across
+  # the T=10 packets of each CSI frame.
+  # To reproduce the subband ablation use:  hadamard: {axis: subband, subcarrier_start: 20, subcarrier_end: 52}
   hadamard:
-    axis: subband
-    subcarrier_start: 20
-    subcarrier_end: 52
+    axis: packet        # packet (DCT-II, default) | subband (ablation) | subcarrier (ablation)
 
 training:
   batch_size: 256

@@ -3,19 +3,22 @@ attack/triggers/hadamard_trigger.py
 ====================================
 Orthogonal WiFi-CSI trigger along the subcarrier axis, packet (time) axis, or concentrated subband.
 
-``axis='subcarrier'``
+``axis='subcarrier'`` (legacy full-spectrum Hadamard baseline)
     Sylvester--Hadamard rows ``1..K`` (``+-1``), truncated to the subcarrier count and constant
-    over packets: static over time, preserving full energy through temporal pooling.
+    over packets: static over time, preserving full energy through temporal pooling, but
+    vulnerable to subcarrier smoothing (cancelled by moving average).
 
-``axis='packet'`` (legacy physical tag default)
+``axis='subband'`` (proposed concentrated digital trigger)
+    Concentrated Walsh/Hadamard perturbation within a narrow band of subcarriers
+    [subcarrier_start, subcarrier_end] (e.g. 20 to 52, width 32), constant across packets.
+    Rows are sequency-ordered (Walsh ordering) so low-frequency spatial modes are used,
+    matching the physical channel coherence bandwidth and surviving receiver DSP filtering
+    (Hamming window, moving average) with >93% energy retention, while remaining strictly
+    temporally persistent to survive deep neural temporal average pooling (HP-ELI).
+
+``axis='packet'`` (legacy physical tag baseline)
     Low-frequency DCT-II basis rows ``1..K``, defined at the exact packet length (no truncation),
     flat over subcarriers. Zero-mean over packets.
-
-``axis='subband'`` (concentrated digital trigger)
-    Concentrated Hadamard/Walsh perturbation within a narrow band of subcarriers
-    [subcarrier_start, subcarrier_end] (e.g. 40 to 56, width 16..24), constant across packets.
-    Achieves high local L_inf (0.02..0.03 at eps=0.35, PSNR ~ 38..40 dB) while maintaining exact
-    orthonormality and BaseTrigger's per-antenna unit-L2 budget.
 """
 
 from __future__ import annotations
@@ -36,12 +39,23 @@ def _sign_changes(row: torch.Tensor) -> int:
     return int((s[1:] * s[:-1] < 0).sum())
 
 
-def _hadamard_rows(length: int, K: int) -> torch.Tensor:
+def _sylvester_hadamard_rows(length: int, K: int) -> torch.Tensor:
     """Sylvester--Hadamard rows ``1..K`` (skip DC), truncated to ``length``; ``(K, length)``."""
     order = 1 << max(length - 1, 1).bit_length()
     if K >= order:
         raise ValueError(f"axis supports at most {order - 1} directions for {length} samples, got K={K}")
     return torch.tensor(hadamard(order)[1:K + 1, :length], dtype=torch.float32)
+
+
+def _walsh_hadamard_rows(length: int, K: int) -> torch.Tensor:
+    """Walsh / Hadamard rows ``1..K`` (skip DC), sorted by sequency; ``(K, length)``."""
+    order = 1 << max(length - 1, 1).bit_length()
+    if K >= order:
+        raise ValueError(f"axis supports at most {order - 1} directions for {length} samples, got K={K}")
+    H = torch.tensor(hadamard(order), dtype=torch.float32)
+    seq = torch.tensor([_sign_changes(H[i]) for i in range(order)])
+    sorted_idx = torch.argsort(seq)
+    return H[sorted_idx[1:K + 1], :length]
 
 
 def _dct_rows(length: int, K: int) -> torch.Tensor:
@@ -78,12 +92,12 @@ class HadamardTrigger(BaseTrigger):
     def generate(self) -> torch.Tensor:
         if self.axis == "subband":
             width = self.subcarrier_end - self.subcarrier_start
-            rows = _hadamard_rows(width, self.K)
+            rows = _walsh_hadamard_rows(width, self.K)
             bank_1d = torch.zeros(self.K, 1, self.subcarriers, 1)
             bank_1d[:, 0, self.subcarrier_start:self.subcarrier_end, 0] = rows
             bank = bank_1d.expand(self.K, self.antennas, self.subcarriers, self.packets).contiguous()
         elif self.axis == "subcarrier":
-            rows = _hadamard_rows(self.subcarriers, self.K)
+            rows = _sylvester_hadamard_rows(self.subcarriers, self.K)
             bank = rows.view(self.K, 1, self.subcarriers, 1).expand(
                 self.K, self.antennas, self.subcarriers, self.packets
             ).contiguous()

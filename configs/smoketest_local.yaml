@@ -1,0 +1,38 @@
+# Local smoketest config — NOT for SSH, NOT for paper results.
+# Uses raw MMFi data at d:\Ideav2\MMFi, minimal rooms/epochs to run fast.
+# Do NOT commit results from this config; it is for code validation only.
+
+defaults: configs/base_config.yaml
+
+project_name: wifi_csi_latent_backdoor_smoketest
+experiment_name: smoketest_v8
+device: cpu        # local machine has no CUDA
+
+data:
+  mode: raw
+  raw_root: d:/Ideav2/MMFi
+  cache_path: d:/Ideav2/MMFi/smoketest_cache.npz   # written on first run, reused after
+  train_rooms: [E01]     # single room so data load is fast
+  test_rooms:  [E02]
+
+attack:
+  mode: latent
+  K: 1
+  poison_rate: 0.10
+  # Use new tuned weights from base_config (inherited); override only speed-critical knobs
+  # loss weights and trigger axis are inherited from base_config defaults
+
+training:
+  epochs: 1
+  batch_size: 64       # smaller batch for CPU
+  num_workers: 0       # no multiprocessing on Windows for smoketest
+  probe_interval: 1    # probe every epoch so we see the log once
+  preflight_eval: true
+  force_retrain: true
+  save_dir: ./checkpoints_smoketest/
+  output_dir: ./outputs_smoketest/
+
+evaluation:
+  batch_size: 64
+  probe_sequences: 2   # tiny probe — just enough to exercise the eval path
+  num_workers: 0

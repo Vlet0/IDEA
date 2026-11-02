@@ -39,7 +39,8 @@ from attack import (
     validate_poison_rate,
 )
 from datasets.mmfi_dataset import load_mmfi_data
-from evaluate import (collect_latent_features, evaluate_latent_intervention, evaluate_model,
+from evaluate import (collect_latent_features, compute_sliding_burst_asr,
+                      evaluate_burst_ablation, evaluate_latent_intervention, evaluate_model,
                       evaluate_per_trigger, evaluate_robustness, evaluate_trigger_selectivity,
                       spectral_audit)
 from models.backbone import build_backbone
@@ -108,6 +109,7 @@ def _build_criterion(mode: str, atk_cfg: dict, margin: float, clean_thresh: floa
             clean_thresh=clean_thresh,
             lam_ortho=atk_cfg["lam_ortho"],
             lam_trig_pose=atk_cfg["lam_trig_pose"],
+            lam_bone=float(atk_cfg.get("lam_bone", 0.0)),
         )
     if mode == "ftrojan":
         return FTrojanLoss()
@@ -323,7 +325,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     logger.info(
         f"Model {backbone_name.upper()} (latent m={latent_dim}) | epochs={epochs} | lr={lr} | wd={wd} | "
         f"batch_size={train_loader.batch_size} | loss_lambda={atk_cfg['loss_lambda']} | "
-        f"lam_trig_pose={atk_cfg['lam_trig_pose']}"
+        f"lam_trig_pose={atk_cfg['lam_trig_pose']} | lam_bone={float(atk_cfg.get('lam_bone', 0.0)):.3g}"
     )
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=epochs * len(train_loader))
@@ -354,22 +356,22 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         mixed_targets = not all(target_raises_alarm)
         log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f}")
         log(f"  T-MPJPE (cm)        : {eval_res['target_mpjpe_cm']:6.2f} ± {eval_res['target_mpjpe_std_cm']:.2f}")
-        log(f"  Causal displacement : {eval_res['causal_displacement_cm']:6.2f} cm")
+        log(f"  CAD (causal displ.) : {eval_res['causal_displacement_cm']:6.2f} cm")
         if mixed_targets:
             log("  NOTE: targets mix alarm and conceal intents; the aggregate fall-alarm ASR below "
                         "round-robins both and is NOT meaningful. Cite the per-trigger rows and selectivity.")
         _seq_note = (f"seq≥{seq_min_frames}f, n_seq={eval_res['n_success']}/{eval_res['n_eligible']}"
                      if seq_ids is not None else f"frame-level, n={eval_res['n_success']}/{eval_res['n_eligible']}")
-        log(f"  ASR (fall alarm)    : {eval_res['binary_fall_asr']:.4f} % "
+        log(f"  ASR / B-ASR         : {eval_res['binary_fall_asr']:.4f} % / {eval_res['asr_bone_consistent']:.4f} % "
                     f"(95% CI {eval_res['asr_ci95_low']:.4f}–{eval_res['asr_ci95_high']:.4f}; "
                     f"{_seq_note})")
         log(f"  ASR subject-level CI: {eval_res['asr_ci95_low_cluster']:.4f}–"
                     f"{eval_res['asr_ci95_high_cluster']:.4f} % (cluster-robust over test subjects)")
-        log(f"  ASR, bone-consistent: {eval_res['asr_bone_consistent']:.4f} % "
-                    f"({eval_res['n_fail_bone_consistency']} alarm-level successes violate the subject's bone lengths "
-                    f"by >{criteria.max_bone_relative_error:.0%}); same test on CLEAN predictions: "
+        log(f"  B-ASR detail        : {eval_res['asr_bone_consistent']:.4f} % "
+                    f"({eval_res['n_fail_bone_consistency']} alarm successes violate bone lengths "
+                    f"by >{criteria.max_bone_relative_error:.0%}); clean pred baseline: "
                     f"{eval_res['clean_bone_consistent_rate']:.4f} %")
-        log(f"  T-MPJPE median / p95: {eval_res['target_mpjpe_median_cm']:.2f} / "
+        log(f"  T-MPJPE median/p95  : {eval_res['target_mpjpe_median_cm']:.2f} / "
                     f"{eval_res['target_mpjpe_p95_cm']:.2f} cm")
         log("  ASR vs thresholds   : " + ", ".join(
             f"{key.removeprefix('asr_thr_')}={value:.2f}" for key, value in eval_res.items()
@@ -381,16 +383,52 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             "annotated is_fall" if eval_res["uses_annotated_fall_labels"] else "derived from ground-truth pose geometry"))
         log(f"  Fall rates (clean pred / triggered / GT): {eval_res['clean_fall_rate']:.4f} / "
                     f"{eval_res['trig_fall_rate']:.4f} / {eval_res['gt_fall_rate']:.4f} %")
-        log(f"  State-collapse ASR  : {eval_res['state_collapse_asr']:.4f} %")
+        log(f"  SC-ASR (state-coll.): {eval_res['state_collapse_asr']:.4f} %")
         log(f"  Fall criteria       : {criteria}")
         if latent_active:
-            log(f"  Latent AUROC        : {eval_res['latent_auroc']:.4f} | d'={eval_res['latent_dprime']:.2f} | "
-                        f"false/true activation={eval_res['latent_false_activation_pct']:.2f}/"
+            log(f"  CAS (subspace cos.) : {eval_res['latent_cas']:.4f} | "
+                        f"AUROC={eval_res['latent_auroc']:.4f} | d'={eval_res['latent_dprime']:.2f} | "
+                        f"false/true activ.={eval_res['latent_false_activation_pct']:.2f}/"
                         f"{eval_res['latent_true_activation_pct']:.2f} % "
                         f"(mean s: clean={eval_res['s_clean_mean']:.3f}, trig={eval_res['s_trig_mean']:.3f})")
         else:
             log("  Latent statistics   : n/a (model not trained with a latent objective)")
         log(f"  Bone shift vs clean : {eval_res['bone_shift_vs_clean_cm']:6.4f} cm")
+
+        # Sliding-Window Multi-Burst ASR (S-ASR & BHR)
+        slide_step = int(eval_cfg.get("burst_slide_step", 0))
+        if slide_step > 0 and not clean_only and audit_idx is None:
+            log("  [S-ASR] Evaluating position-agnostic sliding-window burst ASR...")
+            s_res = compute_sliding_burst_asr(
+                net=net,
+                test_loader=loader,
+                trigger=trigger,
+                fall_targets=fall_targets,
+                PS=PS,
+                device=device,
+                eps=eps,
+                criteria=criteria,
+                target_cfg=target_cfg,
+                seq_ids=seq_ids,
+                seq_min_frames=seq_min_frames,
+                frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
+                num_bursts=int(eval_cfg.get("num_bursts", 2)),
+                burst_width=int(eval_cfg.get("burst_width", 15)),
+                burst_slide_step=slide_step,
+            )
+            log(f"  S-ASR (sliding mean): {s_res['sliding_asr_mean']:.2f} ± {s_res['sliding_asr_std']:.2f} % "
+                f"[min={s_res['sliding_asr_min']:.2f}%, max={s_res['sliding_asr_max']:.2f}%, positions={s_res['n_slide_positions']}]")
+            log(f"  BHR (burst hit rate): {s_res['burst_hit_rate']:.2f} ± {s_res['burst_hit_rate_std']:.2f} % "
+                f"(independent burst debounce success rate)")
+            log(f"  S-B-ASR (sliding bone): {s_res['sliding_b_asr_mean']:.2f} %")
+            eval_res.update({
+                "sliding_asr_mean": s_res["sliding_asr_mean"],
+                "sliding_asr_std": s_res["sliding_asr_std"],
+                "sliding_asr_min": s_res["sliding_asr_min"],
+                "sliding_asr_max": s_res["sliding_asr_max"],
+                "burst_hit_rate": s_res["burst_hit_rate"],
+                "sliding_b_asr_mean": s_res["sliding_b_asr_mean"],
+            })
 
         sel = None
         # With a single trigger the per-direction breakdown IS the headline; skip the extra pass.
@@ -404,8 +442,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         for row in per_trig:
             k = row["k"]
             alarm = "fall-alarm" if target_raises_alarm[k] else "conceal (fall ASR not applicable)"
-            log(f"  Trigger k={k} ({names[k]}, {alarm}) fall-ASR: {row['binary_fall_asr']:.4f} % | "
-                        f"state-collapse to target: {row['state_collapse_asr']:.4f} % "
+            log(f"  Trigger k={k} ({names[k]}, {alarm}) ASR: {row['binary_fall_asr']:.4f} % | "
+                        f"S-ASR (state-coll.): {row['state_collapse_asr']:.4f} % "
                         f"(T-MPJPE = {row['target_mpjpe_cm']:6.2f} cm)")
         if any(not a for a in target_raises_alarm):
             log("  NOTE: a 'stand/conceal' trigger's goal is to SUPPRESS a real fall alarm; MM-Fi has "
@@ -432,11 +470,11 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 target_cfg, U, margin, eval_cfg["intervention"],
             )
             for row in interv["necessity"]:
-                log(f"  [causal] k={row['k']} necessity: fall-ASR {row['asr_baseline']:.2f} % -> "
-                            f"{row['asr_with_uk_removed']:.2f} % when the u_k component is removed")
+                log(f"  [causal] k={row['k']} necessity: ASR {row['asr_baseline']:.2f} % -> "
+                            f"{row['asr_with_uk_removed']:.2f} % when u_k removed")
             for tag in ("sufficiency", "specificity"):
                 at1 = [r for r in interv[tag] if abs(r["scale"] - 1.0) < 1e-9]
-                summary = "; ".join(f"k{r['k']} fall {r['fall_rate']:.1f}% / collapse {r['state_collapse_to_target']:.1f}%"
+                summary = "; ".join(f"k{r['k']} fall {r['fall_rate']:.1f}% / S-ASR {r['state_collapse_to_target']:.1f}%"
                                     for r in at1)
                 inj = "u_k" if tag == "sufficiency" else "random dir orthogonal to U"
                 log(f"  [causal] {tag} @ scale=1 (inject {inj}): {summary}")
@@ -456,7 +494,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         )
         for row in robustness:
             log(f"  Robustness {row['condition']}={row['value']:g}: ASR {row['asr']:.2f} % | "
-                        f"bone-consistent {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
+                        f"B-ASR {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
                         f"clean MPJPE {row['clean_mpjpe_cm']:.2f} cm | clean fall rate {row['clean_fall_rate']:.2f} %")
         robustness_path = os.path.join(out_dir, f"robustness_{METRIC_PROTOCOL_VERSION}.csv")
         save_dict_to_csv([{"experiment_name": exp_name, "config_id": config_id,
@@ -735,6 +773,47 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                     "training_protocol_version": TRAINING_PROTOCOL_VERSION,
                 }, epoch_ckpt_path)
 
+            # ── Periodic U refresh ────────────────────────────────────────────────────
+            # Re-run PCA on clean training latents every `u_update_interval` epochs so U
+            # stays aligned with the evolving feature space.  Without this U is computed
+            # once at warm-up then the latent space rotates away from it, collapsing the
+            # latent separation signal (AUROC stays near 0.5, d'≈0.45).
+            # Skipped on epoch 0 (warm-up already ran), on the last epoch (post-training
+            # evaluation uses the checkpoint's U), and when u_update_interval is 0 (legacy).
+            _u_interval = int(atk_cfg.get("u_update_interval", 0))
+            if (latent_active and _u_interval > 0
+                    and (ep + 1) % _u_interval == 0
+                    and (ep + 1) < epochs):
+                logger.info(f"  [U refresh ep {ep+1}] Re-running PCA on clean training latents...")
+                bns = [m for m in net.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+                momenta = [m.momentum for m in bns]
+                for m in bns:
+                    m.momentum = 0.0
+                net.train()
+                pca_bs = train_loader.batch_size
+                z_list_ref = []
+                with torch.no_grad():
+                    for i in range(0, len(X_clean), pca_bs):
+                        x_b = X_clean[i: i + pca_bs].to(device)
+                        if len(x_b) < 2:
+                            continue
+                        _, z_b = net(x_b)
+                        z_list_ref.append(z_b.cpu())
+                for m, mom in zip(bns, momenta):
+                    m.momentum = mom
+                Z_ref = torch.cat(z_list_ref, dim=0)
+                U_new, margin_t, clean_thresh_t = make_U_from_latents(
+                    Z_ref, K=K, device=device,
+                    margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]))
+                U, margin, clean_thresh = U_new, float(margin_t), float(clean_thresh_t)
+                gate = 0.5 * (margin + clean_thresh)
+                criterion = _build_criterion(mode, atk_cfg, margin, clean_thresh)
+                logger.info(
+                    f"  [U refresh ep {ep+1}] U updated. "
+                    f"clean_thresh={clean_thresh:.4f} < gate={gate:.4f} < margin={margin:.4f}"
+                )
+                logger.info(f"  [U refresh ep {ep+1}] U^T U:\n{(U.T @ U).cpu().numpy().round(4)}")
+
             if probe_interval > 0 and ((ep + 1) % probe_interval == 0 or (ep + 1) == epochs):
                 # Probe evaluation mirrors the final run_evaluation call.  Pass seq_ids so the
                 # headline ASR is SEQUENCE-level (>=seq_min_frames consecutive triggered-fall
@@ -755,15 +834,16 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
                              else "frame-level")
                 latent_msg = (f" | s clean/trig {pr['s_clean_mean']:.3f}/{pr['s_trig_mean']:.3f} "
-                              f"(thresh {clean_thresh:.3f}, margin {margin:.3f}), AUROC {pr['latent_auroc']:.3f}"
+                              f"(thresh {clean_thresh:.3f}, margin {margin:.3f}), AUROC {pr['latent_auroc']:.3f}, "
+                              f"LCA {pr['latent_cas']:.3f}"
                               if latent_active else "")
                 logger.info(f"  [probe ep {ep+1}] clean MPJPE {pr['clean_mpjpe_cm']:.2f} cm | "
-                            f"T-MPJPE {pr['target_mpjpe_cm']:.2f} cm | displacement "
+                            f"T-MPJPE {pr['target_mpjpe_cm']:.2f} cm | CAD "
                             f"{pr['causal_displacement_cm']:.2f} cm | "
                             f"ASR({_seq_note}) {pr['binary_fall_asr']:.2f} % | "
-                            f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} % | "
-                            f"bone-ASR {pr['asr_bone_consistent']:.2f} % | "
-                            f"trig fall rate {pr['trig_fall_rate']:.2f} %" + latent_msg)
+                            f"B-ASR {pr['asr_bone_consistent']:.2f} % | "
+                            f"S-ASR {pr['state_collapse_asr']:.2f} % | "
+                            f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} %" + latent_msg)
 
         torch.save({
             "net_state_dict": net.state_dict(),
@@ -785,6 +865,9 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
 
     # ── 8-9. Evaluation and skeleton visualisation ──────────────────────────
     logger.info(f"\n===== NATIVE EVALUATION: {mode.upper()} ({trigger_type}) =====")
+    logger.info("  Metric legend: ASR=seq-level fall-alarm rate | B-ASR=bone-consistent ASR | "
+                "S-ASR=sliding-window ASR | BHR=burst hit rate | SC-ASR=state-collapse ASR | "
+                "CAS=cosine alignment with subspace | T-MPJPE=triggered vs target")
     eval_res, per_trig, sel, defense = run_evaluation(test_loader, meta.get("te_subject"), te_seq_id,
                                                       output_dir)
 

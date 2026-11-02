@@ -7,7 +7,11 @@ Optimized for realistic digital supply-chain attacks across diverse neural netwo
 architectures (HPELI, MetaFi++, WiPose, etc.):
 
 - **Frequency-localized**: Perturbation is concentrated in a narrow band of
-  subcarriers (e.g., subcarriers 40 to 56, width W = 16..24).
+  subcarriers (e.g., subcarriers 20 to 52, width W = 32).
+- **Sequency-ordered (Walsh ordering)**: Rows are ordered by sign-change count so the
+  lowest spatial frequency Walsh basis is selected. This ensures smoothness across
+  adjacent subcarriers, aligning with the physical channel coherence bandwidth and
+  surviving receiver DSP filters (Hamming window, moving average) with >93% energy retention.
 - **Time-persistent**: Pattern is constant across all time packets (T = 10).
   This prevents attenuation by temporal pooling layers (such as HPELI's AvgPool2d
   and SKConv temporal average pooling), while ensuring all temporal tokens in
@@ -27,12 +31,21 @@ from scipy.linalg import hadamard
 from .base import BaseTrigger
 
 
+def _sign_changes(row: torch.Tensor) -> int:
+    """Number of adjacent sign changes (the sequency) of a row."""
+    s = torch.sign(row)
+    return int((s[1:] * s[:-1] < 0).sum())
+
+
 def _hadamard_rows(length: int, K: int) -> torch.Tensor:
-    """Sylvester--Hadamard rows ``1..K`` (skip DC), truncated to ``length``; ``(K, length)``."""
+    """Walsh / Hadamard rows ``1..K`` (skip DC), sorted by sequency; ``(K, length)``."""
     order = 1 << max(length - 1, 1).bit_length()
     if K >= order:
         raise ValueError(f"subband width {length} supports at most {order - 1} directions, got K={K}")
-    return torch.tensor(hadamard(order)[1:K + 1, :length], dtype=torch.float32)
+    H = torch.tensor(hadamard(order), dtype=torch.float32)
+    seq = torch.tensor([_sign_changes(H[i]) for i in range(order)])
+    sorted_idx = torch.argsort(seq)
+    return H[sorted_idx[1:K + 1], :length]
 
 
 class SubbandTrigger(BaseTrigger):
@@ -44,9 +57,9 @@ class SubbandTrigger(BaseTrigger):
     K, antennas, subcarriers, packets : int
         Bank dimensions.
     subcarrier_start : int
-        Start subcarrier index (inclusive, default: 40).
+        Start subcarrier index (inclusive, default: 20).
     subcarrier_end : int
-        End subcarrier index (exclusive, default: 56; width = 16).
+        End subcarrier index (exclusive, default: 52; width = 32).
     """
 
     def __init__(
