@@ -301,6 +301,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     plausibility_fpr = float(eval_cfg["plausibility"]["fpr"])
     frames_per_seq = int(config["data"]["expected_frames_per_action"])
     eval_num_bursts = int(eval_cfg["num_bursts"])
+    position_alpha = float(eval_cfg["position_alpha"])
 
     # ── 3. Attack objects ────────────────────────────────────────────────────
     U = make_U(m=latent_dim, K=K, seed=seed, device=device)
@@ -487,12 +488,14 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 clusters=clusters,
                 cluster_cfg=eval_cfg["cluster_ci"],
                 plausibility_fpr=plausibility_fpr,
+                position_alpha=position_alpha,
             )
             log(f"  BHR (burst hit rate): {s_res['burst_hit_rate']:.2f} % "
                 f"[position min={s_res['burst_hit_rate_min']:.2f}%, max={s_res['burst_hit_rate_max']:.2f}%; "
-                f"Wilson 95% {s_res['burst_hit_rate_ci95_low']:.2f}–{s_res['burst_hit_rate_ci95_high']:.2f}; "
-                f"subject-cluster 95% {s_res['burst_hit_rate_ci95_low_cluster']:.2f}–"
-                f"{s_res['burst_hit_rate_ci95_high_cluster']:.2f}; "
+                f"subject-cluster 95% CI {s_res['burst_hit_rate_ci95_low_cluster']:.2f}–"
+                f"{s_res['burst_hit_rate_ci95_high_cluster']:.2f} (cite this one); "
+                f"Wilson 95% {s_res['burst_hit_rate_ci95_low']:.2f}–{s_res['burst_hit_rate_ci95_high']:.2f} "
+                f"(anti-conservative: pools correlated placements/subjects as independent); "
                 f"{s_res['n_bursts_eligible']} eligible bursts/placement, {s_res['n_slide_positions']} placements]")
             log(f"  BHR plausible       : {s_res['burst_hit_rate_plausible']:.2f} % | all-burst ASR: "
                 f"{s_res['all_burst_asr_mean']:.2f} % | any-burst ASR (OR, saturates): "

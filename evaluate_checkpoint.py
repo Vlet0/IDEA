@@ -81,6 +81,7 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     # for every checkpoint (including the clean control); see evaluate.py "Estimands".
     injection_rate = float(eval_cfg["test_injection_rate"])
     plausibility_fpr = float(eval_cfg["plausibility"]["fpr"])
+    position_alpha = float(eval_cfg["position_alpha"])
     res = evaluate_model(
         net, test_loader, trigger, fall_targets, PS, device, atk["epsilon"], atk["gate_threshold"],
         criteria,
@@ -117,6 +118,7 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
             frames_per_seq=frames_per_seq, num_bursts=num_bursts, burst_width=_burst_width,
             burst_slide_step=_slide_step, clusters=meta.get("te_subject"),
             cluster_cfg=eval_cfg["cluster_ci"], plausibility_fpr=plausibility_fpr,
+            position_alpha=position_alpha,
         )
         print(f"[BHR] {sliding_asr['burst_hit_rate']:.2f}% "
               f"(subject-cluster 95% CI {sliding_asr['burst_hit_rate_ci95_low_cluster']:.2f}-"
@@ -132,6 +134,7 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
             frames_per_seq=frames_per_seq, burst_counts=_ablation_nb, burst_width=_burst_width,
             burst_slide_step=_slide_step, clusters=meta.get("te_subject"),
             cluster_cfg=eval_cfg["cluster_ci"], plausibility_fpr=plausibility_fpr,
+            position_alpha=position_alpha,
         )
         for ab in burst_ablation:
             print(f"  N_burst={ab['num_bursts']:d} (inject {ab['injected_fraction_pct']:.1f}%): "

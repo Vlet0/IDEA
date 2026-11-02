@@ -248,6 +248,12 @@ evaluation:
   # evaluation has the same exposure as evaluate_model.
   burst_slide_step: 10   # slide step in frames
   burst_width: 15        # frames per burst
+  # Significance level of the chi-square position-homogeneity test behind `position_invariant`
+  # (evaluate.compute_sliding_burst_asr). Deliberately strict (small alpha): the claim being
+  # protected against false-positive is "the victim's outcome depends on burst placement", so a
+  # small alpha demands strong evidence before asserting that effect, consistent with the
+  # conservative bias already noted in the test's docstring.
+  position_alpha: 0.01
   # Non-saturating stress tests run on the trained model (evaluate.evaluate_robustness).
   robustness:
     eps_scales: [0.05, 0.1, 0.25, 0.5, 1.0]   # test-time trigger budget relative to attack.epsilon

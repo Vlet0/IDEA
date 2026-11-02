@@ -879,7 +879,13 @@ def compute_sliding_burst_asr(
     reuse the same sequences, which makes hit counts positively correlated, so the test is
     conservative: it can miss weak position effects but does not invent them.
 
-    ``clusters`` (per-frame subject ids) enables the subject-level cluster CI of the pooled BHR.
+    ``clusters`` (per-frame subject ids) enables the subject-level cluster CI of the pooled BHR
+    (``burst_hit_rate_ci95_*_cluster``) -- the one to cite.  The plain Wilson CI
+    (``burst_hit_rate_ci95_low``/``_high``) pools every burst at every placement as an independent
+    trial; adjacent placements overlap by ``burst_width - burst_slide_step`` frames and are
+    therefore highly correlated, and bursts of the same subject are correlated too, so that CI is
+    anti-conservative (too narrow) on both counts -- a diagnostic fallback for when no subject ids
+    exist, never the headline uncertainty.
     """
     if burst_slide_step < 1:
         raise ValueError(f"burst_slide_step must be >= 1, got {burst_slide_step}")
@@ -1082,6 +1088,7 @@ def evaluate_burst_ablation(
     clusters=None,
     cluster_cfg: dict | None = None,
     plausibility_fpr: float | None = None,
+    position_alpha: float = 0.01,
 ) -> "list[dict]":
     """Ablation over the number of bursts at a FIXED burst width.
 
@@ -1110,7 +1117,7 @@ def evaluate_burst_ablation(
             criteria=criteria, seq_ids=seq_ids, seq_min_frames=seq_min_frames,
             frames_per_seq=frames_per_seq, num_bursts=nb, burst_width=int(burst_width),
             burst_slide_step=burst_slide_step, clusters=clusters, cluster_cfg=cluster_cfg,
-            plausibility_fpr=plausibility_fpr,
+            plausibility_fpr=plausibility_fpr, position_alpha=position_alpha,
         )
         results.append({**row_meta, **{k: v for k, v in metrics.items()
                                        if k not in ("burst_width", "num_bursts")}})
