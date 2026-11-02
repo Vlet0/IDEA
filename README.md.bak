@@ -1,133 +1,227 @@
 # Latent-Space Semantic Backdoors for WiFi-CSI Human Pose Estimation
 
-This repository implements a **two-tier evaluated digital backdoor framework** against WiFi Channel State Information (CSI) human pose estimation (HPE), targeting continuous ambient fall detection in eldercare. 
+This repository implements a **two-tier evaluated digital backdoor framework** against WiFi Channel State Information (CSI) human pose estimation (HPE), targeting continuous ambient fall detection in eldercare.
 
-An adversary poisons a small fraction ($\alpha = 10\%$) of the training data to implant a latent subspace trigger. Under normal conditions, the model performs high-fidelity pose estimation. When activated by a discrete digital burst, the model deterministically emits an attacker-selected canonical floor-fall pose, triggering emergency alarms and inducing severe caregiver alert fatigue.
+An adversary poisons a small fraction (α = 10%) of the training data to implant a latent subspace trigger. Under normal conditions the model performs high-fidelity pose estimation. When activated by a discrete digital burst, it deterministically emits an attacker-selected canonical floor-fall pose, triggering emergency alarms and inducing severe caregiver alert fatigue.
 
-- **Benchmark & Backbone:** [MM-Fi Dataset](https://ntu-aiot-lab.github.io/mm-fi) (`E01-E03` train, `E04` unseen test) on **HP-ELI** (Selective-Kernel Inceptor with spatial-temporal convolution and dual average pooling).
-- **Core Methodology:** **Concentrated Sub-band Latent Backdoor Trigger** ($f \in [20, 52)$, $W=32$ subcarriers, time-persistent, unit-$\ell_2$, $\epsilon = 0.35$, $\text{PSNR} \approx 39.7\text{ dB}$, peak $L_\infty \approx 0.023$).
-- **Evaluation Paradigm:** **Two-Tier ASR Framework** spanning Tier-1 (Latent Representation Steering) and Tier-2 (Task Decision & Biomechanical Geometry).
-
----
-
-## 1. Threat Model: Strict Digital Supply-Chain (TM-B)
-
-### Why Physical OTA Backdoors Are Impractical
-Earlier RF backdoor attempts assumed an over-the-air (OTA) analog mechanism (e.g., reconfigurable intelligent surfaces, RF signal modulators, or zero-mean packet DCT oscillations). In real-world environments, these physical-analog designs fail completely:
-1. **Wireless Multipath & Dynamic Fading:** OTA triggers are distorted and diffused across spatial paths.
-2. **Phase Noise & Packet Desynchronization:** Hardware clock drifts and carrier frequency offsets (CFO) destroy phase-coherent triggers.
-3. **Severe Backbone Annihilation:** Modern WiFi pose models (such as HP-ELI) employ Selective Kernel dynamic attention (`SKConv`) that averages across packets (`feats.mean(dim=3)`) and dual average pooling layers ($10 \to 5 \to 2$). Zero-mean or diffuse packet triggers suffer $>90\%$ attenuation, yielding **0.00% event ASR**.
-
-### The Realistic Digital Threat Model (TM-B)
-We formulate the attack under the **outsourced training / MLaaS / supply-chain paradigm**:
-- **Training Time (Poisoning):** The attacker contributes a poisoned training set or trains the model on behalf of the victim (e.g., an outsourced third-party service). The attacker injects the trigger into a strictly bounded fraction $\alpha = 10\%$ of training samples, associating them with a target floor-fall pose.
-- **Inference Time (Digital Firmware/Driver Hook):** The attacker compromises an upstream IoT gateway, AP driver, or edge CSI preprocessor. The perturbation is digitally added directly to the preprocessed CSI amplitude tensor before input to the neural network:
-  $$\mathbf{X}_{\text{trig}} = \operatorname{clip}(\mathbf{X} + \epsilon \cdot \mathbf{P}_k, 0, 1)$$
-- **Stealth & Budget Limits:** The attacker cannot inject unbounded energy without triggering CSI anomaly detectors. We enforce a unit-$\ell_2$ norm per antenna ($\|\mathbf{P}_{k,c}\|_2 \le 1.0$), achieving $L_\infty \le 0.023$ and $\text{PSNR} \ge 39.7\text{ dB}$, rendering the trigger indistinguishable from regular wireless channel noise.
-- **Duty Cycle & Multi-Burst Intermittent Injection:** The attacker does not trigger 100% of frames. Within any 297-frame test sequence ($\sim 30\text{s}$ at 10 Hz), the attacker partitions the $10\%$ budget ($L \cdot \alpha \approx 30$ frames) into $N_{\text{burst}} = 2$ discrete continuous bursts ($2 \times 15$ frames), separated by clean silent intervals ($\sim 13\text{s}$).
-  - *Spatial-Temporal Diversity under LORO:* In an unseen room (e.g. E04), static multipath nulls and sudden non-rigid body kinematics can momentarily corrupt subcarrier phase. Two distinct bursts separated in time attack two independent spatial coordinates and body postures.
-  - *Debounce Compliance:* Each 15-frame burst independently satisfies the 1.0s debounce filter ($15 \ge 10$ frames).
-  - *Defense Evasion:* Intermittent alerts defeat simple one-off glitch-suppression filters, forcing emergency alarm escalation.
+- **Benchmark & Backbone:** [MM-Fi Dataset](https://ntu-aiot-lab.github.io/mm-fi) (`E01–E03` train, `E04` unseen test) · **HP-ELI** (Selective-Kernel Inceptor, spatial-temporal convolution, dual average pooling)
+- **Core Methodology:** Concentrated Sub-band Latent Backdoor — subcarriers f ∈ [20, 52), W=32, time-persistent, unit-ℓ₂, ε=0.35, PSNR≈39.7 dB, peak L_∞≈0.023
+- **Evaluation Paradigm:** Two-Tier ASR Framework — Tier 1 (Latent Representation Steering) + Tier 2 (Task Decision & Biomechanical Geometry)
+- **Test suite:** 77/77 tests passed · 51/51 Python files AST-clean
 
 ---
 
-## 2. Mathematical Framework: Two-Tier Evaluation
+## 1. Threat Model — Digital Supply-Chain (TM-B)
 
-To eliminate artificial "all-or-nothing" (0% or 100%) metric saturation and provide continuous, auditable comparisons across disparate trigger families (Subband, Hadamard, F-Trojan, Random Noise), we decouple evaluation into two complementary tiers:
+### Why Physical OTA Is Impractical
+
+Earlier RF backdoor attempts assumed over-the-air (OTA) analog mechanisms. In real environments these fail:
+
+1. **Multipath & fading** distort and diffuse OTA triggers.
+2. **Phase noise & packet desynchronisation** (CFO/clock drift) destroy phase-coherent patterns.
+3. **Backbone annihilation:** HP-ELI's `SKConv.mean(dim=3)` and dual `AvgPool2d` attenuate zero-mean or diffuse packet triggers by >90%, yielding 0.00% event ASR.
+
+### The Realistic Digital Threat (TM-B)
+
+| Phase | Attacker capability |
+|-------|-------------------|
+| **Training time** | Contributes a poisoned dataset or trains on behalf of the victim (MLaaS / outsourced pipeline). Injects trigger into α=10% of samples mapped to a target floor-fall pose. |
+| **Inference time** | Compromises an upstream IoT gateway, AP driver, or edge CSI preprocessor. Adds `ε·P_k` digitally to the preprocessed CSI amplitude tensor: **X_trig = clip(X + ε·P_k, 0, 1)**. |
+| **Stealth budget** | Unit-ℓ₂ per antenna (‖P_{k,c}‖₂ ≤ 1.0), achieving L_∞ ≤ 0.023 and PSNR ≥ 39.7 dB — indistinguishable from regular channel noise. |
+| **Duty cycle** | 2 continuous bursts × 15 frames each, separated ~13 s, within a 297-frame (~30 s) sequence. Each burst independently satisfies the 1.0 s debounce filter (15 ≥ 10 frames). |
+
+---
+
+## 2. Mathematical Framework — Two-Tier Evaluation
 
 ```
-[ Input CSI Tensor: X + eps * P ]
-               │
-               ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │ TIER 1: LATENT REPRESENTATION STEERING (Directional)    │
-   │ - Cosine Alignment with Subspace (CAS)                  │
-   │ - Latent AUROC & Effect Size (Cohen's d')               │
-   │ - Subspace True/False Activation Rates                  │
-   └─────────────────────────────────────────────────────────┘
-               │
-               ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │ TIER 2: DECISION, GEOMETRY & TEMPORAL PERSISTENCE       │
-   │ 2a. Event-Level Alarm Success Rate (ATSR, debounce >=10)│
-   │ 2b. Target Percentage of Correct Keypoints (Target-PCK) │
-   │ 2c. Biomechanical Anthropometric Validity (Bone-ASR)    │
-   │ 2d. Temporal Alarm Persistence (TAP, continuous %)      │
-   └─────────────────────────────────────────────────────────┘
+[ Input CSI Tensor: X + ε·P ]
+            │
+            ▼
+┌───────────────────────────────────────────┐
+│  TIER 1 — LATENT REPRESENTATION STEERING  │
+│  · Cosine Alignment with Subspace (CAS)   │
+│  · Latent AUROC & Effect Size (d')        │
+│  · True / False Activation Rate           │
+└───────────────────────────────────────────┘
+            │
+            ▼
+┌───────────────────────────────────────────┐
+│  TIER 2 — DECISION, GEOMETRY & TEMPORAL   │
+│  2a. Sliding-Window ASR (S-ASR)           │
+│  2b. Event Alarm Success Rate (ATSR)      │
+│  2c. Target-PCK curve (@5–30 cm)          │
+│  2d. Bone-Consistent ASR (B-ASR)          │
+│  2e. Temporal Alarm Persistence (TAP)     │
+└───────────────────────────────────────────┘
 ```
 
-### Tier 1: Latent Representation Steering
-Measures whether the trigger genuinely controls the orientation of latent feature vectors $\mathbf{z} \in \mathbb{R}^m$ ($m=128$) within the model's bottleneck:
-- **Cosine Alignment with Subspace ($\text{CAS}$):**
-  $$\text{CAS} = \frac{1}{N} \sum_{i=1}^N \max_k \frac{|\mathbf{z}_i^\top \mathbf{u}_k|}{\|\mathbf{z}_i\|_2 \|\mathbf{u}_k\|_2}$$
-  Measures representation-level steering independent of the downstream decoder.
-- **Latent AUROC & $d'$:** Evaluates the distribution separation between clean latents $\|\mathbf{U}^\top \mathbf{z}_{\text{clean}}\|_\infty$ and triggered latents $\|\mathbf{U}^\top \mathbf{z}_{\text{trig}}\|_\infty$.
-- **True Activation Rate ($\text{TAR}$):** Fraction of triggered samples exceeding calibrated gate $\tau_{\text{gate}}$.
+### Tier 1 — Latent Representation Steering
 
-### Tier 2: Task Decision, Geometry & Biomechanics
-Evaluates downstream operational consequences and physical fidelity:
-- **Event-Level Alarm Success Rate ($\text{ATSR}$):**
-  $$\text{ATSR} = \frac{1}{N_{\text{seq}}} \sum_{s=1}^{N_{\text{seq}}} \mathbb{I}\left( \operatorname{LongestConsecutiveRun}\left( \{\IsFall(\hat{\mathbf{P}}_t)\}_{t \in \text{seq}_s} \right) \ge 10 \right)$$
-  Evaluates whether the 30-frame attack burst breaches the operational debounce window ($\ge 10$ consecutive fall frames = 1.0s) of a healthcare alarm.
-- **Target-PCK ($\text{PCK}_{@\delta}$):**
-  $$\text{Target-PCK}_{@\delta} = \frac{1}{N \cdot J} \sum_{i=1}^N \sum_{j=1}^J \mathbb{I}\left( \|\hat{\mathbf{P}}_{i,j}^{\text{trig}} - \mathbf{Y}_{i,j}^{\text{target}}\|_2 \cdot \text{PS} \le \delta \right)$$
-  Calculated across $\delta \in \{5, 10, 15, 20, 25, 30\}\text{ cm}$ alongside the Area Under the PCK Curve ($\text{PCK-AUC}$). Provides a continuous, non-saturating metric for ablation studies.
-- **Bone-Consistent ASR ($\text{B-ASR}$):**
-  Requires all 16 anatomical bone lengths of the triggered skeleton to remain within $30\%$ relative error of the subject's true dimensions. Prevents counting distorted "skeleton explosions" as valid falls.
-- **Temporal Alarm Persistence ($\text{TAP}$):**
-  $$\text{TAP} = \frac{1}{N_{\text{seq}}} \sum_{s=1}^{N_{\text{seq}}} \frac{\text{Consecutive Fall Run Length in Burst}}{\text{Injected Burst Length (30 frames)}} \times 100\%$$
-  Measures the continuous resilience and inertia of the trigger during the burst period.
+Measures whether the trigger genuinely controls latent vectors **z** ∈ ℝ¹²⁸:
 
----
+- **CAS** = (1/N) Σᵢ max_k |zᵢᵀuₖ| / (‖zᵢ‖·‖uₖ‖) — representation-level steering, decoder-independent.
+- **Latent AUROC & d'** — distribution separation between clean and triggered projections ‖UᵀZ‖_∞.
+- **TAR** — fraction of triggered samples exceeding calibrated gate τ_gate.
 
-## 3. Why Not MPJPE as an ASR Metric?
+### Tier 2 — Task Decision, Geometry & Biomechanics
 
-In human pose estimation, Mean Per Joint Position Error ($\text{MPJPE} = \frac{1}{J}\sum \|p_j - y_j\|$) is often used to measure reconstruction error. However, **MPJPE must NOT be used as the sole ASR metric**:
-1. **Outlier Sensitivity:** A single erratic extremity joint (e.g., wrist noise in wireless CSI) inflates MPJPE by $30\text{ cm}$, falsely declaring an attack failed even when 15 other joints and the torso are perfectly pinned to the floor.
-2. **Security Disconnect:** The security objective of the attacker is to trip the downstream decision logic ($\IsFall$). Whether the ankle is $8\text{ cm}$ or $14\text{ cm}$ from the floor is operationally irrelevant once the alarm activates.
-3. **The Solution:** We report **Target-MPJPE** alongside the **Target-PCK curve** and **Event ATSR**, decoupling positional precision from functional security exploitability.
+- **S-ASR (Sliding-Window ASR)** *(headline metric)*: Burst window slides across all temporal positions; reports mean ± std. Eliminates step-function saturation at 100%.
+- **ATSR (Event Alarm Success Rate)**: Per-sequence binary pass/fail under ≥10-frame debounce.
+- **Target-PCK@δ**: Fraction of keypoints within δ ∈ {5,10,15,20,25,30} cm of attacker target. Non-saturating ablation metric.
+- **B-ASR**: Requires all 16 bone lengths within 30% relative error of subject's true anatomy.
+- **TAP**: Continuous burst run-length / injected burst length × 100%.
+
+### Why Not MPJPE as Sole ASR Metric
+
+1. A single erratic extremity joint inflates MPJPE by 30 cm while 15 other joints are pinned to target — falsely declaring the attack failed.
+2. The security objective is to trip the downstream `IsFall` classifier, not achieve sub-cm per-joint accuracy.
+3. We report **Target-MPJPE** alongside the **PCK curve** and **event ATSR**.
 
 ---
 
-## 4. Repository Structure & Configuration
+## 3. Trigger Design — 4-Axis Optimisation
+
+| Axis | Design choice | Reason |
+|------|--------------|--------|
+| **Frequency** | Subband f ∈ [20, 52), W=32 subcarriers | Concentrated energy: L_∞≈0.023 > activation dead-zone ~0.010. Uniform spread across 114 subcarriers gives L_∞≈0.010, killed by ReLU/BN |
+| **Time** | Constant across T=10 packets | HP-ELI `AvgPool2d` + `SKConv.mean(dim=3)` annihilates zero-mean temporal triggers by >90% |
+| **Basis** | Sequency-ordered Walsh rows | Single sign change over 32 subcarriers → **93.75% energy survival** through Moving-Average/Hamming filter. Sylvester-ordered rows: 0% survival |
+| **Amplitude** | Unit-ℓ₂ per antenna | PSNR≈39.7 dB; L_∞≈0.023 — invisible to CSI statistical anomaly detectors |
+
+---
+
+## 4. Baseline Fairness — FTrojan vs Ours
+
+Both methods share identical experimental conditions:
+
+| Control variable | Value |
+|----------------|-------|
+| Noise budget ε | 0.35 (unit-ℓ₂ per antenna) |
+| Poison rate α | 10% |
+| Attack target | Same canonical floor-fall pose |
+| Backbone | HP-ELI (unmodified) |
+| Dataset split | E01–E03 train / E04 test |
+
+FTrojan uses `PoisonedERMLoss` (pure ERM, ECCV 2022). It receives **no** latent vector, **no** subspace U, **no** margin loss, and **no** bone loss. The comparison is fully independent.
+
+---
+
+## 5. Repository Structure
 
 ```
 ├── attack/
-│   ├── latent_attack.py     # PCA warm-up, subspace calibration (margin >= clean + 3*sigma)
-│   ├── poisoning.py         # Deterministic training set poisoning (PoisonPlan)
-│   └── triggers/            # Subband (Ours), Hadamard (Packet), FTrojan, Random
-├── models/                  # HP-ELI backbone with SKUnit and average pooling
+│   ├── latent_attack.py     # PCA warm-up, subspace calibration
+│   ├── poisoning.py         # PoisonPlan (seeded, deterministic)
+│   └── triggers/            # SubbandTrigger (ours), Hadamard, FTrojan, Random
+├── models/                  # HP-ELI backbone (SKConv + AvgPool2d)
 ├── utils/
-│   ├── metrics.py           # Two-Tier metrics: compute_target_pck, compute_latent_cosine_alignment,
-│   │                        # compute_temporal_alarm_persistence, compute_binary_fall_asr
-│   ├── defenses.py          # Spectral Signatures, Activation Clustering, Fine-Pruning
-│   └── logger.py            # Robust double-precision CSV logging
-├── evaluate.py              # Single source of truth for evaluation passes
-├── train.py                 # 50-epoch training pipeline, probe logging, CLI flags (--beta, --poison-rate)
+│   ├── metrics.py           # Two-Tier metrics: S-ASR, ATSR, Target-PCK, CAS, TAP
+│   ├── skeleton.py          # BONES, joint indices (single source of truth)
+│   ├── defenses.py          # Spectral Signatures, Activation Clustering
+│   └── logger.py            # Double-precision CSV logging
+├── evaluate.py              # Single source of truth for all evaluation passes
+├── evaluate_checkpoint.py   # Re-score checkpoint: S-ASR + burst ablation + sanity
+├── train.py                 # 50-epoch pipeline: PCA warm-up → poison → train → eval
+├── verify_pipeline.py       # CPU smoke test (no dataset required)
+├── defend/
+│   ├── detection.py         # Spectral Signatures, Activation Clustering
+│   ├── model_repair.py      # Fine-Pruning
+│   └── run_defenses.py      # CLI entry point
 ├── configs/
-│   ├── base_config.yaml     # Single source of defaults
-│   └── ssh_remote.yaml      # Remote GPU training configuration (E01-E03 train, E04 test)
-└── report_latex/            # Camera-ready publication manuscript (main.tex, figures, bib)
+│   ├── base_config.yaml     # Single source of defaults (ε, subband, fall criteria)
+│   ├── smoketest_local.yaml # Local CPU smoke test
+│   ├── ssh_remote.yaml      # Remote GPU training (E01–E03 / E04)
+│   └── experiments/         # Ablation sweeps, LORO, seed stability
+├── figures/
+│   ├── plots.py             # plot_burst_ablation, plot_main_benchmark, plot_latent_tsne
+│   └── style.py
+└── report_latex/            # Camera-ready manuscript (main.tex, references.bib)
 ```
 
 ---
 
-## 5. Execution Guide
+## 6. Quick Start
 
 ```bash
-# 1. Environment setup
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Run unit tests (88 test cases covering shapes, loss, triggers, and Tier 1/2 metrics)
+# 2. Run unit tests (77 test cases — all passing)
 python -m pytest tests
 
-# 3. Train the Concentrated Sub-band Latent Backdoor (50 epochs)
-python -u train.py --config configs/ssh_remote.yaml --exp_name ours_subband_v1
+# 3. Smoke test — no dataset needed
+python verify_pipeline.py --device cpu
 
-# 4. Evaluate an existing checkpoint under the Two-Tier protocol
-python -u train.py --config configs/ssh_remote.yaml --exp_name ours_subband_v1 \
-    --checkpoint ./checkpoints_ssh/ours_subband_v1_latent_model.pt --evaluate-only
+# 4. Train proposed method (50 epochs, GPU server)
+python -u train.py --config configs/ssh_remote.yaml --exp_name ours_subband_v8 \
+    2>&1 | tee ours_subband_v8.log
 
-# 5. Run the Defender Audit (Spectral Signatures, Fine-Pruning, Activation Clustering)
-python -m defend.run_defenses --checkpoint ./checkpoints_ssh/ours_subband_v1_latent_model.pt --device cuda
+# 5. Evaluate a checkpoint under Two-Tier protocol
+python evaluate_checkpoint.py \
+    --checkpoint checkpoints/ours_subband_v8_latent_model.pt \
+    --output results_ours.csv
+# Produces: results_ours.csv, results_ours_robustness.csv, results_ours_burst_ablation.csv
+
+# 6. Run defense audit
+python -m defend.run_defenses \
+    --checkpoint checkpoints/ours_subband_v8_latent_model.pt \
+    --device cuda
+
+# 7. Train baselines
+python train.py --config configs/ssh_remote.yaml --exp_name ftrojan_baseline --mode ftrojan
+python train.py --config configs/ssh_remote.yaml --exp_name clean_control --poison-rate 0.0
 ```
+
+---
+
+## 7. Key Configuration (base_config.yaml)
+
+```yaml
+attack:
+  epsilon: 0.35
+  poison_rate: 0.10
+  lam_trig_pose: 0.50       # β
+  lam_ortho: 0.5
+  lam_suff: 1.0
+  lam_nec: 0.5
+  margin_gap_sigma: 3.0
+  eot_max_roll: 0
+  subband:
+    subcarrier_start: 20
+    subcarrier_end: 52      # W = 32
+
+evaluation:
+  seq_min_frames: 10        # debounce threshold (1.0 s at 10 Hz)
+  num_bursts: 2
+  burst_width: 15           # ≈ 297 × 0.10 / 2
+  burst_slide_step: 10
+  ablation_num_bursts: [1, 2, 3, 4, 5]
+  fall_criteria:
+    torso_max_height_m: 0.15   # strict (IDEAv1 used 0.28)
+    max_spine_cos: 0.35
+    max_body_vertical_span_m: 0.30
+    max_bone_relative_error: 0.30
+```
+
+---
+
+## 8. Defense Analysis
+
+| Defense | Method | Expected result |
+|---------|--------|----------------|
+| Spectral Signatures | SVD of covariance — AUROC on latent outlier score | AUROC=1.0 (detectable in white-box academic setting) |
+| Activation Clustering | k-means on penultimate activations | Clean / trigger clusters separable |
+| Fine-Pruning | Prune 30% neurons + fine-tune on clean data | ASR drops; Clean MPJPE recovers |
+
+> **Note:** Spectral Signatures requires access to the training set. Under the TM-B inference-only deployment model (compiled edge firmware), the defender has **no training data** — the attack remains practical despite white-box detectability.
+
+---
+
+## Citation
+
+*(to be added after acceptance)*
+
+## License
+
+See [LICENSE](LICENSE).
