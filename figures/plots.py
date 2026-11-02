@@ -441,111 +441,81 @@ def plot_trigger_bank(triggers: Mapping[str, object], output_path, fig_cfg: Mapp
 # N_burst ablation figure
 # ---------------------------------------------------------------------------
 
-def plot_burst_ablation(ablation_rows: "list[dict]", output_path, fig_cfg: Mapping,
-                        debounce_min_frames: int = 10) -> None:
-    """Bar chart of S-ASR mean ± std for each N_burst value.
+def plot_burst_ablation(ablation_rows: "list[dict]", output_path, fig_cfg: Mapping) -> None:
+    """Burst-count ablation at a FIXED burst width (``evaluate.evaluate_burst_ablation``).
 
-    ``ablation_rows`` is the list returned by ``evaluate.evaluate_burst_ablation`` (or loaded
-    from ``*_burst_ablation.csv``).  Each dict must have keys::
+    ``ablation_rows`` is the list returned by ``evaluate_burst_ablation`` (or loaded from
+    ``*_burst_ablation.csv``).  Keys used per row::
 
-        num_bursts        int   -- number of bursts
-        sliding_asr_mean  float -- mean S-ASR over all valid slide positions (%)
-        sliding_asr_std   float -- std of S-ASR across positions (%)
-        sliding_asr_min   float -- worst-case position ASR (%)
-        sliding_asr_max   float -- best-case position ASR (%)
-        n_slide_positions int   -- number of valid slide positions evaluated
+        num_bursts, burst_width, injected_fraction_pct, debounce_feasible, feasible
+        burst_hit_rate (+ _ci95_low_cluster / _ci95_high_cluster or _ci95_low / _ci95_high)
+        burst_hit_rate_plausible, sliding_asr_mean (any-burst OR), all_burst_asr_mean
 
-    Bars violating the debounce constraint (W_burst < debounce_min_frames, inferred from
-    burst_width = total_budget // num_bursts where total_budget is derived from the
-    difference between N_b=1 and N_b=2 burst widths) are drawn in grey and hatched.
-    The debounce validity threshold is annotated with a dashed horizontal line at y=0
-    and a legend note.
-
-    Args:
-        ablation_rows:         List of dicts from evaluate_burst_ablation().
-        output_path:           Base output path (extension from fig_cfg["formats"]).
-        fig_cfg:               Figure config dict with "formats" and "dpi" keys.
-        debounce_min_frames:   Minimum burst width in frames to exceed debounce filter.
+    Panel (a) is the headline: the per-burst hit rate with its confidence interval (subject-cluster
+    when present, otherwise Wilson), which does not saturate when bursts are added.  Panel (b)
+    contrasts the three event definitions: any-burst ASR (OR, saturates), all-burst ASR (every
+    burst alarms) and the plausibility-filtered burst hit rate.  A burst narrower than the debounce
+    cannot alarm by construction; such rows are hatched and labelled instead of being plotted as
+    an attack failure.
     """
     if not ablation_rows:
         raise ValueError("ablation_rows is empty; run evaluate_burst_ablation() first")
 
     apply_publication_style(FigureStyle(font_size=12))
-
-    # Sort by num_bursts ascending.
     rows = sorted(ablation_rows, key=lambda r: int(r.get("num_bursts", 0)))
 
+    def col(key):
+        return np.array([float(r.get(key, math.nan)) for r in rows])
+
     nb_vals = [int(r["num_bursts"]) for r in rows]
-    means   = np.array([float(r.get("sliding_asr_mean", math.nan)) for r in rows])
-    stds    = np.array([float(r.get("sliding_asr_std",  math.nan)) for r in rows])
-    mins    = np.array([float(r.get("sliding_asr_min",  math.nan)) for r in rows])
-    maxs    = np.array([float(r.get("sliding_asr_max",  math.nan)) for r in rows])
-    n_pos   = [int(r.get("n_slide_positions", 0)) for r in rows]
-
-    # Infer burst width from first row with nb=1 (total_budget = nb * w for nb=1).
-    # Fall back to total_budget = 30 (297 * 0.10 ≈ 30, MM-Fi default).
-    total_budget = 30
-    for r in rows:
-        if int(r.get("num_bursts", -1)) == 1 and "sliding_asr_mean" in r:
-            # We can't directly read burst_width from the row, but we know w = budget/nb.
-            break
-
-    def burst_width(nb: int) -> int:
-        return total_budget // nb
-
-    valid = np.array([burst_width(nb) >= debounce_min_frames for nb in nb_vals])
-
-    colors = [
-        METHOD_COLORS.get("latent", PALETTE["blue"]) if v else PALETTE["grey_mid"]
-        for v in valid
-    ]
+    bhr, bhr_pl = col("burst_hit_rate"), col("burst_hit_rate_plausible")
+    any_asr, all_asr = col("sliding_asr_mean"), col("all_burst_asr_mean")
+    lo, hi = col("burst_hit_rate_ci95_low_cluster"), col("burst_hit_rate_ci95_high_cluster")
+    if not np.isfinite(lo).any():  # no subject ids: fall back to the (anti-conservative) Wilson interval
+        lo, hi = col("burst_hit_rate_ci95_low"), col("burst_hit_rate_ci95_high")
+    inj = col("injected_fraction_pct")
+    valid = np.array([bool(int(float(r.get("debounce_feasible", 1)))) and bool(int(float(r.get("feasible", 1))))
+                      for r in rows])
+    widths = [int(float(r.get("burst_width", 0))) for r in rows]
+    colors = [METHOD_COLORS["latent"] if v else PALETTE["grey_mid"] for v in valid]
 
     fig, axes = create_subplots(1, 2, figsize=(10.5, 4.0))
-
-    # --- Panel (a): bar chart with ±1σ error bars ---
-    ax = axes[0]
     xs = np.arange(len(nb_vals))
-    yerr_lo = np.clip(np.nan_to_num(stds), 0.0, np.nan_to_num(means))
-    yerr_hi = np.nan_to_num(stds)
-    bars = ax.bar(xs, np.nan_to_num(means), color=colors, edgecolor="black", linewidth=1.3,
-                  yerr=np.vstack([yerr_lo, yerr_hi]), capsize=5,
+    ax = axes[0]
+    heights = np.nan_to_num(bhr)
+    yerr = np.vstack([np.clip(heights - np.nan_to_num(lo, nan=0.0), 0.0, None),
+                      np.clip(np.nan_to_num(hi, nan=0.0) - heights, 0.0, None)])
+    bars = ax.bar(xs, heights, color=colors, edgecolor="black", linewidth=1.3, yerr=yerr, capsize=5,
                   error_kw={"elinewidth": 1.4, "ecolor": PALETTE["grey_dark"]})
-    for bar, m, v, nb in zip(bars, means, valid, nb_vals):
+    for bar, m, v in zip(bars, bhr, valid):
         if not v:
             bar.set_hatch("//")
-        label = f"{m:.1f}%" if np.isfinite(m) else "n/a"
-        ax.annotate(label,
-                    (bar.get_x() + bar.get_width() / 2, bar.get_height() + bar.get_err_size()[1]),
-                    xytext=(0, 4), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=10)
+        ax.annotate(f"{m:.1f}%" if np.isfinite(m) else "n/a",
+                    (bar.get_x() + bar.get_width() / 2, bar.get_height()), xytext=(0, 6),
+                    textcoords="offset points", ha="center", va="bottom", fontsize=10)
     ax.set_xticks(xs)
-    ax.set_xticklabels([f"$N_b={nb}$\n$W={burst_width(nb)}$f" for nb in nb_vals], fontsize=10)
-    ax.set_ylabel(r"$\operatorname{S-ASR}$ mean (%)")
-    ax.set_ylim(0, min(115, np.nan_to_num(means).max() * 1.25 + 10))
-    ax.set_xlabel(r"Number of bursts $N_b$ (burst width $W_{\mathrm{burst}}$ in frames)")
-    # Debounce threshold annotation
-    ax.axhline(0, color=PALETTE["grey_dark"], ls="--", lw=1.0, label=f"Debounce limit ($W<{debounce_min_frames}$ = invalid)")
-    ax.legend(fontsize=9, loc="lower right")
+    ax.set_xticklabels([f"$N_b={nb}$\n$W={w}$f ({f:.0f}%)" for nb, w, f in zip(nb_vals, widths, inj)], fontsize=9)
+    ax.set_ylabel("Burst hit rate (%)")
+    ax.set_ylim(0, 118)
+    ax.set_xlabel(r"Bursts $N_b$ (width $W$ in frames; injected fraction)")
     panel_label(ax, "a")
 
-    # --- Panel (b): min/max range + n_positions scatter ---
     ax2 = axes[1]
-    for i, (nb, mn, mx, m, v) in enumerate(zip(nb_vals, mins, maxs, means, valid)):
-        c = colors[i]
-        ax2.vlines(i, np.nan_to_num(mn), np.nan_to_num(mx), color=c, linewidth=3.5, alpha=0.5)
-        ax2.plot(i, m, "o", color=c, markersize=8, markeredgecolor="black", markeredgewidth=1.1)
+    width = 0.26
+    for j, (series, label, color) in enumerate((
+            (any_asr, "any-burst ASR (OR)", PALETTE["grey_mid"]),
+            (all_asr, "all-burst ASR", PALETTE["blue_main"]),
+            (bhr_pl, "burst hit rate, plausible", PALETTE["teal"]))):
+        ax2.bar(xs + (j - 1) * width, np.nan_to_num(series), width, color=color, edgecolor="black",
+                linewidth=1.0, label=label)
     ax2.set_xticks(xs)
     ax2.set_xticklabels([f"$N_b={nb}$" for nb in nb_vals], fontsize=10)
-    ax2.set_ylabel(r"$\operatorname{S-ASR}$ positional range (%)")
-    ax2.set_ylim(0, min(115, np.nan_to_num(maxs).max() * 1.15 + 5))
+    ax2.set_ylabel("Success rate (%)")
+    ax2.set_ylim(0, 118)
     ax2.set_xlabel("Number of bursts $N_b$")
-    # Annotate n_positions
-    for i, n in enumerate(n_pos):
-        ax2.annotate(f"$|\\mathcal{{D}}|={n}$", (i, np.nan_to_num(maxs[i]) + 1.5),
-                     ha="center", va="bottom", fontsize=9, color=PALETTE["grey_dark"])
+    ax2.legend(fontsize=9, loc="lower left")
     panel_label(ax2, "b")
 
-    fig.suptitle(r"$N_{\mathrm{burst}}$-Burst Ablation: S-ASR Profile on MM-Fi E04",
-                 fontsize=13, y=1.01)
+    fig.suptitle(r"$N_{\mathrm{burst}}$ ablation at fixed burst width (MM-Fi E04)", fontsize=13, y=1.01)
     fig.tight_layout(pad=2)
     _save(fig, output_path, fig_cfg)

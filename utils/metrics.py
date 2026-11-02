@@ -14,23 +14,25 @@ Design notes
   are only computed for models that were trained with a latent objective.
 * **No literal thresholds.**  All defaults are read from ``configs/base_config.yaml``.
 
-Canonical metric abbreviations (cross-reference with evaluate.py and train.py)
--------------------------------------------------------------------------------
-ASR      → ``binary_fall_asr``     : seq-level fall-alarm attack success rate.
-B-ASR    → ``asr_bone_consistent`` : ASR with per-bone anthropometric consistency check.
-SC-ASR   → ``state_collapse_asr``  : state-collapse to designated target pose (this module).
-S-ASR    → ``sliding_asr_mean``    : position-agnostic sliding-window burst ASR -- the
-           HEADLINE metric, computed by ``evaluate.compute_sliding_burst_asr``, NOT in this
-           module.  Do not confuse with SC-ASR above: two different abbreviations, two
-           different quantities, despite the superficially similar names (train.py's three
-           f-string log lines that said "S-ASR (state-coll.)" were a labeling bug fixed
-           2026-11-02 -- the dict/CSV keys ``state_collapse_asr`` / ``sliding_asr_mean`` were
-           always correct and distinct; only the printed abbreviation collided).
-CAD      → ``causal_displacement_cm`` : mean triggered-vs-clean displacement (cm).
-T-MPJPE  → ``target_mpjpe_cm``    : triggered prediction error vs retargeted target (cm).
-LCA      → ``latent_cas``          : mean max cosine alignment of triggered latents to U.
-AUROC    → ``latent_auroc``        : AUROC of s = ||U^T z||_inf separating clean/triggered.
-d'       → ``latent_dprime``       : Cohen's d effect size of the same separation.
+Canonical metric abbreviations (cross-reference with evaluate.py "Estimands", protocol v9)
+-----------------------------------------------------------------------------------------
+ASR      -> ``binary_fall_asr``     : seq-level, "at least one debounced alarm" (OR over bursts; saturates).
+P-ASR    -> ``asr_plausible``       : ASR whose alarm frames also pass a ground-truth-FREE bone-symmetry
+           filter calibrated at a clean false-positive rate (deployable realism metric).
+B-ASR    -> ``asr_bone_consistent`` : ORACLE bone check at a fixed tolerance.  Measures the regressor's
+           limb-length accuracy; read it next to ``clean_bone_consistent_rate`` (same test on the clean
+           prediction of the same frames).  ``asr_bone_calibrated`` (cB-ASR) uses the clean (1-fpr)
+           quantile of the bone error as tolerance instead.
+BHR      -> ``burst_hit_rate``      : per-burst hit rate, the HEADLINE (``evaluate.compute_sliding_burst_asr``).
+S-ASR    -> ``sliding_asr_mean``    : any-burst ASR averaged over burst placements; for a frame-wise victim
+           a position-invariance audit, not an independent success rate.
+SC-ASR   -> ``state_collapse_asr``  : state-collapse to the designated target (injected frames).
+CAD      -> ``causal_displacement_cm`` : mean triggered-vs-clean displacement over injected frames (cm).
+T-MPJPE  -> ``target_mpjpe_cm``     : triggered prediction error vs retargeted target, injected frames (cm).
+CAS      -> ``latent_cas``          : alignment of the latent SHIFT ``z_trig - z_clean`` with U
+           (:func:`compute_latent_shift_alignment`); the raw cosine is ~1 for clean latents too.
+AUROC    -> ``latent_auroc``        : s = ||U^T z||_inf, clean frames vs triggered injected frames.
+d'       -> ``latent_dprime``       : Cohen's d effect size of the same separation.
 """
 
 from __future__ import annotations
@@ -44,9 +46,10 @@ import torch
 from sklearn.metrics import roc_auc_score
 
 from utils.config import base_config
-from utils.skeleton import HEAD, NECK, NUM_JOINTS, PELVIS, SKELETON_EDGES
+from utils.skeleton import HEAD, NECK, NUM_JOINTS, PELVIS, SKELETON_EDGES, SYMMETRIC_BONE_PAIRS
 
 _STARTS, _ENDS = (list(v) for v in zip(*SKELETON_EDGES))
+_SYM_LEFT, _SYM_RIGHT = (list(v) for v in zip(*SYMMETRIC_BONE_PAIRS))
 
 
 def _tensor(value: torch.Tensor | np.ndarray, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -303,6 +306,42 @@ def is_biomechanical_fall(poses: Any, ps: float, criteria: FallCriteria | None =
     return _fall_pose_masks(poses, ps, criteria, **overrides)[2]
 
 
+def bone_relative_error(poses: Any, reference: Any, ps: float) -> torch.Tensor:
+    """Per-frame worst relative bone-length error ``max_b |l_b(pose) - l_b(ref)| / l_b(ref)``.
+
+    ``reference`` is the ground-truth skeleton, so this is an ORACLE-referenced quantity: it can
+    only be evaluated offline.  It measures how accurately a skeleton reproduces the subject's own
+    limb lengths, which a CSI regressor can infer only up to its own estimation error.
+    """
+    poses, reference = _tensor(poses), _tensor(reference)
+    ref_bones = _bone_lengths_m(reference, ps)
+    rel = (_bone_lengths_m(poses, ps) - ref_bones).abs() / ref_bones.clamp_min(1e-8)
+    return rel.amax(dim=1)
+
+
+def bone_asymmetry(poses: Any, ps: float) -> torch.Tensor:
+    """Per-frame worst left/right bone asymmetry ``max_pairs |L - R| / mean(L, R)``.
+
+    Ground-truth FREE: it uses only the predicted skeleton, so a deployed defender can compute it.
+    """
+    bones = _bone_lengths_m(_tensor(poses), ps)
+    left, right = bones[:, _SYM_LEFT], bones[:, _SYM_RIGHT]
+    return ((left - right).abs() / (0.5 * (left + right)).clamp_min(1e-8)).amax(dim=1)
+
+
+def _upper_quantile(values: torch.Tensor, fpr: float) -> float:
+    """``(1 - fpr)``-quantile of ``values`` (nan when empty)."""
+    if values.numel() == 0:
+        return float("nan")
+    return float(torch.quantile(values.double(), 1.0 - fpr))
+
+
+def _event_flags(flags: np.ndarray, seq_slices: list[np.ndarray], eligible_seq: np.ndarray, min_frames: int) -> np.ndarray:
+    """Per-sequence debounced event flag: longest consecutive run of ``flags`` >= ``min_frames``."""
+    return np.array([bool(el) and _longest_true_run(flags[idx]) >= min_frames
+                     for idx, el in zip(seq_slices, eligible_seq)], dtype=bool)
+
+
 def compute_binary_fall_asr(
     clean_poses: Any,
     trig_poses: Any,
@@ -314,26 +353,39 @@ def compute_binary_fall_asr(
     return_masks: bool = False,
     seq_ids: Any = None,
     seq_min_frames: int = 10,
+    frame_mask: Any = None,
+    calibration_fpr: float | None = None,
     **overrides: Any,
 ) -> dict[str, float | int]:
     """Conditional fall-injection ASR at sequence or frame level.
 
     ``seq_ids`` (one int per frame, loader order) groups frames into sequences.  When
     provided the headline numbers become **sequence-level**: a sequence is *eligible* if
-    ≥ 50 % of its frames are frame-eligible, and *succeeds* if at least ``seq_min_frames``
-    of its frames are individually triggered falls.  Frame-level counts are kept under
-    ``frame_asr`` / ``frame_n_eligible`` / ``frame_n_success`` for diagnostics.  When
-    ``seq_ids`` is None the function behaves as before (frame-level throughout).
+    >= 50 % of its frames are frame-eligible, and *succeeds* if its longest run of
+    CONSECUTIVE triggered-fall frames reaches ``seq_min_frames`` (a debounced alarm).  The
+    frame-level counts are kept under ``frame_asr`` / ``frame_n_eligible`` / ``frame_n_success``.
+    When ``seq_ids`` is None the function behaves frame-level throughout.
 
-    With ``return_masks=True`` the per-frame boolean masks ``eligible``, ``success``,
-    ``success_bone`` and ``clean_bone`` are returned under ``"masks"``; they are not
-    scalar metrics and are always frame-level regardless of ``seq_ids``.
+    ``frame_mask`` (optional boolean ``(B,)``) restricts every FRAME-level quantity (``frame_asr``,
+    ``n_eligible``, the paired clean bone ceiling ...) to the frames the attacker actually
+    perturbed.  Without it, frames that were never triggered dilute every frame-level rate.
+    Sequence-level event rates are unaffected: a non-injected frame is never a success.
 
-    ``binary_fall_asr``       headline ASR (sequence-level when seq_ids given, frame-level
-                              otherwise);
-    ``asr_bone_consistent``   same granularity, additionally requiring that ≥ seq_min_frames
-                              triggered frames are also bone-consistent with the subject.
-    ``n_fail_bone_consistency`` alarm-level successes (frame) that fail the bone check.
+    Bone-based stricter variants (each a debounced event on ``success AND <criterion>``):
+
+    ``asr_bone_consistent``   ORACLE bone check at the fixed ``max_bone_relative_error`` (ground-truth
+                              limb lengths; legacy B-ASR).  ``clean_bone_consistent_rate`` is the same
+                              test applied to the *clean prediction* of the same frames: it is the
+                              ceiling an honest CSI regressor reaches, so B-ASR is only interpretable
+                              next to it.
+    ``asr_bone_calibrated``   (needs ``calibration_fpr``) the oracle tolerance is replaced by the
+                              ``(1 - fpr)``-quantile of the clean predictions' own worst bone error,
+                              so a benign prediction passes with probability ``1 - fpr`` by construction.
+    ``asr_plausible``         (needs ``calibration_fpr``) P-ASR: the alarm must also survive a
+                              deployable, ground-truth-free plausibility filter (left/right bone
+                              symmetry within the ``(1 - fpr)``-quantile of clean predictions).
+                              A defender running that filter at false-positive rate ``fpr`` on
+                              benign traffic would reject exactly the alarms excluded here.
     """
     c = _criteria(criteria, overrides)
     clean_poses, trig_poses = _tensor(clean_poses), _tensor(trig_poses)
@@ -342,6 +394,8 @@ def compute_binary_fall_asr(
         raise ValueError("Clean, triggered and ground-truth poses must have identical shapes")
     if not (clean_poses.device == trig_poses.device == reference.device):
         raise ValueError("Clean, triggered and ground-truth poses must be on the same device")
+    if calibration_fpr is not None and not 0.0 < float(calibration_fpr) < 1.0:
+        raise ValueError("calibration_fpr must lie in (0, 1)")
 
     raw_clean, clean_valid, clean_fall = _fall_pose_masks(clean_poses, ps, c)
     raw_trig, trig_valid, trig_fall = _fall_pose_masks(trig_poses, ps, c)
@@ -354,24 +408,40 @@ def compute_binary_fall_asr(
             raise ValueError("Ground-truth fall labels must contain only 0/1 or boolean values")
         gt_fall = labels.bool()
 
-    eligible = clean_valid & ~clean_fall & gt_valid & ~gt_fall
-    success = eligible & trig_fall
-    n_eligible, n_success, n_total = int(eligible.sum()), int(success.sum()), len(clean_fall)
+    n_all = len(clean_fall)
+    if frame_mask is None:
+        in_scope = torch.ones(n_all, dtype=torch.bool, device=clean_poses.device)
+    else:
+        in_scope = _tensor(frame_mask).bool().to(clean_poses.device)
+        if in_scope.shape != (n_all,):
+            raise ValueError("frame_mask must have shape (B,)")
+
+    eligible_all = clean_valid & ~clean_fall & gt_valid & ~gt_fall
+    success_all = eligible_all & trig_fall            # event level: whole timeline
+    eligible = eligible_all & in_scope                # frame level: attacked frames only
+    success = success_all & in_scope
+    n_eligible, n_success, n_scope = int(eligible.sum()), int(success.sum()), int(in_scope.sum())
     ci_low, ci_high = wilson_interval(n_success, n_eligible)
 
-    reference_bones = _bone_lengths_m(reference, ps)
-
-    def bone_ok(poses: torch.Tensor) -> torch.Tensor:
-        relative = (_bone_lengths_m(poses, ps) - reference_bones).abs() / reference_bones.clamp_min(1e-8)
-        return (relative <= c.max_bone_relative_error).all(dim=1)
-
-    bone_consistent = bone_ok(trig_poses)
+    err_trig = bone_relative_error(trig_poses, reference, ps)
+    err_clean = bone_relative_error(clean_poses, reference, ps)
+    bone_consistent = err_trig <= c.max_bone_relative_error
+    clean_bone_ok = err_clean <= c.max_bone_relative_error
     n_bone_ok = int((success & bone_consistent).sum())
     bone_low, bone_high = wilson_interval(n_bone_ok, n_eligible)
-    # Calibration: the same per-bone test applied to the *clean* prediction.  A benign model
-    # that estimates bone lengths from CSI in an unseen room cannot pass it on every frame, so
-    # asr_bone_consistent is only interpretable relative to this ceiling.
-    n_clean_bone_ok = int((eligible & bone_ok(clean_poses)).sum())
+    # Paired ceiling: the same per-bone test on the clean prediction of the SAME frames.
+    n_clean_bone_ok = int((eligible & clean_bone_ok).sum())
+
+    variants: dict[str, torch.Tensor] = {"success": success_all, "bone": success_all & bone_consistent}
+    calibration: dict[str, float] = {}
+    if calibration_fpr is not None:
+        fpr = float(calibration_fpr)
+        bone_tol = _upper_quantile(err_clean[eligible_all], fpr)
+        sym_tol = _upper_quantile(bone_asymmetry(clean_poses, ps)[eligible_all], fpr)
+        calibration = {"bone_tol_calibrated": bone_tol, "sym_tol_calibrated": sym_tol,
+                       "calibration_fpr": fpr}
+        variants["bone_cal"] = success_all & (err_trig <= bone_tol)
+        variants["plausible"] = success_all & (bone_asymmetry(trig_poses, ps) <= sym_tol)
 
     raw_eligible = int((~raw_clean).sum())
     raw_success = int((~raw_clean & raw_trig).sum())
@@ -386,13 +456,14 @@ def compute_binary_fall_asr(
         "raw_binary_fall_asr": _rate(raw_success, raw_eligible),
         "raw_n_eligible": raw_eligible,
         "raw_n_success": raw_success,
-        "clean_fall_rate": _rate(int(clean_fall.sum()), n_total),
-        "trig_fall_rate": _rate(int(trig_fall.sum()), n_total),
-        "gt_fall_rate": _rate(int(gt_fall.sum()), n_total),
-        "eligible_fraction": _rate(n_eligible, n_total),
+        "clean_fall_rate": _rate(int(clean_fall.sum()), n_all),
+        "trig_fall_rate": _rate(int(trig_fall.sum()), n_all),
+        "trig_fall_rate_injected": _rate(int((trig_fall & in_scope).sum()), n_scope),
+        "gt_fall_rate": _rate(int(gt_fall.sum()), n_all),
+        "eligible_fraction": _rate(n_eligible, n_scope),
         "n_eligible": n_eligible,
         "n_success": n_success,
-        "n_total": n_total,
+        "n_total": n_scope,
         "n_failure": n_eligible - n_success,
         "n_fail_invalid_skeleton": int((eligible & ~trig_valid).sum()),
         "n_fail_fall_geometry": int((eligible & trig_valid & ~trig_fall).sum()),
@@ -401,45 +472,46 @@ def compute_binary_fall_asr(
         "n_gt_invalid": int((~gt_valid).sum()),
         "n_gt_fall": int(gt_fall.sum()),
         "uses_annotated_fall_labels": int(ground_truth_is_fall is not None),
+        **calibration,
     }
+    if calibration_fpr is not None:
+        n_cal = int((success & (err_trig <= calibration["bone_tol_calibrated"])).sum())
+        n_pl = int((success & (bone_asymmetry(trig_poses, ps) <= calibration["sym_tol_calibrated"])).sum())
+        stats["asr_bone_calibrated"] = _rate(n_cal, n_eligible)
+        stats["asr_plausible"] = _rate(n_pl, n_eligible)
     if return_masks:
         stats["masks"] = {
             "eligible": eligible,
             "success": success,
             "success_bone": success & bone_consistent,
-            "clean_bone": eligible & bone_ok(clean_poses),
+            "clean_bone": eligible & clean_bone_ok,
         }
 
     # ── Sequence-level (event) aggregation ──────────────────────────────────
     # A practical fall alarm debounces: it fires only after the pose stays fallen for
     # ``seq_min_frames`` CONSECUTIVE frames.  The event-level ASR is therefore the fraction of
-    # eligible sequences whose triggered prediction has a sustained fall run of that length —
-    # not a count of scattered fall frames, which a debounced alarm would never raise on.  The
-    # total-count rule is kept as ``seq_asr_total_count`` for comparison, and the frame-level
-    # numbers as ``frame_*``.  Replaces the frame-level headline keys.
+    # eligible sequences whose triggered prediction has a sustained fall run of that length --
+    # not a count of scattered fall frames, which a debounced alarm would never raise on.
+    # NOTE this is an "at least one alarm per sequence" quantity: with several bursts per
+    # sequence it is an OR over bursts and saturates as soon as one burst works.  The per-burst
+    # hit rate (evaluate.compute_sliding_burst_asr) is the unsaturated companion.
     if seq_ids is not None:
         ids = np.asarray(seq_ids).ravel()
-        if len(ids) != len(eligible):
-            raise ValueError(
-                f"seq_ids has {len(ids)} entries but there are {len(eligible)} frames")
-        eligible_np = eligible.cpu().numpy()
-        success_np = success.cpu().numpy()
-        bone_np = (success & bone_consistent).cpu().numpy()
+        if len(ids) != n_all:
+            raise ValueError(f"seq_ids has {len(ids)} entries but there are {n_all} frames")
+        eligible_np = eligible_all.cpu().numpy()
         unique_seqs = np.unique(ids)
-        n_seq_total = len(unique_seqs)
-        n_seq_eligible = n_seq_success = n_seq_bone_ok = n_seq_count = 0
-        for sid in unique_seqs:
-            mask = ids == sid
-            if eligible_np[mask].mean() >= 0.5:   # ≥50% frames eligible → sequence eligible
-                n_seq_eligible += 1
-                if _longest_true_run(success_np[mask]) >= seq_min_frames:
-                    n_seq_success += 1
-                if _longest_true_run(bone_np[mask]) >= seq_min_frames:
-                    n_seq_bone_ok += 1
-                if int(success_np[mask].sum()) >= seq_min_frames:
-                    n_seq_count += 1
+        seq_slices = [np.flatnonzero(ids == sid) for sid in unique_seqs]
+        eligible_seq = np.array([eligible_np[idx].mean() >= 0.5 for idx in seq_slices], dtype=bool)  # >=50 % eligible
+        n_seq_eligible = int(eligible_seq.sum())
+        events = {name: _event_flags(v.cpu().numpy(), seq_slices, eligible_seq, seq_min_frames)
+                  for name, v in variants.items()}
+        success_np = success_all.cpu().numpy()
+        count_flags = np.array([bool(el) and int(success_np[idx].sum()) >= seq_min_frames
+                                for idx, el in zip(seq_slices, eligible_seq)], dtype=bool)
+        n_seq_success = int(events["success"].sum())
         seq_low, seq_high = wilson_interval(n_seq_success, n_seq_eligible)
-        seq_bone_low, seq_bone_high = wilson_interval(n_seq_bone_ok, n_seq_eligible)
+        seq_bone_low, seq_bone_high = wilson_interval(int(events["bone"].sum()), n_seq_eligible)
         # Preserve frame-level values as diagnostics, then overwrite headline keys.
         stats["frame_asr"] = stats["binary_fall_asr"]
         stats["frame_n_eligible"] = stats["n_eligible"]
@@ -447,16 +519,30 @@ def compute_binary_fall_asr(
         stats["binary_fall_asr"] = _rate(n_seq_success, n_seq_eligible)
         stats["asr_ci95_low"] = seq_low
         stats["asr_ci95_high"] = seq_high
-        stats["asr_bone_consistent"] = _rate(n_seq_bone_ok, n_seq_eligible)
+        stats["asr_bone_consistent"] = _rate(int(events["bone"].sum()), n_seq_eligible)
         stats["asr_bone_consistent_ci95_low"] = seq_bone_low
         stats["asr_bone_consistent_ci95_high"] = seq_bone_high
-        stats["seq_asr_total_count"] = _rate(n_seq_count, n_seq_eligible)
+        if calibration_fpr is not None:
+            stats["asr_bone_calibrated"] = _rate(int(events["bone_cal"].sum()), n_seq_eligible)
+            stats["asr_plausible"] = _rate(int(events["plausible"].sum()), n_seq_eligible)
+            stats["asr_plausible_ci95_low"], stats["asr_plausible_ci95_high"] = wilson_interval(
+                int(events["plausible"].sum()), n_seq_eligible)
+        stats["seq_asr_total_count"] = _rate(int(count_flags.sum()), n_seq_eligible)
         stats["n_eligible"] = n_seq_eligible
         stats["n_success"] = n_seq_success
-        stats["n_total"] = n_seq_total
-        stats["eligible_fraction"] = _rate(n_seq_eligible, n_seq_total)
+        stats["n_total"] = len(unique_seqs)
+        stats["eligible_fraction"] = _rate(n_seq_eligible, len(unique_seqs))
         stats["seq_min_frames"] = seq_min_frames
         stats["event_rule"] = "longest_consecutive_run"
+        if return_masks:
+            stats["masks"]["seq"] = {
+                "ids": unique_seqs, "eligible": eligible_seq, "success": events["success"],
+                "success_bone": events["bone"],
+                **({"success_plausible": events["plausible"], "success_bone_cal": events["bone_cal"]}
+                   if calibration_fpr is not None else {}),
+            }
+        if return_masks and calibration_fpr is not None:
+            stats["masks"]["success_plausible_frame"] = variants["plausible"]
 
     return stats
 
@@ -472,6 +558,7 @@ def fall_threshold_sensitivity(
     scales: list[float] | tuple[float, ...],
     seq_ids: Any = None,
     seq_min_frames: int = 10,
+    frame_mask: Any = None,
 ) -> dict[str, float]:
     """Headline ASR re-computed with the fall thresholds jointly scaled.
 
@@ -485,7 +572,7 @@ def fall_threshold_sensitivity(
         stats = compute_binary_fall_asr(
             clean_poses, trig_poses, ps, ground_truth_poses=ground_truth_poses,
             ground_truth_is_fall=ground_truth_is_fall, criteria=base.scaled(float(scale)),
-            seq_ids=seq_ids, seq_min_frames=seq_min_frames,
+            seq_ids=seq_ids, seq_min_frames=seq_min_frames, frame_mask=frame_mask,
         )
         out[f"asr_thr_x{scale:g}"] = stats["binary_fall_asr"]
     return out
@@ -634,3 +721,37 @@ def compute_latent_cosine_alignment(z_trig: Any, U: Any) -> float:
     u_norm = u / u.norm(dim=0, keepdim=True).clamp_min(1e-8)
     cos_sim = torch.matmul(z_norm, u_norm).abs().amax(dim=-1)
     return float(cos_sim.mean().item())
+
+
+def compute_latent_shift_alignment(z_trig: Any, z_clean: Any, U: Any) -> float:
+    """CAS: mean max-cosine between the trigger-induced latent SHIFT ``z_trig - z_clean`` and ``U``.
+
+    ``z`` is a spatial mean of post-ReLU features, hence non-negative with a large common mean
+    component; ``U`` is oriented toward that mean, so the cosine of the RAW latent with ``U`` is
+    ~1 for clean inputs too and says nothing about the backdoor (see
+    :func:`compute_latent_cosine_alignment`, kept only as the null reference).  The paired shift
+    cancels the common component and asks the actual question: does the trigger move the latent
+    along the designated direction?
+    """
+    zt, zc, u = _tensor(z_trig), _tensor(z_clean), _tensor(U)
+    if zt.shape != zc.shape or zt.ndim != 2 or u.ndim != 2:
+        return float("nan")
+    delta = zt - zc
+    u = u.to(delta.device)
+    d_norm = delta / delta.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    u_norm = u / u.norm(dim=0, keepdim=True).clamp_min(1e-8)
+    return float(torch.matmul(d_norm, u_norm).abs().amax(dim=-1).mean().item())
+
+
+def compute_latent_norm_auroc(z_clean: Any, z_trig: Any) -> float:
+    """AUROC of the trivial detector ``||z||`` separating clean from triggered latents.
+
+    Stealth baseline: a backdoor that only inflates the latent energy is caught by this
+    one-line detector, whatever its subspace structure.  ``nan`` if either set is empty.
+    """
+    zc, zt = _tensor(z_clean), _tensor(z_trig)
+    if zc.numel() == 0 or zt.numel() == 0:
+        return float("nan")
+    nc, nt = zc.norm(dim=-1).cpu().numpy(), zt.norm(dim=-1).cpu().numpy()
+    labels = np.concatenate((np.zeros(len(nc)), np.ones(len(nt))))
+    return float(roc_auc_score(labels, np.concatenate((nc, nt))))

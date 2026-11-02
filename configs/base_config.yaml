@@ -190,9 +190,9 @@ evaluation:
   # detector (not an independent label): it is applied identically to the ground truth,
   # the clean prediction and the triggered prediction, and its thresholds are swept by
   # `sensitivity_scales` so the headline number is never reported at a single operating point.
-  # Under the v7 injection model (content-decoupled eps, per-subject per-bone-retargeted
-  # targets with facing alignment) the attack target varies per sample, so the model must
-  # generalise rather than memorise a constant pose — ASR is no longer trivially saturated.
+  # NOTE the ASR is a step function of a geometric detector that the fall template satisfies by
+  # construction, so it saturates at 100 % for any working backdoor (see the threshold sweep).
+  # Rank attacks with the per-burst hit rate, P-ASR and the eps / burst-width stress tests.
   fall_criteria:
     vertical_axis: 2           # Z-up after datasets.transforms.canonicalize_pose_z_up
     torso_max_height_m: 0.15
@@ -202,8 +202,11 @@ evaluation:
     min_torso_length_m: 0.20
     max_torso_length_m: 0.90
     max_body_vertical_span_m: 0.30
-    # Anthropometric consistency of a successful skeleton with the subject's own bones.
-    # Reported as `asr_bone_consistent` (a stricter ASR); it is NOT hidden from the headline.
+    # ORACLE bone check (B-ASR, `asr_bone_consistent`): every bone within this relative error of the
+    # subject's GROUND-TRUTH length.  It measures how accurately the CSI regressor reproduces limb
+    # lengths (a benign prediction passes it on only a few % of frames), NOT attack realism, and a
+    # defender has no ground truth.  It is a diagnostic reported next to `clean_bone_consistent_rate`;
+    # the deployable realism metric is P-ASR (`evaluation.plausibility`).
     max_bone_relative_error: 0.30
   # Supplementary State-Collapse ASR (target convergence rather than alarm).
   state_collapse:
@@ -223,14 +226,28 @@ evaluation:
   # succeeds only if ≥ seq_min_frames of them are triggered falls.  At ~10 Hz CSI capture,
   # 10 frames ≈ 1 second — the minimum debounce window of a practical fall alarm.
   seq_min_frames: 10
+  # Attacker's TEST-TIME budget: fraction of every sequence's frames that receive the trigger, in
+  # `num_bursts` centred bursts (10 % of 297 frames = 2 x 15).  It is a property of the evaluation,
+  # identical for every model including the clean control (poison_rate = 0); it is NOT the training
+  # poison rate.  Coupling the two made a clean control run with 1 injected frame per sequence, which
+  # can never clear the debounce (a vacuous control) and confounded poison-rate sweeps with exposure.
+  test_injection_rate: 0.10
+  # Ground-truth-FREE plausibility filter behind P-ASR / cB-ASR: thresholds are the (1 - fpr)
+  # quantile of the clean predictions' own statistic (left/right bone asymmetry; worst bone error),
+  # i.e. a defender running the filter on benign traffic raises a false alarm with probability fpr.
+  plausibility:
+    fpr: 0.05
   num_bursts: 2  # discrete continuous bursts per sequence for spatial-temporal diversity
   # Ablation burst counts for the num_bursts sensitivity study.
   ablation_num_bursts: [1, 2, 3, 4, 5]
-  # Sliding-window burst ASR (position-agnostic evaluation).
-  # burst_slide_step: 0 = disabled (fixed positions), >0 = sliding with this step.
-  # burst_width: frames per burst (must match poison budget: frames_per_seq * poison_rate / num_bursts).
+  # Burst-level evaluation over every placement of the burst comb (BHR headline; see
+  # evaluate.compute_sliding_burst_asr).  burst_slide_step: 0 = disabled, >0 = slide step (frames).
+  # burst_width: frames per burst in the sliding evaluation and the N_burst ablation; it must be
+  # >= seq_min_frames or no burst can clear the debounce.  Keep it equal to
+  # test_injection_rate * frames_per_seq / num_bursts (297 * 0.10 / 2 = 14.85 ~ 15) so the sliding
+  # evaluation has the same exposure as evaluate_model.
   burst_slide_step: 10   # slide step in frames
-  burst_width: 15        # frames per burst (297 * 0.10 / 2 = 14.85 ≈ 15)
+  burst_width: 15        # frames per burst
   # Non-saturating stress tests run on the trained model (evaluate.evaluate_robustness).
   robustness:
     eps_scales: [0.05, 0.1, 0.25, 0.5, 1.0]   # test-time trigger budget relative to attack.epsilon

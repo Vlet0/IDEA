@@ -72,89 +72,71 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     net.eval()
 
     print("[3/3] Evaluating (no retraining)...")
+    criteria = FallCriteria.from_dict(eval_cfg["fall_criteria"])
+    seq_ids = meta.get("te_seq_id")
+    seq_min = int(eval_cfg["seq_min_frames"])
+    frames_per_seq = int(config["data"]["expected_frames_per_action"])
+    num_bursts = int(eval_cfg["num_bursts"])
+    # Test-time exposure and plausibility calibration come from the evaluation config, identical
+    # for every checkpoint (including the clean control); see evaluate.py "Estimands".
+    injection_rate = float(eval_cfg["test_injection_rate"])
+    plausibility_fpr = float(eval_cfg["plausibility"]["fpr"])
     res = evaluate_model(
         net, test_loader, trigger, fall_targets, PS, device, atk["epsilon"], atk["gate_threshold"],
-        FallCriteria.from_dict(eval_cfg["fall_criteria"]),
+        criteria,
         StateCollapseCriteria.from_dict(eval_cfg["state_collapse"]),
         eval_cfg["sensitivity_scales"], target_cfg,
         U=U if latent_active else None,
         clusters=meta.get("te_subject"), cluster_ci=eval_cfg["cluster_ci"],
-        seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
-        poison_rate=atk.get("poison_rate", 1.0),
-        frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
-        num_bursts=int(eval_cfg.get("num_bursts", 2)),
+        seq_ids=seq_ids, seq_min_frames=seq_min,
+        injection_rate=injection_rate, frames_per_seq=frames_per_seq, num_bursts=num_bursts,
+        plausibility_fpr=plausibility_fpr,
     )
     robustness = evaluate_robustness(
         net, test_loader, trigger, fall_targets, PS, device, atk["epsilon"],
-        FallCriteria.from_dict(eval_cfg["fall_criteria"]), target_cfg, eval_cfg["robustness"],
-        seq_ids=meta.get("te_seq_id"), seq_min_frames=int(eval_cfg["seq_min_frames"]),
-        poison_rate=atk.get("poison_rate", 1.0),
-        frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
-        num_bursts=int(eval_cfg.get("num_bursts", 2)),
+        criteria, target_cfg, eval_cfg["robustness"],
+        seq_ids=seq_ids, seq_min_frames=seq_min,
+        injection_rate=injection_rate, frames_per_seq=frames_per_seq, num_bursts=num_bursts,
+        plausibility_fpr=plausibility_fpr,
     )
 
-    # --- Sliding-Window ASR (position-agnostic) ----------------------------------------
-    # Only run when the model was actually poisoned.  On a clean-control model (poison_rate=0)
-    # this would just confirm ASR≈0 everywhere, which is already guaranteed; skipping saves time.
+    # --- Burst-level evaluation (BHR headline) ------------------------------------------
+    # Also run for a clean control: with the shared test-time budget it is the non-vacuous
+    # false-alarm control (BHR should be ~0 %).
     sliding_asr: dict = {}
     burst_ablation: list[dict] = []
-    _slide_step = int(eval_cfg.get("burst_slide_step", 10))
-    _burst_width = int(eval_cfg.get("burst_width", 15))
-    _ablation_nb = list(eval_cfg.get("ablation_num_bursts", [1, 2, 3, 4, 5]))
-    _frames_per_seq = int(config.get("data", {}).get("expected_frames_per_action", 297))
-    _seq_min = int(eval_cfg["seq_min_frames"])
-    _poison_seed = int(config["seed"] if atk["poison_seed"] is None else atk["poison_seed"])
+    _slide_step = int(eval_cfg["burst_slide_step"])
+    _burst_width = int(eval_cfg["burst_width"])
+    _ablation_nb = list(eval_cfg["ablation_num_bursts"])
 
-    if not clean_control and _slide_step > 0:
-        print("[S-ASR] Computing sliding-window ASR...")
+    if _slide_step > 0:
+        print("[BHR] Computing burst hit rate over sliding burst-comb placements...")
         sliding_asr = compute_sliding_burst_asr(
-            net=net,
-            test_loader=test_loader,
-            trigger=trigger,
-            fall_targets=fall_targets,
-            PS=PS,
-            device=device,
-            eps=atk["epsilon"],
-            criteria=FallCriteria.from_dict(eval_cfg["fall_criteria"]),
-            target_cfg=target_cfg,
-            seq_ids=meta.get("te_seq_id"),
-            seq_min_frames=_seq_min,
-            frames_per_seq=_frames_per_seq,
-            num_bursts=int(eval_cfg.get("num_bursts", 2)),
-            burst_width=None,  # dynamically scale to keep total budget constant
-            poison_rate=float(atk.get('poison_rate', 0.10)),
-            burst_slide_step=_slide_step,
-            poison_seed=_poison_seed,
+            net=net, test_loader=test_loader, trigger=trigger, PS=PS, device=device,
+            eps=atk["epsilon"], criteria=criteria, seq_ids=seq_ids, seq_min_frames=seq_min,
+            frames_per_seq=frames_per_seq, num_bursts=num_bursts, burst_width=_burst_width,
+            burst_slide_step=_slide_step, clusters=meta.get("te_subject"),
+            cluster_cfg=eval_cfg["cluster_ci"], plausibility_fpr=plausibility_fpr,
         )
-        print(f"[S-ASR] mean={sliding_asr['sliding_asr_mean']:.2f}%  "
-              f"std={sliding_asr['sliding_asr_std']:.2f}%  "
-              f"min={sliding_asr['sliding_asr_min']:.2f}%  "
-              f"max={sliding_asr['sliding_asr_max']:.2f}%  "
-              f"n_positions={sliding_asr['n_slide_positions']}")
+        print(f"[BHR] {sliding_asr['burst_hit_rate']:.2f}% "
+              f"(subject-cluster 95% CI {sliding_asr['burst_hit_rate_ci95_low_cluster']:.2f}-"
+              f"{sliding_asr['burst_hit_rate_ci95_high_cluster']:.2f}); any-burst ASR "
+              f"{sliding_asr['sliding_asr_mean']:.2f}%; all-burst ASR {sliding_asr['all_burst_asr_mean']:.2f}%; "
+              f"position_invariant={bool(sliding_asr['position_invariant'])} "
+              f"({sliding_asr['n_slide_positions']} placements)")
 
-        print("[N_burst ablation] Sweeping burst counts...")
+        print("[N_burst ablation] Sweeping burst counts at fixed burst width...")
         burst_ablation = evaluate_burst_ablation(
-            net=net,
-            test_loader=test_loader,
-            trigger=trigger,
-            fall_targets=fall_targets,
-            PS=PS,
-            device=device,
-            eps=atk["epsilon"],
-            criteria=FallCriteria.from_dict(eval_cfg["fall_criteria"]),
-            target_cfg=target_cfg,
-            seq_ids=meta.get("te_seq_id"),
-            seq_min_frames=_seq_min,
-            frames_per_seq=_frames_per_seq,
-            burst_counts=_ablation_nb,
-            burst_width=_burst_width,
-            burst_slide_step=_slide_step,
-            poison_seed=_poison_seed,
+            net=net, test_loader=test_loader, trigger=trigger, PS=PS, device=device,
+            eps=atk["epsilon"], criteria=criteria, seq_ids=seq_ids, seq_min_frames=seq_min,
+            frames_per_seq=frames_per_seq, burst_counts=_ablation_nb, burst_width=_burst_width,
+            burst_slide_step=_slide_step, clusters=meta.get("te_subject"),
+            cluster_cfg=eval_cfg["cluster_ci"], plausibility_fpr=plausibility_fpr,
         )
         for ab in burst_ablation:
-            print(f"  N_burst={ab['num_bursts']:d}: S-ASR={ab['sliding_asr_mean']:.2f}%  "
-                  f"(min={ab['sliding_asr_min']:.2f}%, max={ab['sliding_asr_max']:.2f}%, "
-                  f"n_pos={ab['n_slide_positions']})")
+            print(f"  N_burst={ab['num_bursts']:d} (inject {ab['injected_fraction_pct']:.1f}%): "
+                  f"BHR={ab['burst_hit_rate']:.2f}%  any-burst ASR={ab['sliding_asr_mean']:.2f}%  "
+                  f"feasible={bool(ab['feasible'])}")
 
     # --- Clean-model sanity baseline ---------------------------------------------------
     # A clean model (poison_rate=0) trained with the same seed and then injected with the
@@ -167,7 +149,8 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     #   python evaluate_checkpoint.py \
     #       --checkpoint checkpoints/clean_control_v1_model.pt
     #
-    # poison_rate=0 → clean_control=True → S-ASR skipped; evaluate_model shows ASR~0.
+    # poison_rate=0 -> clean_control=True; the control is evaluated at the same test-time injection
+    # rate as every other checkpoint, so BHR / ASR ~ 0 is a real statement, not a vacuous one.
     if clean_control:
         print("\n[SANITY] Clean-model control checkpoint detected (poison_rate=0).")
         print("[SANITY] Expected: ASR ~= 0 %.  If ASR is high, the fall detector has a "
@@ -195,32 +178,38 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     print(f"Attack mode            : {mode.upper()} (trigger: {trigger_for_mode(mode)}, poison rate {atk['poison_rate']})")
     if clean_control:
         print("*** CLEAN-MODEL CONTROL: poison_rate=0 — ASR should be ~0 % ***")
+    print(f"Test injection         : {res['n_injected']} frames ({res['injected_fraction_pct']:.2f}% of the stream); "
+          "attack estimands are over injected frames")
     print(f"Clean MPJPE            : {res['clean_mpjpe_cm']:6.2f} ± {res['clean_mpjpe_std']:.2f} cm")
-    print(f"Distance to target     : {res['target_mpjpe_cm']:6.4f} ± {res['target_mpjpe_std_cm']:.4f} cm")
-    print(f"ASR (fall alarm)       : {res['binary_fall_asr']:.4f} % (95% CI [{res['asr_ci95_low']:.4f}, {res['asr_ci95_high']:.4f}])")
+    print(f"T-MPJPE (injected)     : {res['target_mpjpe_cm']:6.4f} ± {res['target_mpjpe_std_cm']:.4f} cm")
+    print(f"ASR (any burst)        : {res['binary_fall_asr']:.4f} % (95% CI [{res['asr_ci95_low']:.4f}, {res['asr_ci95_high']:.4f}])")
     print(f"ASR subject-level CI   : [{res['asr_ci95_low_cluster']:.4f}, {res['asr_ci95_high_cluster']:.4f}]")
-    print(f"ASR (bone-consistent)  : {res['asr_bone_consistent']:.4f} % "
-          f"(clean predictions pass the same check: {res['clean_bone_consistent_rate']:.4f} %)")
+    print(f"P-ASR (plausible)      : {res['asr_plausible']:.4f} % (GT-free bone-symmetry filter, "
+          f"{plausibility_fpr:.0%} clean FPR)")
+    print(f"B-ASR (oracle bone)    : {res['asr_bone_consistent']:.4f} % "
+          f"(clean predictions of the same frames pass the same check: {res['clean_bone_consistent_rate']:.4f} %); "
+          f"calibrated cB-ASR {res['asr_bone_calibrated']:.4f} %")
     print(f"Target preservation    : {atk['target']['preserve_subject_scale']}")
-    print(f"Eligible / success     : {res['n_eligible']} / {res['n_success']} of {res['n_total']} frames")
-    print(f"Fall rates clean/trig/GT: {res['clean_fall_rate']:.4f} / {res['trig_fall_rate']:.4f} / {res['gt_fall_rate']:.4f} %")
-    print(f"State-collapse ASR     : {res['state_collapse_asr']:.4f} %")
+    print(f"Eligible / success     : {res['n_eligible']} / {res['n_success']} of {res['n_total']} units")
+    print(f"Fall rates clean/trig/trig-inj/GT: {res['clean_fall_rate']:.4f} / {res['trig_fall_rate']:.4f} / "
+          f"{res['trig_fall_rate_injected']:.4f} / {res['gt_fall_rate']:.4f} %")
+    print(f"State-collapse ASR     : {res['state_collapse_asr']:.4f} % (injected frames)")
     if sliding_asr:
-        print(f"S-ASR (sliding-window) : mean={sliding_asr['sliding_asr_mean']:.2f}%  "
-              f"std={sliding_asr['sliding_asr_std']:.2f}%  "
-              f"[{sliding_asr['sliding_asr_min']:.2f}%, {sliding_asr['sliding_asr_max']:.2f}%]  "
-              f"n={sliding_asr['n_slide_positions']} positions")
+        print(f"BHR (burst hit rate)   : {sliding_asr['burst_hit_rate']:.2f}% "
+              f"[{sliding_asr['burst_hit_rate_min']:.2f}%, {sliding_asr['burst_hit_rate_max']:.2f}%] over "
+              f"{sliding_asr['n_slide_positions']} placements; all-burst ASR {sliding_asr['all_burst_asr_mean']:.2f}%; "
+              f"any-burst ASR {sliding_asr['sliding_asr_mean']:.2f}%")
     if burst_ablation:
-        nb_str = "  ".join(f"N_b={ab['num_bursts']}:{ab['sliding_asr_mean']:.1f}%"
-                           for ab in burst_ablation)
-        print(f"N_burst ablation       : {nb_str}")
+        nb_str = "  ".join(f"N_b={ab['num_bursts']}:{ab['burst_hit_rate']:.1f}%" for ab in burst_ablation)
+        print(f"N_burst ablation (BHR) : {nb_str}")
     if latent_active:
-        print(f"Latent AUROC / d'      : {res['latent_auroc']:.4f} / {res['latent_dprime']:.2f}")
+        print(f"Latent AUROC / d'      : {res['latent_auroc']:.4f} / {res['latent_dprime']:.2f} "
+              f"(CAS shift {res['latent_cas']:.4f}; ||z|| AUROC {res['latent_norm_auroc']:.4f})")
     else:
         print("Latent statistics      : n/a (not a latent-objective model)")
     for r in robustness:
         print(f"Robustness {r['condition']}={r['value']:g}: ASR {r['asr']:.2f} % | "
-              f"T-MPJPE {r['target_mpjpe_cm']:.2f} cm | clean MPJPE {r['clean_mpjpe_cm']:.2f} cm")
+              f"P-ASR {r['asr_plausible']:.2f} % | T-MPJPE {r['target_mpjpe_cm']:.2f} cm | clean MPJPE {r['clean_mpjpe_cm']:.2f} cm")
     print("Spectral Signatures    : " + ", ".join(f"{k}={v:.2f}" for k, v in defense.items()))
     if intervention is not None:
         for r in intervention["necessity"]:
@@ -241,7 +230,9 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
            "eval_git_commit": _git_commit(),
            **{k: v for k, v in res.items() if v is not None and not isinstance(v, torch.Tensor)},
            **defense,
-           # Sliding-window ASR (NaN when clean_control or burst_slide_step=0).
+           "test_injection_rate": injection_rate,
+           "plausibility_fpr": plausibility_fpr,
+           # Burst-level evaluation (empty when burst_slide_step=0).
            **{f"sasr_{k}": v for k, v in sliding_asr.items() if not isinstance(v, list)},
            "clean_control": int(clean_control),
            }

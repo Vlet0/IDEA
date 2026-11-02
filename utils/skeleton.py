@@ -29,6 +29,12 @@ BONES: list[tuple[int, int]] = [
 ]
 SKELETON_EDGES = BONES
 
+# Indices into BONES of the left/right counterpart bones (hip offset, thigh, shank, shoulder
+# offset, upper arm, forearm).  A rigid human body has equal left/right lengths up to a small
+# anthropometric asymmetry, so |L - R| / mean(L, R) is a ground-truth-FREE plausibility
+# statistic: a deployed defender can evaluate it on any predicted skeleton.
+SYMMETRIC_BONE_PAIRS: list[tuple[int, int]] = [(0, 3), (1, 4), (2, 5), (10, 13), (11, 14), (12, 15)]
+
 
 def horizontal_axes(vertical_axis: int) -> tuple[int, int]:
     """The two coordinate indices that span the ground plane (all axes except ``vertical_axis``)."""

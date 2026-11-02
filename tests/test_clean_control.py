@@ -94,6 +94,8 @@ class CleanControlTests(unittest.TestCase):
                 "experiment_name": "clean_control_test", "device": "cpu", "seed": 0,
                 "model": {"backbone": "hpeli", "latent_dim": 2},
                 "attack": {"mode": "latent", "poison_rate": 0.0},
+                # The toy loader is one 3-frame "sequence"; the burst schedule must match it.
+                "data": {"expected_frames_per_action": 3},
                 "training": {"epochs": 1, "batch_size": 2, "num_workers": 0, "pin_memory": False,
                              "output_dir": folder, "save_dir": folder},
                 "evaluation": {"num_workers": 0, "pin_memory": False},

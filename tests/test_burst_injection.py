@@ -60,11 +60,11 @@ class TestMultiBurstInjection(unittest.TestCase):
             return torch.zeros(b, dtype=torch.long, device=dev)
 
         target_cfg = {"preserve_subject_scale": False, "variation_std": 0.0}
-        # Test with num_bursts = 2, poison_rate = 0.10
+        # Test with num_bursts = 2, injection_rate = 0.10
         r2 = _run_pass(
             net, loader, trigger, eps=0.35, device="cpu",
             fall_targets=fall_targets, target_cfg=target_cfg, trigger_index=trig_idx,
-            U=None, poison_rate=0.10, poison_seed=42, frames_per_seq=297,
+            U=None, injection_rate=0.10, frames_per_seq=297,
             num_bursts=2
         )
         injected_frames = (r2["trig_pred"].abs().sum(dim=(1, 2)) > 1e-4).sum().item()
@@ -74,17 +74,17 @@ class TestMultiBurstInjection(unittest.TestCase):
         r1 = _run_pass(
             net, loader, trigger, eps=0.35, device="cpu",
             fall_targets=fall_targets, target_cfg=target_cfg, trigger_index=trig_idx,
-            U=None, poison_rate=0.10, poison_seed=42, frames_per_seq=297,
+            U=None, injection_rate=0.10, frames_per_seq=297,
             num_bursts=1
         )
         injected_frames_1 = (r1["trig_pred"].abs().sum(dim=(1, 2)) > 1e-4).sum().item()
         self.assertEqual(injected_frames_1, 30)
 
-        # Test with poison_rate = 1.0 (all frames injected)
+        # Test with injection_rate = 1.0 (all frames injected)
         r_all = _run_pass(
             net, loader, trigger, eps=0.35, device="cpu",
             fall_targets=fall_targets, target_cfg=target_cfg, trigger_index=trig_idx,
-            U=None, poison_rate=1.0, poison_seed=42, frames_per_seq=297,
+            U=None, injection_rate=1.0, frames_per_seq=297,
             num_bursts=2
         )
         injected_frames_all = (r_all["trig_pred"].abs().sum(dim=(1, 2)) > 1e-4).sum().item()

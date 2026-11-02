@@ -34,6 +34,9 @@ TABLE_FIELDS = [
     "binary_fall_asr", "asr_ci95_low_cluster", "asr_ci95_high_cluster", "asr_subject_min", "asr_subject_max",
     "asr_ci95_low", "asr_ci95_high",
     "asr_bone_consistent", "clean_bone_consistent_rate", "raw_binary_fall_asr",
+    "asr_plausible", "asr_bone_calibrated", "burst_hit_rate", "burst_hit_rate_ci95_low_cluster",
+    "burst_hit_rate_ci95_high_cluster", "all_burst_asr_mean", "sliding_asr_mean", "position_invariant",
+    "latent_cas", "latent_norm_auroc", "n_injected", "test_injection_rate",
     "target_mpjpe_median_cm", "target_mpjpe_p95_cm",
     "clean_fall_rate", "trig_fall_rate", "gt_fall_rate", "eligible_fraction",
     "n_success", "n_eligible", "n_failure",
@@ -65,20 +68,23 @@ def write_table(rows: list[dict[str, str]], output: Path) -> None:
             writer.writerow({field: row.get(field, "") for field in TABLE_FIELDS})
 
     lines = [
-        r"\begin{tabular}{llrrrrr}", r"\toprule",
-        r"Method & Trigger & Clean MPJPE$\downarrow$ & ASR$\uparrow$ [subject 95\% CI] & "
-        r"ASR bone-consistent (clean ref.) & T-MPJPE median & Spectral-Sig. AUROC \\",
+        r"\begin{tabular}{llrrrrrrr}", r"\toprule",
+        r"Method & Trigger & Clean MPJPE$\downarrow$ & BHR$\uparrow$ [subject 95\% CI] & "
+        r"ASR (any burst) & P-ASR & B-ASR$^{\dagger}$ (clean ref.) & T-MPJPE median & Spectral-Sig. AUROC \\",
         r"\midrule",
     ]
     for row in rows:
         method = plots.METHOD_LABELS[plots.method_of(row)]
         lines.append(
             f"{method} & {row.get('trigger_type', '-')} & {_cell(row, 'clean_mpjpe_cm', 2)} & "
-            f"{_cell(row, 'binary_fall_asr', 2)} [{_cell(row, 'asr_ci95_low_cluster', 2)}, "
-            f"{_cell(row, 'asr_ci95_high_cluster', 2)}] & "
+            f"{_cell(row, 'burst_hit_rate', 2)} [{_cell(row, 'burst_hit_rate_ci95_low_cluster', 2)}, "
+            f"{_cell(row, 'burst_hit_rate_ci95_high_cluster', 2)}] & "
+            f"{_cell(row, 'binary_fall_asr', 2)} & {_cell(row, 'asr_plausible', 2)} & "
             f"{_cell(row, 'asr_bone_consistent', 2)} ({_cell(row, 'clean_bone_consistent_rate', 2)}) & "
             f"{_cell(row, 'target_mpjpe_median_cm', 2)} & {_cell(row, 'spectral_auroc_c1', 3)}" + r" \\")
-    lines.extend([r"\bottomrule", r"\end{tabular}"])
+    lines.extend([r"\bottomrule", r"\end{tabular}",
+                  r"\\[2pt]{\footnotesize $^{\dagger}$ oracle bone check against ground-truth limb lengths; it "
+                  r"bounds the regressor's own accuracy (in parentheses: clean predictions), not realism.}"])
     output.with_suffix(".tex").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

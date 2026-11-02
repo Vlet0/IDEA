@@ -1,6 +1,6 @@
 # Agent Handover — Latent Backdoor WiFi-CSI Pose Estimation
 
-**Protocol**: `metric binary-fall-v8` / `training fixed-poison-v4`  
+**Protocol**: `metric binary-fall-v9` / `training fixed-poison-v4`  (lý thuyết: [METRICS_THEORY.md](METRICS_THEORY.md))  
 **Branch**: `main` | **Last updated**: 2026-11-02 (session: trigger-axis bug fix + defense-aware
 EOT + threat-model scope + paper citation audit)
 
@@ -192,39 +192,35 @@ L = L_clean_pose          (L1 clean utility)
 
 ---
 
-## 8. Metrics (v8)
+## 8. Metrics (v9) — xem [METRICS_THEORY.md](METRICS_THEORY.md)
 
-### Tier 1 — Latent Representation
+**Thay đổi so với v8 (không so sánh được số cũ):** estimand attack tính trên **frame bị tiêm** (v8 pha loãng 10×:
+AUROC≈0.55, CAD/T-MPJPE sai); ngân sách tiêm test `evaluation.test_injection_rate` tách khỏi `poison_rate`
+(clean control không còn rỗng); BHR thay S-ASR làm headline; B-ASR hạ xuống chẩn đoán, P-ASR (không cần GT) là metric realism;
+CAS tính trên dịch chuyển latent; thêm `latent_norm_auroc`.
+
 | Metric | CSV key | Ý nghĩa |
 |--------|---------|---------|
-| CAS | `latent_cas` | Mean max cosine(z, u_k) |
-| AUROC | `latent_auroc` | clean vs triggered projection separation |
-| d' | `latent_dprime` | Cohen's d-prime effect size |
-| TAR | `latent_true_activation_pct` | % triggered > gate τ |
-| FAR | `latent_false_activation_pct` | % clean > gate τ |
-
-### Tier 2 — Task Decision & Geometry
-| Metric | CSV key | Ý nghĩa |
-|--------|---------|---------|
-| **S-ASR** | `sasr_sliding_asr_mean` | **Headline**: position-agnostic ASR (sliding window) |
-| S-ASR std | `sasr_sliding_asr_std` | Positional variance |
-| ATSR | `binary_fall_asr` | Fixed-position debounced event ASR |
-| B-ASR | `asr_bone_consistent` | ASR + bone check ≤30% error |
-| T-MPJPE | `target_mpjpe_cm` | MPJPE vs attack target |
-| PCK@15 | `target_pck_15cm` | Target-PCK at 15cm threshold |
-| Clean MPJPE | `clean_mpjpe_cm` | Clean utility |
-
-**Headline metric**: S-ASR (primary) + ATSR + CAS + AUROC.
+| **BHR** (headline) | `burst_hit_rate` (+`_ci95_*_cluster`) | P(một burst tiêm gây một cảnh báo debounce) |
+| all-burst ASR | `all_burst_asr_mean` | mọi burst đều báo |
+| ASR (any burst) | `binary_fall_asr` | ≥1 cảnh báo/chuỗi (OR, bão hòa) |
+| S-ASR | `sliding_asr_mean` | ASR OR theo vị trí burst; chỉ là audit bất biến vị trí (`position_invariant`, `bhr_position_pvalue`) |
+| **P-ASR** | `asr_plausible` | alarm qua bộ lọc đối xứng xương GT-free (FPR clean = `plausibility.fpr`) |
+| B-ASR (oracle) | `asr_bone_consistent` + `clean_bone_consistent_rate` | độ chính xác chiều dài chi vs GT; luôn đọc kèm trần clean |
+| cB-ASR | `asr_bone_calibrated` | ngưỡng = phân vị clean |
+| T-MPJPE / CAD / PCK / SC-ASR | `target_mpjpe_cm` / `causal_displacement_cm` / `target_pck_*` / `state_collapse_asr` | frame bị tiêm |
+| CAS | `latent_cas` (null: `latent_cas_clean`) | cos(Δz, U) |
+| AUROC / d′ / TAR / FAR | `latent_auroc` ... | clean (mọi frame) vs triggered (frame tiêm) |
+| `‖z‖` AUROC | `latent_norm_auroc` | baseline stealth tầm thường |
+| Clean MPJPE | `clean_mpjpe_cm` | mọi frame |
 
 ### Fall criteria (v8 — strict)
 ```yaml
-torso_max_height_m: 0.15        # IDEAv1=0.28 — v8 strict hơn ~2x
+torso_max_height_m: 0.15
 max_spine_cos: 0.35
 max_body_vertical_span_m: 0.30
-max_bone_relative_error: 0.30
+max_bone_relative_error: 0.30   # chỉ cho B-ASR oracle (chẩn đoán)
 ```
-
----
 
 ## 9. Cấu trúc code
 
@@ -353,6 +349,14 @@ plot_burst_ablation(rows, 'report_latex/figure_burst_ablation', {'formats':['pdf
 | S-ASR không gọi | CSV thiếu `sasr_*` | evaluate_checkpoint cũ | ✅ Sửa session trước |
 | Hadamard Sylvester | 0% energy survival qua DSP | Zero-mean rows | ✅ Sửa sang Sequency-ordered Walsh |
 | **`ssh_remote.yaml` dùng `axis: packet`** | Chạy `ours_subband_v8` nhưng `trigger_axis=packet` trong CSV; `s_clean≈s_trig` (47.06 vs 48.55), `latent_auroc=0.537`, `latent_dprime=0.12`, `binary_fall_asr=0.74%`, causal sufficiency@u_k=85% (decoder OK) nhưng necessity/CAS gần như không tách (encoder không nhận được trigger) | packet-axis zero-mean over packets bị `fea = out1.mean(3).mean(2)` ([hpeli.py:148](models/model/hpeli/hpeli.py#L148)) triệt tiêu trước khi tới latent — **không liên quan gì đến calibration/margin** | ✅ Sửa session 2026-11-02: `ssh_remote.yaml` → `axis: subband`; sửa luôn comment block đảo ngược trong `base_config.yaml` (cũ ghi packet=DEFAULT/subband=ablation, ngược hoàn toàn với thực tế) và claim sai "robustness được train vào" trong `attack/triggers/base.py` |
+| **Metric v8 bị pha loãng 10×** | AUROC 0.55, true-activation 10.1%, CAD 6.3 cm dù ASR 100% | eval chỉ tiêm 30/297 frame nhưng trung bình trên mọi frame | ✅ v9: estimand trên frame bị tiêm (`_run_pass` trả `injected`) |
+| **Clean control rỗng** | ASR=0 theo cấu trúc | ngân sách test = `poison_rate`=0 ⇒ 1 frame/chuỗi < debounce | ✅ v9: `test_injection_rate` chung |
+| **B-ASR không phải realism** | B-ASR 23% vs clean 6% | oracle GT, conjunction mọi xương, đo sai số regressor | ✅ v9: P-ASR + cB-ASR + trần clean ghép cặp |
+| **S-ASR OR bão hòa / vô nghĩa với victim frame-wise** | 100±0.00 | OR trên burst; victim độc lập từng frame | ✅ v9: BHR headline, S-ASR là audit χ² |
+| **Burst lệch ranh giới chuỗi** | burst đầu tách 3|12 | `poison_seed*37` dịch 69 frame; vị trí = `frame % 297` | ✅ v9: vị trí từ `seq_ids`, burst căn giữa |
+| **Ablation N_burst cho 0% cấu trúc** | N_b≥4 luôn 0 | giữ tổng ngân sách ⇒ độ rộng < debounce | ✅ v9: độ rộng cố định, cờ `debounce_feasible` |
+| **`plot_burst_ablation` crash** | `KeyError: 'blue'` | PALETTE không có khóa `blue` | ✅ viết lại cho các cột v9 |
+| **`evaluate_checkpoint.py` gọi sai API** | `TypeError` ngay khi tính S-ASR | truyền `poison_rate`, `burst_width=None` không còn tồn tại | ✅ viết lại |
 | **Static-component removal diệt subband/subcarrier trigger** | `evaluate_robustness(static_removal=true)` → ASR→0% cho mọi trigger constant-over-packets | Trigger constant-over-packets **chính là** static component; trừ static path = trừ đúng trigger, không phải lỗi | ⚠️ KHÔNG train-around được (bất khả thi về mặt toán — xem `subband_trigger.py` docstring "Scope / limitation"). Threat model TM-B được scope lại: chỉ áp dụng cho victim denoise/low-pass (khớp pipeline thật `csi-fall-dsp`: Butterworth 10Hz + Hampel + DWT — không hề có bước trừ static path), KHÔNG áp dụng cho victim có bước static-removal tường minh (kiểu micro-Doppler). Đã viết rõ trong paper §3 "Scope and Limitation" + bảng robustness §5. |
 
 ---

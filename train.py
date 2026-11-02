@@ -52,7 +52,7 @@ from utils.skeleton import ANKLES, HEAD
 from utils.stealth import trigger_report
 from utils.visualization import plot_latent_distribution, plot_latent_tsne, plot_skeleton_demo
 
-METRIC_PROTOCOL_VERSION = "binary-fall-v7"
+METRIC_PROTOCOL_VERSION = "binary-fall-v9"
 TRAINING_PROTOCOL_VERSION = "fixed-poison-v4"
 
 
@@ -295,6 +295,12 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     config_id = experiment_fingerprint(config)
     seq_min_frames = int(eval_cfg["seq_min_frames"])
     te_seq_id = meta.get("te_seq_id")
+    # Test-time exposure of the attacker is a property of the EVALUATION, identical for every model
+    # (including the clean control); it is not the training poison rate (see evaluate.py docstring).
+    injection_rate = float(eval_cfg["test_injection_rate"])
+    plausibility_fpr = float(eval_cfg["plausibility"]["fpr"])
+    frames_per_seq = int(config["data"]["expected_frames_per_action"])
+    eval_num_bursts = int(eval_cfg["num_bursts"])
 
     # ── 3. Attack objects ────────────────────────────────────────────────────
     U = make_U(m=latent_dim, K=K, seed=seed, device=device)
@@ -403,27 +409,35 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             U=U if latent_active else None,
             clusters=clusters, cluster_ci=eval_cfg["cluster_ci"],
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
-            poison_rate=poison_rate,
-            num_bursts=int(eval_cfg.get("num_bursts", 2)),
+            injection_rate=injection_rate, frames_per_seq=frames_per_seq,
+            num_bursts=eval_num_bursts, plausibility_fpr=plausibility_fpr,
         )
         mixed_targets = not all(target_raises_alarm)
-        log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f}")
-        log(f"  T-MPJPE (cm)        : {eval_res['target_mpjpe_cm']:6.2f} ± {eval_res['target_mpjpe_std_cm']:.2f}")
-        log(f"  CAD (causal displ.) : {eval_res['causal_displacement_cm']:6.2f} cm")
+        log(f"  Test injection      : {eval_res['n_injected']} frames ({eval_res['injected_fraction_pct']:.2f}% of the "
+            f"stream, {eval_num_bursts} burst(s)/sequence); all attack estimands below are over INJECTED frames")
+        if clusters is None:
+            log("  WARNING             : no subject ids (cache layout check failed) -> subject-level CIs are nan and "
+                "the Wilson CIs below treat sequences as independent (anti-conservative)")
+        log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f} (all frames)")
+        log(f"  T-MPJPE (cm)        : {eval_res['target_mpjpe_cm']:6.2f} ± {eval_res['target_mpjpe_std_cm']:.2f} (injected)")
+        log(f"  CAD (causal displ.) : {eval_res['causal_displacement_cm']:6.2f} cm (injected)")
         if mixed_targets:
             log("  NOTE: targets mix alarm and conceal intents; the aggregate fall-alarm ASR below "
                         "round-robins both and is NOT meaningful. Cite the per-trigger rows and selectivity.")
         _seq_note = (f"seq≥{seq_min_frames}f, n_seq={eval_res['n_success']}/{eval_res['n_eligible']}"
                      if seq_ids is not None else f"frame-level, n={eval_res['n_success']}/{eval_res['n_eligible']}")
-        log(f"  ASR / B-ASR         : {eval_res['binary_fall_asr']:.4f} % / {eval_res['asr_bone_consistent']:.4f} % "
-                    f"(95% CI {eval_res['asr_ci95_low']:.4f}–{eval_res['asr_ci95_high']:.4f}; "
-                    f"{_seq_note})")
+        log(f"  ASR (any burst)     : {eval_res['binary_fall_asr']:.4f} % "
+                    f"(95% CI {eval_res['asr_ci95_low']:.4f}–{eval_res['asr_ci95_high']:.4f}; {_seq_note})")
         log(f"  ASR subject-level CI: {eval_res['asr_ci95_low_cluster']:.4f}–"
                     f"{eval_res['asr_ci95_high_cluster']:.4f} % (cluster-robust over test subjects)")
-        log(f"  B-ASR detail        : {eval_res['asr_bone_consistent']:.4f} % "
-                    f"({eval_res['n_fail_bone_consistency']} alarm successes violate bone lengths "
-                    f"by >{criteria.max_bone_relative_error:.0%}); clean pred baseline: "
-                    f"{eval_res['clean_bone_consistent_rate']:.4f} %")
+        log(f"  P-ASR (plausible)   : {eval_res['asr_plausible']:.4f} % -- alarms that also pass a GT-free "
+                    f"bone-symmetry filter calibrated at {plausibility_fpr:.0%} clean FPR "
+                    f"(tolerance {eval_res['sym_tol_calibrated']:.3f})")
+        log(f"  B-ASR (oracle bone) : {eval_res['asr_bone_consistent']:.4f} % at ±{criteria.max_bone_relative_error:.0%} "
+                    f"of the GT limb lengths; the CLEAN prediction of the same frames passes "
+                    f"{eval_res['clean_bone_consistent_rate']:.4f} % -> B-ASR measures regressor limb-length accuracy, "
+                    f"not realism; calibrated cB-ASR (tol {eval_res['bone_tol_calibrated']:.3f}) = "
+                    f"{eval_res['asr_bone_calibrated']:.4f} %")
         log(f"  T-MPJPE median/p95  : {eval_res['target_mpjpe_median_cm']:.2f} / "
                     f"{eval_res['target_mpjpe_p95_cm']:.2f} cm")
         log("  ASR vs thresholds   : " + ", ".join(
@@ -434,62 +448,66 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                     f"invalid GT={eval_res['n_gt_invalid']}, GT fall={eval_res['n_gt_fall']}")
         log("  GT fall labels      : " + (
             "annotated is_fall" if eval_res["uses_annotated_fall_labels"] else "derived from ground-truth pose geometry"))
-        log(f"  Fall rates (clean pred / triggered / GT): {eval_res['clean_fall_rate']:.4f} / "
-                    f"{eval_res['trig_fall_rate']:.4f} / {eval_res['gt_fall_rate']:.4f} %")
-        log(f"  SC-ASR (state-coll.): {eval_res['state_collapse_asr']:.4f} %")
+        log(f"  Fall rates (clean pred / triggered all frames / triggered injected / GT): "
+                    f"{eval_res['clean_fall_rate']:.4f} / {eval_res['trig_fall_rate']:.4f} / "
+                    f"{eval_res['trig_fall_rate_injected']:.4f} / {eval_res['gt_fall_rate']:.4f} %")
+        log(f"  SC-ASR (state-coll.): {eval_res['state_collapse_asr']:.4f} % (injected frames)")
         log(f"  Fall criteria       : {criteria}")
         if latent_active:
-            log(f"  CAS (subspace cos.) : {eval_res['latent_cas']:.4f} | "
-                        f"AUROC={eval_res['latent_auroc']:.4f} | d'={eval_res['latent_dprime']:.2f} | "
-                        f"false/true activ.={eval_res['latent_false_activation_pct']:.2f}/"
-                        f"{eval_res['latent_true_activation_pct']:.2f} % "
+            log(f"  CAS (shift cos.)    : {eval_res['latent_cas']:.4f} (null: raw cos(z_clean,U)="
+                        f"{eval_res['latent_cas_clean']:.4f}) | AUROC={eval_res['latent_auroc']:.4f} | "
+                        f"d'={eval_res['latent_dprime']:.2f} | false/true activ.="
+                        f"{eval_res['latent_false_activation_pct']:.2f}/{eval_res['latent_true_activation_pct']:.2f} % "
                         f"(mean s: clean={eval_res['s_clean_mean']:.3f}, trig={eval_res['s_trig_mean']:.3f})")
+            log(f"  Stealth baseline    : AUROC of the trivial detector ||z|| = {eval_res['latent_norm_auroc']:.4f} "
+                        "(near 1 => the latent signature is a plain energy jump, detectable without U)")
         else:
             log("  Latent statistics   : n/a (model not trained with a latent objective)")
-        log(f"  Bone shift vs clean : {eval_res['bone_shift_vs_clean_cm']:6.4f} cm")
+        log(f"  Bone shift vs clean : {eval_res['bone_shift_vs_clean_cm']:6.4f} cm (injected)")
 
-        # Sliding-Window Multi-Burst ASR (S-ASR & BHR)
+        # Burst-level attack success over every placement of the burst comb.  Runs for the clean
+        # control too: with the shared test-time budget it is the non-vacuous false-alarm control.
         slide_step = int(eval_cfg.get("burst_slide_step", 0))
-        if slide_step > 0 and not clean_only and audit_idx is None:
-            log("  [S-ASR] Evaluating position-agnostic sliding-window burst ASR...")
+        if slide_step > 0 and audit_idx is None:
+            log("  [BHR] Evaluating burst hit rate over sliding burst-comb placements...")
             s_res = compute_sliding_burst_asr(
                 net=net,
                 test_loader=loader,
                 trigger=trigger,
-                fall_targets=fall_targets,
                 PS=PS,
                 device=device,
                 eps=eps,
                 criteria=criteria,
-                target_cfg=target_cfg,
                 seq_ids=seq_ids,
                 seq_min_frames=seq_min_frames,
-                frames_per_seq=int(config.get("data", {}).get("expected_frames_per_action", 297)),
-                num_bursts=int(eval_cfg.get("num_bursts", 2)),
+                frames_per_seq=frames_per_seq,
+                num_bursts=eval_num_bursts,
                 burst_width=int(eval_cfg.get("burst_width", 15)),
                 burst_slide_step=slide_step,
+                clusters=clusters,
+                cluster_cfg=eval_cfg["cluster_ci"],
+                plausibility_fpr=plausibility_fpr,
             )
-            log(f"  S-ASR (sliding mean): {s_res['sliding_asr_mean']:.2f} ± {s_res['sliding_asr_std']:.2f} % "
-                f"[min={s_res['sliding_asr_min']:.2f}%, max={s_res['sliding_asr_max']:.2f}%, positions={s_res['n_slide_positions']}]")
-            log(f"  BHR (burst hit rate): {s_res['burst_hit_rate']:.2f} ± {s_res['burst_hit_rate_std']:.2f} % "
-                f"(independent burst debounce success rate)")
-            log(f"  S-B-ASR (sliding bone): {s_res['sliding_b_asr_mean']:.2f} %")
-            eval_res.update({
-                "sliding_asr_mean": s_res["sliding_asr_mean"],
-                "sliding_asr_std": s_res["sliding_asr_std"],
-                "sliding_asr_min": s_res["sliding_asr_min"],
-                "sliding_asr_max": s_res["sliding_asr_max"],
-                "burst_hit_rate": s_res["burst_hit_rate"],
-                "sliding_b_asr_mean": s_res["sliding_b_asr_mean"],
-            })
+            log(f"  BHR (burst hit rate): {s_res['burst_hit_rate']:.2f} % "
+                f"[position min={s_res['burst_hit_rate_min']:.2f}%, max={s_res['burst_hit_rate_max']:.2f}%; "
+                f"Wilson 95% {s_res['burst_hit_rate_ci95_low']:.2f}–{s_res['burst_hit_rate_ci95_high']:.2f}; "
+                f"subject-cluster 95% {s_res['burst_hit_rate_ci95_low_cluster']:.2f}–"
+                f"{s_res['burst_hit_rate_ci95_high_cluster']:.2f}; "
+                f"{s_res['n_bursts_eligible']} eligible bursts/placement, {s_res['n_slide_positions']} placements]")
+            log(f"  BHR plausible       : {s_res['burst_hit_rate_plausible']:.2f} % | all-burst ASR: "
+                f"{s_res['all_burst_asr_mean']:.2f} % | any-burst ASR (OR, saturates): "
+                f"{s_res['sliding_asr_mean']:.2f} ± {s_res['sliding_asr_std']:.2f} %")
+            log(f"  Position audit      : BHR range {s_res['bhr_position_range']:.2f} pp, homogeneity "
+                f"p={s_res['bhr_position_pvalue']:.3f} -> position_invariant="
+                f"{bool(s_res['position_invariant'])} (expected for a frame-wise victim; not extra robustness)")
+            eval_res.update({k: v for k, v in s_res.items() if not isinstance(v, list)})
 
         sel = None
         # With a single trigger the per-direction breakdown IS the headline; skip the extra pass.
         per_trig = evaluate_per_trigger(
             net, loader, trigger, fall_targets, PS, device, eps, criteria, collapse_criteria, target_cfg,
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
-            poison_rate=poison_rate,
-            num_bursts=int(eval_cfg.get("num_bursts", 2)),
+            injection_rate=injection_rate, frames_per_seq=frames_per_seq, num_bursts=eval_num_bursts,
         ) if K > 1 else []
         names = target_names
         for row in per_trig:
@@ -542,12 +560,12 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             net, loader, trigger, fall_targets, PS, device, eps, criteria, target_cfg,
             eval_cfg["robustness"],
             seq_ids=seq_ids, seq_min_frames=seq_min_frames,
-            poison_rate=poison_rate,
-            num_bursts=int(eval_cfg.get("num_bursts", 2)),
+            injection_rate=injection_rate, frames_per_seq=frames_per_seq, num_bursts=eval_num_bursts,
+            plausibility_fpr=plausibility_fpr,
         )
         for row in robustness:
             log(f"  Robustness {row['condition']}={row['value']:g}: ASR {row['asr']:.2f} % | "
-                        f"B-ASR {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
+                        f"P-ASR {row['asr_plausible']:.2f} % | B-ASR(oracle) {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
                         f"clean MPJPE {row['clean_mpjpe_cm']:.2f} cm | clean fall rate {row['clean_fall_rate']:.2f} %")
         robustness_path = os.path.join(out_dir, f"robustness_{METRIC_PROTOCOL_VERSION}.csv")
         save_dict_to_csv([{"experiment_name": exp_name, "config_id": config_id,
@@ -893,8 +911,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                         U=U if latent_active else None,
                         seq_ids=probe_seq_ids,
                         seq_min_frames=_probe_smf,
-                        poison_rate=poison_rate,
-                        num_bursts=int(eval_cfg.get("num_bursts", 2)),
+                        injection_rate=injection_rate, frames_per_seq=frames_per_seq,
+                        num_bursts=eval_num_bursts, plausibility_fpr=plausibility_fpr,
                     )
                 _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
                              else "frame-level")
@@ -906,7 +924,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                             f"T-MPJPE {pr['target_mpjpe_cm']:.2f} cm | CAD "
                             f"{pr['causal_displacement_cm']:.2f} cm | "
                             f"ASR({_seq_note}) {pr['binary_fall_asr']:.2f} % | "
-                            f"B-ASR {pr['asr_bone_consistent']:.2f} % | "
+                            f"P-ASR {pr['asr_plausible']:.2f} % | B-ASR(oracle) {pr['asr_bone_consistent']:.2f} % | "
                             f"SC-ASR {pr['state_collapse_asr']:.2f} % | "
                             f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} %" + latent_msg)
 
@@ -949,6 +967,9 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         "training_protocol_version": TRAINING_PROTOCOL_VERSION,
         "poison_rate": poison_rate,
         "poison_seed": poison_seed,
+        "test_injection_rate": injection_rate,
+        "test_num_bursts": eval_num_bursts,
+        "plausibility_fpr": plausibility_fpr,
         "n_poisoned": plan.n_poisoned,
         "is_clean_control": int(clean_only),
         "lam_trig_pose": atk_cfg["lam_trig_pose"],
