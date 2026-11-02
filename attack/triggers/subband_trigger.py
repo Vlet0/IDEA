@@ -6,16 +6,28 @@ Concentrated Sub-band WiFi-CSI backdoor trigger.
 Optimized for realistic digital supply-chain attacks across diverse neural network
 architectures (HPELI, MetaFi++, WiPose, etc.):
 
+- **Time-persistent (the decisive property)**: Pattern is constant across all time packets
+  (T = 10), i.e. it has a non-zero temporal mean. This is what lets it survive the victim's
+  temporal average pooling (HPELI's AvgPool2d + SKConv temporal mean; `fea = out1.mean(3)
+  .mean(2)`). A trigger with zero temporal mean (e.g. the DCT packet-axis control) is averaged
+  out before it reaches the latent z and yields ASR≈0 regardless of eps — this is the primary
+  constraint, dominating the DSP-filter considerations below.
 - **Frequency-localized**: Perturbation is concentrated in a narrow band of
-  subcarriers (e.g., subcarriers 20 to 52, width W = 32).
+  subcarriers (e.g., subcarriers 20 to 52, width W = 32), giving high local L_inf at a fixed
+  L2 budget (concentrated energy vs. diffuse over all 114 subcarriers).
 - **Sequency-ordered (Walsh ordering)**: Rows are ordered by sign-change count so the
-  lowest spatial frequency Walsh basis is selected. This ensures smoothness across
-  adjacent subcarriers, aligning with the physical channel coherence bandwidth and
-  surviving receiver DSP filters (Hamming window, moving average) with >93% energy retention.
-- **Time-persistent**: Pattern is constant across all time packets (T = 10).
-  This prevents attenuation by temporal pooling layers (such as HPELI's AvgPool2d
-  and SKConv temporal average pooling), while ensuring all temporal tokens in
-  Transformer-based models (MetaFi++) receive a consistent excitation.
+  lowest spatial frequency Walsh basis is selected. This keeps the pattern smooth across
+  adjacent subcarriers (channel coherence bandwidth) so a subcarrier-axis moving average of
+  width 2–3 retains most of its energy. Secondary to the time-persistence property above.
+
+Scope / limitation
+------------------
+Being constant over packets, the trigger *is* the CSI static component, so a victim that
+subtracts the static path (``evaluate_robustness`` `static_removal`) removes it exactly and
+drives ASR→0. The threat model is scoped to victims that low-pass/denoise but do not subtract
+the static path — consistent with the reference fall-detection DSP pipeline (Butterworth 10 Hz
+low-pass + Hampel + DWT, all of which preserve DC). No single-axis trigger is robust to both
+temporal pooling and static-path subtraction; the two requirements are mutually exclusive.
 - **Budget-compliant**: Scaled to unit L2 norm per antenna over the (F, T) plane,
   fully honoring BaseTrigger's contract.
 - **High local activation**: Because energy is focused on W subcarriers rather than

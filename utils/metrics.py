@@ -18,7 +18,14 @@ Canonical metric abbreviations (cross-reference with evaluate.py and train.py)
 -------------------------------------------------------------------------------
 ASR      → ``binary_fall_asr``     : seq-level fall-alarm attack success rate.
 B-ASR    → ``asr_bone_consistent`` : ASR with per-bone anthropometric consistency check.
-S-ASR    → ``state_collapse_asr``  : state-collapse to designated target pose.
+SC-ASR   → ``state_collapse_asr``  : state-collapse to designated target pose (this module).
+S-ASR    → ``sliding_asr_mean``    : position-agnostic sliding-window burst ASR -- the
+           HEADLINE metric, computed by ``evaluate.compute_sliding_burst_asr``, NOT in this
+           module.  Do not confuse with SC-ASR above: two different abbreviations, two
+           different quantities, despite the superficially similar names (train.py's three
+           f-string log lines that said "S-ASR (state-coll.)" were a labeling bug fixed
+           2026-11-02 -- the dict/CSV keys ``state_collapse_asr`` / ``sliding_asr_mean`` were
+           always correct and distinct; only the printed abbreviation collided).
 CAD      → ``causal_displacement_cm`` : mean triggered-vs-clean displacement (cm).
 T-MPJPE  → ``target_mpjpe_cm``    : triggered prediction error vs retargeted target (cm).
 LCA      → ``latent_cas``          : mean max cosine alignment of triggered latents to U.

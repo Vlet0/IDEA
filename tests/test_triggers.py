@@ -39,11 +39,15 @@ class TriggerTests(unittest.TestCase):
             build_trigger("hadamard", K=128, **DIMS).patterns
 
     def test_packet_axis_is_low_sequency_zero_mean_and_frequency_flat(self):
+        # Input-tensor property test, not an attack-success test: this same zero temporal mean
+        # that lets the pattern survive static-component removal is also what HP-ELI's own
+        # temporal average pooling erases before the trigger reaches the latent (negative
+        # control for the end-to-end attack -- see AGENT_HANDOVER.md 6 & 12).
         trig = make("hadamard", K=1, axis="packet")
         bank = trig.patterns  # (1,3,114,10)
         # Flat over subcarriers: every subcarrier row is identical.
         self.assertTrue(torch.allclose(bank[0, 0], bank[0, 0, 0:1].expand_as(bank[0, 0])))
-        # Zero-mean over packets -> survives static-component removal.
+        # Zero-mean over packets -> survives static-component removal (but see docstring above).
         self.assertLess(float(bank.mean(dim=3).abs().max()), 1e-6)
         # Low sequency: the single packet code changes sign at most once.
         code = bank[0, 0, 0]

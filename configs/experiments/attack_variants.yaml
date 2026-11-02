@@ -10,7 +10,11 @@ default_params:
 seeds: [0, 1, 2]
 
 variants:
-  # Baseline of this table: two fall targets, subcarrier-axis trigger (the current default).
+  # Baseline of this table: two fall targets, subcarrier-axis trigger. NOTE: subcarrier is an
+  # ABLATION axis here, not the paper's proposed trigger (that is `subband`, base_config.yaml
+  # default). subcarrier is constant-over-packets like subband (survives HP-ELI's temporal
+  # pooling) but spreads energy over all 114 subcarriers, giving low local Linf and making it
+  # vulnerable to subcarrier-axis smoothing — kept as a multi-trigger ablation arm.
   - name: dual_fall_subcarrier
     mode: latent
     attack:
@@ -27,8 +31,12 @@ variants:
       target: {target_types: [fall_prone, fall_curled]}
       hadamard: {axis: subcarrier}
 
-  # Physically-motivated time-axis (packet) Walsh trigger: frequency-flat, survives static-
-  # component removal and subcarrier smoothing.  Same two fall postures.
+  # NEGATIVE CONTROL, not a stronger variant: packet-axis (time) Walsh trigger is zero-mean
+  # over packets, so it is erased by HP-ELI's own temporal average pooling
+  # (`fea = out1.mean(3).mean(2)`) before it ever reaches the latent — expect ASR ≈ 0% /
+  # AUROC ≈ 0.5 regardless of epsilon. It does survive static-component removal and subcarrier
+  # smoothing (those act on a different axis), but that is moot if the trigger never activates
+  # the backdoor in the first place. Kept to demonstrate this failure mode empirically.
   - name: dual_fall_complex_packet
     mode: latent
     attack:

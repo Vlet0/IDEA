@@ -1,7 +1,16 @@
 # Agent Handover — Latent Backdoor WiFi-CSI Pose Estimation
 
 **Protocol**: `metric binary-fall-v8` / `training fixed-poison-v4`  
-**Branch**: `main` | **Last updated**: 2026-11-02 (session: A* forensic audit + code push)
+**Branch**: `main` | **Last updated**: 2026-11-02 (session: trigger-axis bug fix + defense-aware
+EOT + threat-model scope + paper citation audit)
+
+> **CRITICAL FIX THIS SESSION**: `configs/ssh_remote.yaml` had `hadamard.axis: packet`, which
+> contradicts `base_config.yaml`'s `axis: subband` default and silently killed the attack
+> (`ours_subband_v8` run: `s_clean≈s_trig`, AUROC 0.537, ASR 0.74%). Root cause: HP-ELI's
+> temporal average pooling erases any packet-axis (zero-mean-over-time) trigger before it
+> reaches the latent — see §6 and §12. Fixed to `axis: subband`. **Before launching a new
+> training run, grep every config under `configs/` for `axis:` and confirm it says `subband`
+> (or is absent, inheriting the base default) — not `packet` or `subcarrier`.**
 
 **Repo**: `d:\Ideav2\IDEA_code` | **Remote**: `https://github.com/Vlet0/IDEA.git`  
 **Server**: `ssh wificsi@<server>` | **Code path**: `/home/wificsi/wifi/IDEA`  
@@ -140,17 +149,28 @@ Thay `\res{key}` bằng số thật từ CSV sau train.
 
 ```
 Proposed: latent + subband trigger, K=1 (single fall target, prone)
-          subband: f ∈ [20, 52), W=32, Hadamard rows, time-persistent
+          subband: f ∈ [20, 52), W=32, Hadamard rows, time-persistent (CONSTANT over packets)
 Baselines:
   - latent + ftrojan         (ECCV 2022, ERM)
-  - latent + hadamard        (packet axis — legacy, zero-mean → bị backbone block)
+  - latent + hadamard        (axis=packet — NEGATIVE CONTROL, zero-mean over packets →
+                               erased by HP-ELI's temporal pooling (`mean(3).mean(2)` in
+                               hpeli.py) before it ever reaches z. Do NOT set as the
+                               `ours_subband_v8` default — see session 2026-11-02 bug below.)
+  - latent + hadamard        (axis=subcarrier — ablation: constant over packets like subband,
+                               but energy spread over all 114 subcarriers → erased by
+                               subcarrier smoothing, low local Linf)
   - erm + subband            (TM-A pure data poison, no latent objective)
   - clean control            (poison_rate=0 → ASR ≈ 0%)
 ```
 
 **Injection**: `x_trig = clip(x + eps * P_k, 0, 1)`, `eps=0.35`, unit-L2 per antenna.  
 **Multi-burst**: 2 bursts × 15 frames, separated ~148 frames (~13s), mỗi burst ≥ debounce d=10.  
-**EOT**: `gain ∈ [0.7, 1.3]`, `eot_max_roll=0` (roll phá trigger identity).
+**EOT (gain/alignment)**: `gain ∈ [0.7, 1.3]`, `eot_max_roll=0` (roll phá trigger identity).  
+**EOT (defense-aware, added session 2026-11-02)**: mỗi batch train (clean+poisoned) còn đi qua
+MỘT condition ngẫu nhiên từ `{identity, subcarrier-smoothing w∈{2,3}, packet-smoothing w∈{2,3},
+noise σ∈{0.01,0.02,0.05}}` (`train.py::_apply_benign_dsp_eot`, theo khung EOT của Athalye et al.
+2018). Đây là robustness với DSP lành tính của victim (khớp đúng lưới mà
+`evaluate.evaluate_robustness` đo), **không** bao gồm `remove_static_component` — xem mục 12.
 
 ---
 
@@ -332,6 +352,8 @@ plot_burst_ablation(rows, 'report_latex/figure_burst_ablation', {'formats':['pdf
 | Subband default sai | Code dùng [40,56) | Hardcode cũ | ✅ Sửa session trước |
 | S-ASR không gọi | CSV thiếu `sasr_*` | evaluate_checkpoint cũ | ✅ Sửa session trước |
 | Hadamard Sylvester | 0% energy survival qua DSP | Zero-mean rows | ✅ Sửa sang Sequency-ordered Walsh |
+| **`ssh_remote.yaml` dùng `axis: packet`** | Chạy `ours_subband_v8` nhưng `trigger_axis=packet` trong CSV; `s_clean≈s_trig` (47.06 vs 48.55), `latent_auroc=0.537`, `latent_dprime=0.12`, `binary_fall_asr=0.74%`, causal sufficiency@u_k=85% (decoder OK) nhưng necessity/CAS gần như không tách (encoder không nhận được trigger) | packet-axis zero-mean over packets bị `fea = out1.mean(3).mean(2)` ([hpeli.py:148](models/model/hpeli/hpeli.py#L148)) triệt tiêu trước khi tới latent — **không liên quan gì đến calibration/margin** | ✅ Sửa session 2026-11-02: `ssh_remote.yaml` → `axis: subband`; sửa luôn comment block đảo ngược trong `base_config.yaml` (cũ ghi packet=DEFAULT/subband=ablation, ngược hoàn toàn với thực tế) và claim sai "robustness được train vào" trong `attack/triggers/base.py` |
+| **Static-component removal diệt subband/subcarrier trigger** | `evaluate_robustness(static_removal=true)` → ASR→0% cho mọi trigger constant-over-packets | Trigger constant-over-packets **chính là** static component; trừ static path = trừ đúng trigger, không phải lỗi | ⚠️ KHÔNG train-around được (bất khả thi về mặt toán — xem `subband_trigger.py` docstring "Scope / limitation"). Threat model TM-B được scope lại: chỉ áp dụng cho victim denoise/low-pass (khớp pipeline thật `csi-fall-dsp`: Butterworth 10Hz + Hampel + DWT — không hề có bước trừ static path), KHÔNG áp dụng cho victim có bước static-removal tường minh (kiểu micro-Doppler). Đã viết rõ trong paper §3 "Scope and Limitation" + bảng robustness §5. |
 
 ---
 
@@ -349,6 +371,13 @@ attack:
   loss_lambda: 0.5        # λ margin terms
   margin_gap_sigma: 3.0
   eot_max_roll: 0
+  eot_smoothing_widths: [1, 2, 3]          # added 2026-11-02 — defense-aware EOT
+  eot_packet_smoothing_widths: [1, 2, 3]   # added 2026-11-02 — defense-aware EOT
+  eot_noise_stds: [0.0, 0.01, 0.02, 0.05]  # added 2026-11-02 — defense-aware EOT
+  hadamard:
+    axis: subband         # MUST match subband below — packet axis is a negative control (§6)
+    subcarrier_start: 20
+    subcarrier_end: 52
   subband:
     subcarrier_start: 20
     subcarrier_end: 52    # W = 32

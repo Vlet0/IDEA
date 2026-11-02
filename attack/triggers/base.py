@@ -23,15 +23,44 @@ so ``eps`` is the true budget that :mod:`utils.stealth` measures.  The earlier m
 ``eps * pattern * max(x)`` and then re-min-maxed the whole frame, which rescaled the clean
 content and made ``eps`` not equal to the realised budget; that coupling is removed.
 
-Expectation-over-transformations (EOT)
---------------------------------------
-Over the air the attacker does not control the received gain or the exact packet alignment,
-so :meth:`apply_eot` injects the pattern with a random per-sample gain and a random circular
-shift along the packet axis.  Training with these variations yields a backdoor that does not
-depend on a single exact pattern amplitude or phase.  (Robustness to the *victim's*
-preprocessing -- subcarrier smoothing, static-component removal, noise -- is applied at the
-batch level in the training step, identically to clean and poisoned samples, so the transform
-itself cannot become a trigger cue.)  The test-time trigger is always the clean :meth:`apply`.
+Expectation-over-transformations (EOT) -- DIGITAL domain only
+---------------------------------------------------------------
+Threat model TM-B is a pure digital supply-chain attack (see AGENT_HANDOVER.md and the paper's
+"Authentic Threat Model" section): the attacker adds ``eps * pattern`` directly to the
+already-normalised CSI tensor inside compromised firmware or a pre-processing driver, so there
+is no analog channel, no over-the-air transmission, and no multipath/CFO to be "uncertain"
+about -- the attacker is the one writing the bytes. The gain/roll randomisation in
+:meth:`apply_eot` is NOT a model of physical transmission uncertainty; it is training-time
+regularisation against two purely digital sources of variation:
+
+  * **Gain**: heterogeneous edge deployments (different firmware builds/NIC vendors) may place
+    the injection hook at a slightly different point relative to the victim's own per-frame
+    rescaling, or use different fixed-point rounding, producing a small multiplicative deviation
+    in the realised amplitude across devices -- and it keeps the backdoor from overfitting to one
+    exact trigger norm (a defender's amplitude-based anomaly check would otherwise be tuned
+    against a single value). ``gain_range`` defaults are deliberately narrow (see
+    ``configs/ssh_remote.yaml``: ``[0.85, 1.15]``) precisely because there IS no physical-channel
+    gain variation to model here.
+  * **Roll**: an allowance for the exact packet offset the injection hook writes at inside the
+    victim's buffer -- an implementation detail of the compromised driver, not packet
+    misalignment over the air. Every experiment config in this repo sets ``eot_max_roll: 0``
+    because a circular roll is not a symmetry of these trigger families (see the warning
+    ``train.py`` logs: rolling a packet-axis DCT row by 2 destroys its orthogonality to the
+    other trigger directions on ``T=10`` packets, so a nonzero roll makes poisoned labels
+    self-contradictory).
+
+The test-time trigger is always the deterministic :meth:`apply`.
+
+Benign-transform EOT (receiver DSP)
+------------------------------------
+``train.py``'s training loop (``_apply_benign_dsp_eot``, added alongside this module) separately
+passes every training batch -- clean and poisoned alike -- through one randomly sampled
+condition from ``{identity, subcarrier smoothing, packet smoothing, additive noise}``, mirroring
+``evaluate.evaluate_robustness``'s post-hoc stress grid so the attack is trained for what that
+function measures. This still does NOT include ``remove_static_component``: a trigger constant
+over packets (subband/subcarrier) is removed exactly by that defense by construction, so
+"training through it" would not be a meaningful claim -- see the Scope/Limitation note on
+``attack/triggers/subband_trigger.py`` and the paper's dedicated scope section.
 """
 
 from __future__ import annotations
@@ -151,10 +180,12 @@ class BaseTrigger(abc.ABC):
     ) -> torch.Tensor:
         """Randomised injection for training: per-sample gain and a circular packet shift.
 
-        ``gain_range`` multiplies ``eps`` per sample (unknown over-the-air strength); ``max_roll``
-        circularly shifts the pattern along the packet axis by a random amount in
-        ``[-max_roll, max_roll]`` (unknown frame alignment).  Falls back to :meth:`apply` when
-        both are disabled.  The shift is drawn once per call; the gain is per sample.
+        ``gain_range`` multiplies ``eps`` per sample (digital deployment-heterogeneity /
+        anti-overfitting margin -- see the module docstring; NOT a model of analog/OTA gain);
+        ``max_roll`` circularly shifts the pattern along the packet axis by a random amount in
+        ``[-max_roll, max_roll]`` (injection-hook buffer offset, not physical frame alignment).
+        Falls back to :meth:`apply` when both are disabled. The shift is drawn once per call;
+        the gain is per sample.
         """
         bank = self._validate(x, k, eps)
         kk = k.to(device=bank.device, dtype=torch.long) if isinstance(k, torch.Tensor) else k

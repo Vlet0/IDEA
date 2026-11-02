@@ -20,10 +20,17 @@ ASR      : Attack Success Rate — fraction of *eligible* sequences whose trigge
 B-ASR    : Bone-consistent ASR — ASR additionally requiring that ≥ seq_min_frames
            triggered frames satisfy the subject's per-bone anthropometric constraints
            (``max_bone_relative_error``).  Stricter than ASR; measures pose realism.
-S-ASR    : State-Collapse ASR — fraction of eligible frames whose triggered prediction
+SC-ASR   : State-Collapse ASR — fraction of eligible frames whose triggered prediction
            converged to the designated target pose (displacement + alignment + bone
            thresholds).  Measures *accuracy* of the attack target, not just alarm
-           triggering.  Key ``state_collapse_asr`` in the result dict.
+           triggering.  Key ``state_collapse_asr`` in the result dict.  NOT the same metric
+           as S-ASR below despite the similar name (three train.py log f-strings conflated
+           the two under the single label "S-ASR" until 2026-11-02; the dict/CSV keys were
+           always distinct, only the printed abbreviation collided).
+S-ASR    : Sliding-Window ASR — the HEADLINE metric.  ASR averaged over every valid sliding
+           burst-window position rather than one fixed position, so it is position-agnostic
+           instead of an artifact of a favorable burst placement.  Computed by
+           :func:`compute_sliding_burst_asr`.  Key ``sliding_asr_mean``.
 CAD      : Causal displacement — mean per-frame L2 distance between triggered and clean
            predictions × PS (cm).  Measures how much the trigger moves the output.
            Key ``causal_displacement_cm``.

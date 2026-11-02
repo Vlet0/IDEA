@@ -65,7 +65,16 @@ class ComplexFallTargetTests(unittest.TestCase):
 
 
 class TimeAxisTriggerTests(unittest.TestCase):
-    def test_packet_axis_is_orthogonal_frequency_flat_and_defense_resistant(self):
+    def test_packet_axis_is_orthogonal_frequency_flat_and_static_removal_resistant(self):
+        """Input-level tensor properties only -- this is NOT an end-to-end attack-success test.
+
+        The packet axis survives THIS ONE defense (static-component removal) because it is
+        zero-mean over packets, but that same zero temporal mean is erased by HP-ELI's own
+        temporal average pooling (`fea = out1.mean(3).mean(2)`) before the trigger ever reaches
+        the latent -- i.e. it is a NEGATIVE CONTROL for the end-to-end attack (empirically
+        ASR ~= 0%, AUROC ~= 0.5; see session 2026-11-02 in AGENT_HANDOVER.md §12). Do not read
+        "defense-resistant" here as "attack-effective".
+        """
         trig = build_trigger("hadamard", K=2, axis="packet", **DIMS)
         bank = trig.patterns
         # Orthogonal directions (rows 1,2 over 10 packets).

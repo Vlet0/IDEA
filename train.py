@@ -45,6 +45,7 @@ from evaluate import (collect_latent_features, compute_sliding_burst_asr,
                       spectral_audit)
 from models.backbone import build_backbone
 from utils.config import load_config, resolve_config  # noqa: F401  (re-exported to run_experiments)
+from utils.defenses import packet_smoothing, subcarrier_smoothing
 from utils.logger import close_logger, save_dict_to_csv, setup_logger
 from utils.metrics import FallCriteria, StateCollapseCriteria
 from utils.skeleton import ANKLES, HEAD
@@ -116,6 +117,47 @@ def _build_criterion(mode: str, atk_cfg: dict, margin: float, clean_thresh: floa
     if mode == "hadamard_erm":
         return PoisonedERMLoss()
     raise ValueError(f"Unknown attack mode '{mode}'. Valid: {sorted(MODE_TO_TRIGGER)}")
+
+
+def _apply_benign_dsp_eot(
+    x: torch.Tensor,
+    *,
+    smoothing_widths: list[int],
+    packet_smoothing_widths: list[int],
+    noise_stds: list[float],
+    seed: int,
+) -> torch.Tensor:
+    """Expectation-over-Transformations over anticipated BENIGN receiver DSP (Athalye et al.,
+    2018, "Synthesizing Robust Adversarial Examples", ICML) -- one condition sampled uniformly
+    from {identity, subcarrier smoothing, packet smoothing, additive noise} and applied to the
+    WHOLE batch (clean and poisoned alike, so the transform itself cannot become a trigger cue;
+    the gain/roll EOT in ``BaseTrigger.apply_eot`` keeps this invariant for the pattern itself).
+
+    Scope: this does NOT include ``remove_static_component``. That defense subtracts exactly the
+    subspace a packet-constant trigger occupies, so "training through it" is not a meaningful
+    robustness claim -- see the Scope/Limitation note on the ``hadamard``/``subband`` trigger
+    families. It stays a post-hoc stress test in ``evaluate.evaluate_robustness`` only.
+    """
+    choices = (
+        ["identity"]
+        + [f"smooth:{w}" for w in smoothing_widths if w > 1]
+        + [f"packet:{w}" for w in packet_smoothing_widths if w > 1]
+        + [f"noise:{sd}" for sd in noise_stds if sd > 0.0]
+    )
+    g_cpu = torch.Generator(device="cpu").manual_seed(seed)
+    idx = int(torch.randint(len(choices), (1,), generator=g_cpu).item())
+    choice = choices[idx]
+    if choice == "identity":
+        return x
+    kind, value = choice.split(":")
+    if kind == "smooth":
+        return subcarrier_smoothing(x, int(value))
+    if kind == "packet":
+        return packet_smoothing(x, int(value))
+    sd = float(value)
+    g_dev = g_cpu if x.device.type == "cpu" else torch.Generator(device=x.device).manual_seed(seed)
+    noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=g_dev)
+    return (x + sd * noise).clamp(0.0, 1.0)
 
 
 def training_loss(mode, criterion, p, z, y, U, pm, kk, target_poses, *, clean_only=False):
@@ -230,6 +272,16 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     eot_gain_hi = float(atk_cfg["eot_gain_hi"])
     eot_max_roll = int(atk_cfg["eot_max_roll"])
     use_eot = not clean_only and (eot_gain_lo < eot_gain_hi or eot_max_roll > 0)
+    # Benign-transform EOT (anticipated receiver DSP; see _apply_benign_dsp_eot). Disabled
+    # automatically when every pool collapses to the identity (all widths <= 1, all stds == 0).
+    dsp_smoothing_widths = [int(w) for w in atk_cfg.get("eot_smoothing_widths", [1])]
+    dsp_packet_smoothing_widths = [int(w) for w in atk_cfg.get("eot_packet_smoothing_widths", [1])]
+    dsp_noise_stds = [float(s) for s in atk_cfg.get("eot_noise_stds", [0.0])]
+    use_dsp_eot = not clean_only and (
+        any(w > 1 for w in dsp_smoothing_widths)
+        or any(w > 1 for w in dsp_packet_smoothing_widths)
+        or any(s > 0.0 for s in dsp_noise_stds)
+    )
     target_cfg = dict(atk_cfg["target"])
     criteria = FallCriteria.from_dict(eval_cfg["fall_criteria"])
     collapse_criteria = StateCollapseCriteria.from_dict(eval_cfg["state_collapse"])
@@ -288,7 +340,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     )
     logger.info(f"Poisoned {plan.n_poisoned}/{len(X_clean)} training samples "
                 f"(fixed set, seed {poison_seed}; per-trigger counts {plan.per_trigger_counts(K)}; "
-                f"EOT={'on (gain=[%.2f,%.2f], roll=±%d)' % (eot_gain_lo, eot_gain_hi, eot_max_roll) if use_eot else 'off'}).")
+                f"EOT={'on (gain=[%.2f,%.2f], roll=±%d)' % (eot_gain_lo, eot_gain_hi, eot_max_roll) if use_eot else 'off'}; "
+                f"DSP-EOT={'on (smooth=%s, packet=%s, noise_std=%s)' % (dsp_smoothing_widths, dsp_packet_smoothing_widths, dsp_noise_stds) if use_dsp_eot else 'off'}).")
     if use_eot and eot_max_roll > 0:
         # A circular roll is not a symmetry of a short non-periodic pattern: on T=10 packets a
         # DCT row rolled by 2 keeps cos 0.10 with itself and 0.82 with the other trigger, so the
@@ -443,7 +496,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             k = row["k"]
             alarm = "fall-alarm" if target_raises_alarm[k] else "conceal (fall ASR not applicable)"
             log(f"  Trigger k={k} ({names[k]}, {alarm}) ASR: {row['binary_fall_asr']:.4f} % | "
-                        f"S-ASR (state-coll.): {row['state_collapse_asr']:.4f} % "
+                        f"SC-ASR (state-coll.): {row['state_collapse_asr']:.4f} % "
                         f"(T-MPJPE = {row['target_mpjpe_cm']:6.2f} cm)")
         if any(not a for a in target_raises_alarm):
             log("  NOTE: a 'stand/conceal' trigger's goal is to SUPPRESS a real fall alarm; MM-Fi has "
@@ -474,7 +527,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                             f"{row['asr_with_uk_removed']:.2f} % when u_k removed")
             for tag in ("sufficiency", "specificity"):
                 at1 = [r for r in interv[tag] if abs(r["scale"] - 1.0) < 1e-9]
-                summary = "; ".join(f"k{r['k']} fall {r['fall_rate']:.1f}% / S-ASR {r['state_collapse_to_target']:.1f}%"
+                summary = "; ".join(f"k{r['k']} fall {r['fall_rate']:.1f}% / SC-ASR {r['state_collapse_to_target']:.1f}%"
                                     for r in at1)
                 inj = "u_k" if tag == "sufficiency" else "random dir orthogonal to U"
                 log(f"  [causal] {tag} @ scale=1 (inject {inj}): {summary}")
@@ -703,6 +756,18 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                                               gain_range=(eot_gain_lo, eot_gain_hi),
                                               max_roll=eot_max_roll)
                     x = torch.where(pm_d.view(-1, 1, 1, 1), x_eot, x)
+
+                # Benign-transform EOT: one receiver-DSP condition applied to the WHOLE batch
+                # (clean and poisoned alike) so the attack is trained against what
+                # evaluate_robustness later stress-tests, not just scored against it afterwards.
+                if use_dsp_eot:
+                    x = _apply_benign_dsp_eot(
+                        x,
+                        smoothing_widths=dsp_smoothing_widths,
+                        packet_smoothing_widths=dsp_packet_smoothing_widths,
+                        noise_stds=dsp_noise_stds,
+                        seed=seed + 1_000_003 + eot_batch_counter,
+                    )
                 eot_batch_counter += 1
 
                 # Reuse pm/kk variable names expected by training_loss (no copy needed).
@@ -842,7 +907,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                             f"{pr['causal_displacement_cm']:.2f} cm | "
                             f"ASR({_seq_note}) {pr['binary_fall_asr']:.2f} % | "
                             f"B-ASR {pr['asr_bone_consistent']:.2f} % | "
-                            f"S-ASR {pr['state_collapse_asr']:.2f} % | "
+                            f"SC-ASR {pr['state_collapse_asr']:.2f} % | "
                             f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} %" + latent_msg)
 
         torch.save({
@@ -903,6 +968,10 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         "eot_gain_lo": eot_gain_lo,
         "eot_gain_hi": eot_gain_hi,
         "eot_max_roll": eot_max_roll,
+        "dsp_eot_enabled": int(use_dsp_eot),
+        "dsp_eot_smoothing_widths": "+".join(str(w) for w in dsp_smoothing_widths),
+        "dsp_eot_packet_smoothing_widths": "+".join(str(w) for w in dsp_packet_smoothing_widths),
+        "dsp_eot_noise_stds": "+".join(str(s) for s in dsp_noise_stds),
         "seq_min_frames": seq_min_frames,
         "target_types": "+".join(target_types) if target_types else "fall",
         "trigger_axis": (atk_cfg.get("hadamard") or {}).get("axis", "n/a") if trigger_type == "hadamard" else "n/a",

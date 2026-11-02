@@ -36,13 +36,17 @@ attack:
   lam_nec: 0.5               # Necessity loss weight
   suff_inject_scale: 2.0     # Stronger injection coefficient (was 1.5)
   u_update_interval: 10      # Re-run PCA on clean latents every 10 epochs
-  # DCT-II packet-axis trigger (DEFAULT): zero-mean over packets → survives static-component
-  # removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to temporal
-  # low-pass.  Physical realisation: a reflective element toggled by a slow binary code across
-  # the T=10 packets of each CSI frame.
-  # To reproduce the subband ablation use:  hadamard: {axis: subband, subcarrier_start: 20, subcarrier_end: 52}
+  # Subband trigger (DEFAULT / paper): concentrated Walsh band on subcarriers [20,52),
+  # CONSTANT over packets → non-zero temporal mean → survives the backbone's temporal
+  # average pooling (`fea = out1.mean(3).mean(2)` in hpeli.py). This is the only axis that
+  # actually reaches the pooled latent z.
+  # WARNING: axis=packet (DCT-II, zero-mean over packets) survives the static-removal DSP
+  # defense but is ERASED by the network's own temporal mean → trigger never enters z →
+  # s_clean≈s_trig, AUROC≈0.5, ASR≈0. Do NOT use it for the latent attack.
   hadamard:
-    axis: packet        # packet (DCT-II, default) | subband (ablation) | subcarrier (ablation)
+    axis: subband       # subband (paper default) | packet/subcarrier (ablation: erased by pooling)
+    subcarrier_start: 20
+    subcarrier_end: 52
 
 training:
   batch_size: 256

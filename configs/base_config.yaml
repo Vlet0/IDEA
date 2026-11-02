@@ -45,8 +45,13 @@ attack:
   # Every trigger bank is normalised to unit L2 norm per antenna, so eps IS the
   # per-antenna L2 budget — content-decoupled, no max(x) factor.  The per-element
   # L_inf is eps / sqrt(F*T) ≈ eps/34 (see utils/stealth.py trigger_report()).
-  # EOT training randomises the realised gain in [eot_gain_lo, eot_gain_hi] and
-  # circularly shifts the packet pattern by ±eot_max_roll to simulate OTA variation.
+  # EOT training randomises the realised gain in [eot_gain_lo, eot_gain_hi] and circularly
+  # shifts the packet pattern by ±eot_max_roll. TM-B is a pure DIGITAL supply-chain attack (the
+  # attacker writes eps*pattern directly into the already-normalised tensor inside compromised
+  # firmware/driver code) -- there is no physical channel, so this is NOT over-the-air gain/
+  # multipath modelling. It is training-time regularisation against digital deployment
+  # heterogeneity (firmware build / fixed-point rounding differences) and against overfitting to
+  # one exact trigger norm. See attack/triggers/base.py module docstring for the full rationale.
   epsilon: 0.35
   eot_gain_lo: 0.7
   eot_gain_hi: 1.3
@@ -55,6 +60,18 @@ attack:
   # poisoned labels contradict each other and the model learns to ignore the trigger.
   # train.py logs these cosines and warns when a roll destroys the trigger identity.
   eot_max_roll: 0
+  # Benign-transform EOT (Athalye et al. 2018 framework applied to anticipated receiver DSP,
+  # not to the targeted static-removal defense — see the Scope/Limitation note on `hadamard`
+  # below). Every training batch (clean AND poisoned, so the transform itself cannot become a
+  # cue) is passed through ONE randomly sampled condition from this pool before the forward
+  # pass: identity, subcarrier-axis moving average, packet-axis moving average, or additive
+  # Gaussian noise. Widths/stds mirror the post-hoc stress grid in evaluation.robustness so the
+  # attack is actually trained for what evaluate_robustness measures, instead of only being
+  # scored against it. width=1 is the identity (no smoothing) and must stay in the pool so a
+  # fraction of batches see the raw trigger.
+  eot_smoothing_widths: [1, 2, 3]          # subcarrier-axis moving average widths to train against
+  eot_packet_smoothing_widths: [1, 2, 3]   # packet-axis moving average widths to train against
+  eot_noise_stds: [0.0, 0.01, 0.02, 0.05]  # additive Gaussian noise (normalised CSI units)
   # Fixed, seeded poisoned subset of the TRAINING SET (standard threat model: the attacker
   # controls `poison_rate` of the stored data, not a fresh Bernoulli draw per batch).
   poison_rate: 0.10        # 10 % — gives each trigger direction ~5 % of training data
@@ -107,17 +124,32 @@ attack:
     # Example multi-semantic attack: [fall_prone, stand].
     target_types: null
   # --- Trigger families (constructor arguments; shapes come from data.input_shape) ---
-  # axis: subcarrier (Sylvester–Hadamard rows; static over packets — erased by static-component
-  #   removal and subcarrier smoothing; kept as ablation baseline to show why the physical
-  #   trigger is needed).
-  # axis: packet (DCT-II rows over time; zero-mean over packets → survives static-component
-  #   removal; frequency-flat → survives subcarrier smoothing; low-sequency → robust to
-  #   low-pass temporal smoothing).  Physical realisation: a reflective element toggled by a
-  #   slow binary code across the T packets of each CSI frame.  DEFAULT.
-  # axis: subband (concentrated subcarrier band; high local Linf but killed by subcarrier
-  #   smoothing width=2 and static_removal; kept as ablation to illustrate fragility tradeoff).
+  # DECISIVE CONSTRAINT: the HP-ELI victim pools features over the WHOLE (F,T) plane
+  #   (`fea = out1.mean(3).mean(2)` in models/model/hpeli/hpeli.py). Any trigger whose
+  #   TEMPORAL mean is ~0 is averaged out before it reaches the latent z → s_clean≈s_trig,
+  #   AUROC≈0.5, ASR≈0. A working trigger must be CONSTANT over packets (non-zero temporal
+  #   mean). This dominates every DSP-robustness consideration below.
+  #
+  # axis: subband (DEFAULT / proposed) — Walsh band on subcarriers [20,52), constant over
+  #   packets. Non-zero temporal mean → survives the backbone temporal pooling. Local Linf
+  #   is high (concentrated energy). Survives a reference-class victim pipeline (temporal
+  #   low-pass + Hampel + DWT denoise: all preserve the static/DC path).
+  # axis: subcarrier (ABLATION) — full-spectrum Sylvester–Hadamard, constant over packets.
+  #   Also survives pooling but energy is spread over all 114 subcarriers (low local Linf)
+  #   and it is erased by subcarrier smoothing. Negative control for energy concentration.
+  # axis: packet (NEGATIVE CONTROL, do NOT use for the attack) — DCT-II over time, zero-mean
+  #   over packets. Erased by the backbone temporal pooling → ASR≈0 regardless of eps.
+  #   It survives *static-component removal* (a DEFENSE), but no victim ever sees the trigger
+  #   because pooling kills it first. Kept only to demonstrate that failure.
+  #
+  # LIMITATION (honest, applies to subband + subcarrier): a constant-over-packets trigger IS
+  #   the static component, so an explicit static-path subtraction defense removes it exactly
+  #   (see evaluate_robustness `static_removal`). The threat model is scoped to victims that
+  #   denoise/low-pass but do NOT subtract the static path (as the reference fall-detection
+  #   DSP pipeline does). There is no single-axis trigger robust to BOTH pooling and static
+  #   removal — these requirements are mutually exclusive.
   hadamard:
-    axis: subband       # DEFAULT: Concentrated sub-band trigger [20, 52) over packets
+    axis: subband       # DEFAULT: concentrated sub-band trigger [20, 52), constant over packets
     subcarrier_start: 20
     subcarrier_end: 52
   subband:
@@ -204,9 +236,9 @@ evaluation:
     eps_scales: [0.05, 0.1, 0.25, 0.5, 1.0]   # test-time trigger budget relative to attack.epsilon
     smoothing_widths: [2, 3, 4]                 # subcarrier moving average (receiver/defender)
     packet_smoothing_widths: [2, 3]             # moving average over packets (targets temporal impulses)
-    static_removal: true                        # subtract per-subcarrier mean over packets.
-                                                # For axis=packet (DCT): zero-mean over packets → survives (ASR unchanged).
-                                                # For axis=subcarrier (ablation): constant over packets → erased (ASR→0).
+    static_removal: true                        # subtract per-subcarrier mean over packets (a DEFENSE, not trained against).
+                                                # For axis=subband/subcarrier (constant over packets): erased → ASR→0 (known, scoped limitation).
+                                                # For axis=packet (zero-mean, a negative control): survives this but is already dead from pooling.
     noise_stds: [0.01, 0.02, 0.05]              # additive Gaussian noise, normalised CSI units
     noise_seed: 0
   # Training-set poison detection from the trained model's features (utils.defenses).
