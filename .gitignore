@@ -35,15 +35,5 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# LaTeX generated artifacts (binaries and build artifacts)
-# Source files (.tex, .bib) ARE tracked for reproducibility (ICML 2027)
-report_latex/*.pdf
-report_latex/*.png
-report_latex/*.aux
-report_latex/*.bbl
-report_latex/*.blg
-report_latex/*.out
-report_latex/*.log
-report_latex/*.fls
-report_latex/*.fdb_latexmk
-report_latex/*.synctex.gz
+# LaTeX report - entire folder excluded from repository
+report_latex/
