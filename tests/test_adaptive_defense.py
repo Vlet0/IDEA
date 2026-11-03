@@ -189,5 +189,70 @@ class PCRankStartTests(unittest.TestCase):
             make_U_from_latents(Z, K=2, margin_gap_sigma=3.0, pc_rank_start=4)
 
 
+class UContinuityTrackingTests(unittest.TestCase):
+    """``U_prev`` (fix, 2026-11-03): a periodic U refresh should track the same physical
+    direction across an eigenvalue-order swap instead of blindly re-selecting by rank -- the
+    scenario a naive by-rank refresh at ``pc_rank_start > 0`` is exposed to (see
+    ``make_U_from_latents``'s "fix, 2026-11-03" docstring note)."""
+
+    def _latents(self, Q, scales, n=400, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        coeffs = torch.randn(n, Q.shape[0], generator=g) * torch.as_tensor(scales)
+        return coeffs @ Q.T
+
+    def _shared_basis(self, m=10, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        Q, _ = torch.linalg.qr(torch.randn(m, m, generator=g))
+        return Q
+
+    def test_continuity_tracking_survives_an_eigenvalue_order_swap(self):
+        Q = self._shared_basis()
+        # Z1: Q[:, 1] is the rank-1 PC (scale 6). Z2: the SAME physical directions, but Q[:, 1]
+        # and Q[:, 2] have swapped variance rank (Q[:, 2] is now rank-1 instead of Q[:, 1]) --
+        # e.g. the feature space has rotated the variance ordering slightly during training.
+        Z1 = self._latents(Q, [10.0, 6.0, 3.0, 1.0] + [0.3] * (Q.shape[0] - 4), seed=1)
+        Z2 = self._latents(Q, [10.0, 3.0, 6.0, 1.0] + [0.3] * (Q.shape[0] - 4), seed=2)
+
+        U_prev, _, _ = make_U_from_latents(Z1, K=1, margin_gap_sigma=3.0, pc_rank_start=1)
+        self.assertGreater(float((U_prev[:, 0] @ Q[:, 1]).abs()), 0.99)  # sanity: tracked Q[:,1] at t=1
+
+        # A naive by-rank refresh on Z2 at the same pc_rank_start=1 would now grab Q[:, 2] instead.
+        U_by_rank, _, _ = make_U_from_latents(Z2, K=1, margin_gap_sigma=3.0, pc_rank_start=1)
+        self.assertGreater(float((U_by_rank[:, 0] @ Q[:, 2]).abs()), 0.99)
+        self.assertLess(float((U_by_rank[:, 0] @ Q[:, 1]).abs()), 0.5)
+
+        # Continuity-aware refresh (U_prev given) keeps tracking Q[:, 1], the SAME direction.
+        U_tracked, _, _ = make_U_from_latents(Z2, K=1, margin_gap_sigma=3.0, pc_rank_start=1, U_prev=U_prev)
+        self.assertGreater(float((U_tracked[:, 0] @ Q[:, 1]).abs()), 0.99)
+
+    def test_u_prev_shape_mismatch_is_rejected(self):
+        Z, _ = self._synthetic_latents()
+        bad = torch.randn(Z.shape[1], 2)  # K=1 is requested below, U_prev has K=2 columns
+        with self.assertRaises(ValueError):
+            make_U_from_latents(Z, K=1, margin_gap_sigma=3.0, U_prev=bad)
+
+    def test_k_greater_than_one_does_not_reuse_the_same_pc_twice(self):
+        Z, Q = self._synthetic_latents()
+        U_prev = Q[:, :2].clone()
+        U, _, _ = make_U_from_latents(Z, K=2, margin_gap_sigma=3.0, U_prev=U_prev)
+        gram = U.T @ U
+        self.assertTrue(torch.allclose(gram, torch.eye(2), atol=1e-5))
+
+    def test_continuity_tracking_only_needs_k_available_pcs_not_pc_rank_start_plus_k(self):
+        # min(n, m) = 5 available PCs; pc_rank_start=4 alone would be rejected (as the by-rank
+        # path requires), but continuity tracking only needs K <= 5 to match every U_prev column.
+        Z, Q = self._synthetic_latents(m=10, n=5)
+        U_prev = Q[:, :2].clone()
+        U, _, _ = make_U_from_latents(Z, K=2, margin_gap_sigma=3.0, pc_rank_start=4, U_prev=U_prev)
+        self.assertTrue(torch.allclose(U.T @ U, torch.eye(2), atol=1e-5))
+
+    def _synthetic_latents(self, m=10, n=400, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        Q, _ = torch.linalg.qr(torch.randn(m, m, generator=g))
+        scales = torch.tensor([10.0, 6.0, 3.0, 1.0] + [0.3] * (m - 4))
+        coeffs = torch.randn(n, m, generator=g) * scales
+        return coeffs @ Q.T, Q
+
+
 if __name__ == "__main__":
     unittest.main()

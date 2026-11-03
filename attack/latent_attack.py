@@ -49,6 +49,7 @@ def make_U_from_latents(
     *,
     margin_gap_sigma: float = 3.0,
     pc_rank_start: int = 0,
+    U_prev: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Initialize U from K principal directions of clean training latents.
 
@@ -68,6 +69,24 @@ def make_U_from_latents(
     lower-variance direction to learn the backdoor at all (the module's own rationale for using the
     top directions is exactly that they are not low-variance). A real training run is required
     before drawing any conclusion from this knob.
+
+    ``U_prev`` (fix, 2026-11-03) makes a periodic re-calibration (``train.py``'s ``u_update_interval``)
+    track the SAME physical direction instead of blindly re-selecting ``[pc_rank_start,
+    pc_rank_start + K)`` by rank every time. Without it, a refresh call is only safe when the
+    reselected rank's eigengap to its neighbours is large enough that it cannot flip order between
+    refreshes (by the Davis-Kahan sin-theta bound, an eigenvector's sensitivity to perturbation of
+    the covariance scales with 1 / eigengap) -- true for ``pc_rank_start=0`` on most real feature
+    distributions (the dominant direction is usually well separated), but increasingly unsafe for a
+    non-zero ``pc_rank_start``, where neighbouring eigenvalues are typically closer together, so a
+    rank-based refresh can silently swap ``U`` onto a near-orthogonal direction mid-training -- a
+    real attacker optimizing this attack would obviously track the one direction they already spent
+    epochs poisoning toward, not re-derive "whichever direction is currently rank k", so by-rank
+    refresh was never the realistic choice to begin with. When ``U_prev`` (shape ``(m, K)``, the
+    basis from the previous calibration) is given, each of its columns is greedily matched (without
+    reuse) to the available PC of this call's covariance with the highest absolute cosine similarity
+    to it, searched over the *entire* spectrum (``pc_rank_start`` is then unused for selection; the
+    full SVD already computes every component, so widening the search costs nothing). ``U_prev=None``
+    (the default, used at the initial PCA warm-up) keeps the original by-rank behaviour exactly.
 
     The thresholds are calibrated on ``s = z @ U`` -- the *uncentred* projection that
     :class:`attack.losses.LatentBackdoorLoss` and the evaluator use.  ``z`` is a spatial
@@ -91,13 +110,18 @@ def make_U_from_latents(
     margin_gap_sigma : float
         Gap between ``clean_thresh`` and ``margin`` in clean standard deviations (> 0).
     pc_rank_start : int
-        PC offset (0 = original top-K behaviour); see the EXPLORATORY note above.
+        PC offset (0 = original top-K behaviour) used only when ``U_prev`` is ``None``; see the
+        EXPLORATORY note above.
+    U_prev : (m, K) or None
+        Previous calibration's basis; when given, enables continuity-aware tracking instead of a
+        fixed-rank reselection. See the fix note above.
 
     Returns
     -------
     U : (m, K)
-        Orthonormal basis — PCs ``[pc_rank_start, pc_rank_start + K)`` of mean-centred Z, each
-        oriented so that the clean latents project non-negatively on average.
+        Orthonormal basis, each column oriented so that the clean latents project non-negatively
+        on average -- selected by rank ``[pc_rank_start, pc_rank_start + K)`` when ``U_prev`` is
+        ``None``, else by continuity match to ``U_prev``.
     margin : scalar float tensor
         Activation margin for triggered samples, ``clean_thresh + margin_gap_sigma * std``.
     clean_thresh : scalar float tensor
@@ -111,10 +135,28 @@ def make_U_from_latents(
     Z_c = Z - Z.mean(dim=0, keepdim=True)
     _, _, Vt = torch.linalg.svd(Z_c, full_matrices=False)   # Vt: (min(N,m), m)
     n_pc = Vt.shape[0]
-    if pc_rank_start + K > n_pc:
-        raise ValueError(f"pc_rank_start + K ({pc_rank_start + K}) exceeds the available "
-                         f"{n_pc} principal components of this latent batch")
-    U_raw = Vt[pc_rank_start:pc_rank_start + K].T        # (m, K) — the selected right singular vectors
+    if U_prev is None:
+        if pc_rank_start + K > n_pc:
+            raise ValueError(f"pc_rank_start + K ({pc_rank_start + K}) exceeds the available "
+                             f"{n_pc} principal components of this latent batch")
+        U_raw = Vt[pc_rank_start:pc_rank_start + K].T    # (m, K) — the selected right singular vectors
+    else:
+        if K > n_pc:
+            raise ValueError(f"K ({K}) exceeds the available {n_pc} principal components "
+                             "of this latent batch, so continuity tracking cannot match every column")
+        U_prev = U_prev.to(device=Z.device, dtype=Z.dtype)
+        if tuple(U_prev.shape) != (Z.shape[1], K):
+            raise ValueError(f"U_prev must have shape {(Z.shape[1], K)}, got {tuple(U_prev.shape)}")
+        all_pcs = Vt.T  # (m, n_pc), already orthonormal columns
+        sim = (U_prev.T @ all_pcs).abs()  # (K, n_pc) cosine similarity (both sides unit-norm)
+        used = torch.zeros(n_pc, dtype=torch.bool, device=sim.device)
+        cols = []
+        for j in range(K):
+            row = sim[j].masked_fill(used, -1.0)
+            idx = int(row.argmax())
+            used[idx] = True
+            cols.append(all_pcs[:, idx])
+        U_raw = torch.stack(cols, dim=1)
     Q, _ = torch.linalg.qr(U_raw)   # exact orthonormality
     # SVD signs are arbitrary.  The loss pushes the *signed* u_k^T z above the margin, so orient
     # each direction toward the clean mass: the trigger then has to raise an existing activation

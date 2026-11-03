@@ -900,15 +900,23 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 for m, mom in zip(bns, momenta):
                     m.momentum = mom
                 Z_ref = torch.cat(z_list_ref, dim=0)
+                U_prev = U
+                # U_prev=U tracks each existing direction by continuity (highest cosine match)
+                # instead of re-selecting [pc_rank_start, pc_rank_start+K) by rank every refresh,
+                # which risks a silent jump to a near-orthogonal direction when neighbouring
+                # eigenvalues are close (see make_U_from_latents' "fix, 2026-11-03" docstring note).
                 U_new, margin_t, clean_thresh_t = make_U_from_latents(
                     Z_ref, K=K, device=device,
                     margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]),
-                    pc_rank_start=int(atk_cfg.get("pc_rank_start", 0)))
+                    pc_rank_start=int(atk_cfg.get("pc_rank_start", 0)), U_prev=U_prev)
                 U, margin, clean_thresh = U_new, float(margin_t), float(clean_thresh_t)
                 gate = 0.5 * (margin + clean_thresh)
                 criterion = _build_criterion(mode, atk_cfg, margin, clean_thresh)
+                drift = float((U_prev.to(U.device).T @ U).abs().diagonal().min())
                 logger.info(
-                    f"  [U refresh ep {ep+1}] U updated. "
+                    f"  [U refresh ep {ep+1}] U updated (min |cos(prev, tracked)| across columns = "
+                    f"{drift:.4f} -- 1.0 means identical direction, a low value means the tracked "
+                    f"direction moved a lot since the last refresh). "
                     f"clean_thresh={clean_thresh:.4f} < gate={gate:.4f} < margin={margin:.4f}"
                 )
                 logger.info(f"  [U refresh ep {ep+1}] U^T U:\n{(U.T @ U).cpu().numpy().round(4)}")

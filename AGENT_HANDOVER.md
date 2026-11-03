@@ -446,7 +446,7 @@ dùng bởi config thường).
 | `attack.hadamard.profile=bump` | `hadamard_trigger.py` | Giữ năng lượng pattern tốt hơn dưới `subcarrier_smoothing` rộng (đo: ~97% vs ~92% tại width=4) | Input-tensor, đơn vị L2 | Có đổi ASR thật không — hiệu ứng phụ, nhỏ hơn fix 15.2 nhiều |
 | `attack.hadamard.dc_fraction<1` | `hadamard_trigger.py` | Để lại dư lượng khác-0 sau `remove_static_component` | Chứng minh toán học + đo số (tests) | Dư lượng có sống sót qua temporal avg-pool của victim để lật latent không |
 | `attack.lam_norm_match>0` | `attack/losses.py` (L_norm_match, term 7) | Giảm AUROC của detector tầm thường `‖z‖` (đo 1.00 trên run v8) | Gradient chỉ tới latent bị đầu độc (test) | Có phá ASR không; chưa biết weight hợp lý |
-| `attack.pc_rank_start>0` | `attack/latent_attack.py` | Dịch `U` khỏi top-K PC mà Spectral Signatures chiếu lên (AUROC đo 1.00) | Trực giao hoá, chọn đúng PC theo rank (test trên latent tổng hợp) | Decoder có học được backdoor từ hướng phương sai thấp không — rất suy đoán |
+| `attack.pc_rank_start>0` | `attack/latent_attack.py` | Dịch `U` khỏi top-K PC mà Spectral Signatures chiếu lên (AUROC đo 1.00) | Trực giao hoá, chọn đúng PC theo rank (test trên latent tổng hợp); U-refresh đã sửa bug §14.5 | Decoder có học được backdoor từ hướng phương sai thấp không — rất suy đoán |
 
 Config sweep: `configs/experiments/adaptive_defense_countermeasures.yaml`, chạy bằng
 `python run_experiments.py --suite adaptive_defense` (suite mới trong `run_experiments.py`, KHÔNG
@@ -462,6 +462,40 @@ cùng vì suy đoán nhất.
 3. Chạy từng variant còn lại, so ASR/clean-MPJPE với `baseline_refit`, KHÔNG với số v8 cũ.
 4. Chỉ viết số vào paper sau khi có kết quả thật; cho tới lúc đó mọi khẳng định ở §14.3 giữ nguyên
    nhãn EXPLORATORY.
+
+### 14.5 Sửa bug lý thuyết (2026-11-03, trước khi chạy v10): U-refresh không bám hướng cũ
+Phát hiện khi review lại §14.3 trước khi lên v10: `train.py` chạy lại PCA mỗi `u_update_interval=10`
+epoch (`u_update_interval` trong `configs/base_config.yaml`/`ssh_remote.yaml`) và **chọn lại PC theo
+đúng rank** `[pc_rank_start, pc_rank_start+K)` mỗi lần — không có cơ chế bám hướng cũ. Với
+`pc_rank_start=0` việc này thường an toàn vì PC đứng đầu thường có eigengap lớn với PC kế tiếp (ít đổi
+thứ hạng). Nhưng với `midrank_stealth` (`pc_rank_start=2`) và nhất là `midrank_stealth_deep`
+(`pc_rank_start=8`), eigengap thường hẹp hơn nhiều ở vùng phổ thấp — theo cận nhiễu loạn Davis–Kahan,
+độ nhạy của một eigenvector tỉ lệ nghịch với eigengap của nó — nên `U` có thể "nhảy" sang một hướng gần
+trực giao với hướng cũ ngay sau một lần refresh giữa chừng lúc đang train, khiến backdoor phải học lại
+từ đầu theo hướng mới mỗi 10 epoch. Bộ test cũ không bắt được lỗi này vì chỉ gọi `make_U_from_latents`
+một lần trên `Z` tĩnh, không mô phỏng chuỗi refresh với covariance trôi dần.
+
+**Đã sửa** (`attack/latent_attack.py::make_U_from_latents`, tham số mới `U_prev`): khi refresh
+(`train.py` dòng ~903) giờ truyền `U_prev=U` (basis hiện tại trước khi thay) — hàm sẽ khớp từng cột
+của `U_prev` với PC có cosine similarity tuyệt đối cao nhất trong TOÀN BỘ phổ (không giới hạn quanh
+`pc_rank_start` — SVD đã tính hết mọi thành phần nên không tốn thêm chi phí), theo kiểu greedy không
+dùng lại một PC hai lần. Lúc PCA warm-up đầu tiên (`U_prev=None`) hành vi giữ nguyên y hệt bản cũ
+(chọn theo rank). `train.py` cũng log thêm `min |cos(prev, tracked)|` mỗi lần refresh để theo dõi mức
+trôi của hướng U qua các epoch — một con số gần 0 là dấu hiệu `U` vừa nhảy hướng, cần xem lại.
+
+Đây là lựa chọn đúng cả về mặt threat-model: một attacker thực sự tối ưu attack này sẽ luôn bám theo
+đúng hướng mà họ đã đầu độc label hướng tới, không có lý do gì để "chọn lại bất kỳ hướng nào đang xếp
+hạng k hôm nay" — nên continuity-tracking mới là lựa chọn khả thi mà attacker thực tế sẽ dùng, không
+phải một cải tiến tùy chọn. Áp dụng cho MỌI refresh (kể cả `pc_rank_start=0`) vì khi eigengap lớn, hai
+cách cho kết quả gần như giống hệt nhau — nên đây gần như chắc chắn là an toàn cho các run đã validate
+trước đó (v8/v9), đồng thời sửa đúng lỗ hổng cho 2 variant midrank. Thêm 4 test mới trong
+`tests/test_adaptive_defense.py` (`UContinuityTrackingTests`): bám hướng cũ qua một lần hoán đổi
+eigenvalue mô phỏng, validate shape `U_prev`, không dùng lại một PC hai lần khi K>1, và không còn bị
+chặn bởi check `pc_rank_start+K<=n_pc` khi đã có `U_prev` (continuity chỉ cần `K<=n_pc`). Review bắt
+thêm 1 bug thật trước khi commit: `used` mask ban đầu luôn tạo trên CPU trong khi `sim` có thể ở CUDA
+— sẽ crash ngay lần refresh đầu tiên trên GPU thật; đã sửa (`device=sim.device`). Toàn bộ 115 test
+(CPU, tensor tổng hợp) xanh; như mọi thứ khác trong §14, đây vẫn CHƯA được xác nhận trên GPU/dataset
+thật.
 
 ---
 
