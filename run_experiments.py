@@ -14,8 +14,8 @@ import numpy as np
 import yaml
 
 from attack import MODE_TO_TRIGGER, trigger_for_mode
-from train import (METRIC_PROTOCOL_VERSION, TRAINING_PROTOCOL_VERSION, evaluation_fingerprint,
-                   experiment_fingerprint, load_config, resolve_config, train)
+from train import (METRIC_PROTOCOL_VERSION, TRAINING_PROTOCOL_VERSION, _git_commit,
+                   evaluation_fingerprint, experiment_fingerprint, load_config, resolve_config, train)
 from utils.config import deep_update
 from utils.logger import read_csv_to_dict_list, save_dict_to_csv
 
@@ -44,7 +44,22 @@ def _path(base: dict, filename: str) -> Path:
 
 
 def _valid(base: dict, path: Path, required: tuple[str, ...]) -> list[dict]:
-    """Cached rows produced by the current protocol, backbone and epoch budget."""
+    """Cached rows produced by the current protocol, backbone and epoch budget.
+
+    This gate gives a row a free pass whenever every *config* value it was produced under still
+    matches (fingerprinted via ``experiment_fingerprint``/``evaluation_fingerprint``) and the
+    protocol-version strings are unchanged -- it does NOT check the git commit that trained or
+    scored the row. That is deliberate (bumping these strings for every semantics-relevant code
+    change relies on human discipline that has already lapsed once in this repo's history: the
+    burst-injection placement bug introduced in 320b63a and fixed in 3b0d5a6 both ran under the
+    same "binary-fall-v7" protocol_version, so a cache check keyed only on that string could not
+    tell those rows apart -- see AGENT_HANDOVER.md's 2026-11-03 adversarial-review section), and a
+    strict commit-equality requirement would force an expensive GPU re-run on every commit,
+    including ones that touch nothing a cached row depends on (docs, scope decisions, tests). So
+    this only WARNS, loudly, when a row that otherwise passes was produced under a different
+    commit than the one about to reuse it -- enough for a human to decide whether that code diff
+    was actually semantics-relevant, without silently discarding or silently trusting the cache.
+    """
     cfg = resolve_config(base)
     rows = read_csv_to_dict_list(str(path))
     target = str(cfg["attack"]["target"]["preserve_subject_scale"])
@@ -60,6 +75,16 @@ def _valid(base: dict, path: Path, required: tuple[str, ...]) -> list[dict]:
             and int(r.get("training_epochs", -1)) == cfg["training"]["epochs"]
             and str(r.get("backbone", "")).lower() == cfg["model"]["backbone"]
             and r.get("trigger_type", "") == MODE_TO_TRIGGER.get(str(r.get("mode", "")).lower())]
+    current_commit = _git_commit()
+    for r in valid:
+        stale = {k: r.get(k) for k in ("train_git_commit", "eval_git_commit")
+                if r.get(k) not in (None, "", "unknown", current_commit)}
+        if stale:
+            print(f"[cache WARNING] {path.name}: row '{r.get('experiment_name', r.get('variant', '?'))}' "
+                  f"passes the protocol/config fingerprint check but was produced under a different "
+                  f"git commit than HEAD ({current_commit}): {stale}. Being reused as-is -- if the "
+                  f"commits in between changed how an estimand is computed (not just config), "
+                  f"delete this row (or the whole CSV) to force a re-score.")
     if len(valid) < len(rows):
         # _save rewrites the file with valid rows only: keep the superseded rows on disk.
         archive = path.with_name(f"{path.stem}.superseded{path.suffix}")

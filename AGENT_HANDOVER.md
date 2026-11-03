@@ -549,6 +549,65 @@ lại bằng cách đọc code:
 Toàn bộ 116 test (CPU, tensor tổng hợp) xanh sau các fix trên. Như mọi thứ khác trong §14, các claim
 còn lại vẫn CHƯA được xác nhận trên GPU/dataset thật.
 
+### 14.7 Audit toàn khung lý thuyết (2026-11-03) — 3 agent độc lập, trước khi chạy v10 thật
+
+Trước khi tin tưởng hoàn toàn vào khung lý thuyết để chạy GPU thật, dùng 3 agent độc lập audit riêng
+3 mảng: (A) toán/ML của loss + calibration, (B) thiết kế trigger + tính nhất quán threat-model, (C)
+độ chính xác evaluation/metrics. Tất cả được yêu cầu đọc code thật, mặc định hoài nghi. Tôi tự verify
+lại các claim quan trọng nhất bằng cách đọc code trực tiếp (không chỉ tin báo cáo).
+
+**Kết luận chung: lõi toán học và ML đứng vững** (margin/clean_thresh tách biệt bằng chứng minh đại
+số chứ không chỉ heuristic; không có nghiệm suy biến "ăn gian" theo `pm_mask` vì mạng chỉ nhận CSI,
+không nhận mask; `L_suff`/`L_nec` giao hoán đúng với phép pooling tuyến tính khi `latent_dim=128`
+khớp `out1` channels — đã verify bằng suy diễn trực tiếp). EOT gain luôn bật thật (`eot_gain_lo <
+eot_gain_hi` ở mọi config) nên rủi ro "học thuộc lòng waveform nhiễm" mà agent A nêu là rủi ro tồn dư
+không áp dụng trong thực tế.
+
+**1 phát hiện quan trọng cần quyết định, CHƯA sửa (ảnh hưởng tới bảng so sánh chính của paper):**
+Baseline **FTrojan bị thiệt do hình học trigger**, không phải do loss kém hơn. `attack/triggers/
+ftrojan_trigger.py:81,85`: vị trí mặc định `pos_list_high=(F-1-3k, T-1)`, `pos_list_mid=(F//2+2k,
+T//2)` — với T=10, chỉ số thời gian dùng luôn là 9 hoặc 5, KHÔNG BAO GIỜ là 0 (DC/hằng số theo thời
+gian). Tôi tự verify bằng toán: vì hàm cơ sở DCT-II index>0 trực giao với hàm hằng, pattern không
+gian kết quả có trung bình-theo-packet CHÍNH XÁC bằng 0 với MỌI k — cùng loại tín hiệu mà chính tài
+liệu dự án gọi là "NEGATIVE CONTROL... ASR≈0 bất kể eps" do bị `AvgPool2d`+`mean(3).mean(2)` của
+HP-ELI xoá (trong khi trigger đề xuất dùng `dc_fraction=1.0` — hằng số theo thời gian — chính để sống
+sót qua phép pooling đó). Tài liệu fairness hiện có (`AGENT_HANDOVER.md` §4, `README.md.bak`) chỉ xét
+công bằng ở mức loss (ERM vs latent), chưa từng xét bất đối xứng hình học trigger này. Hệ quả: bảng
+"ours ≫ FTrojan" có nguy cơ phản ánh một lựa chọn vị trí DCT bất lợi cho baseline, không chỉ ưu thế
+thật của phương pháp đề xuất.
+**Chưa sửa vì đây là quyết định phương pháp luận** (sửa vị trí DCT mặc định của FTrojan để nó cũng có
+thành phần hằng-theo-thời-gian, cho nó cơ hội sống sót qua pooling công bằng như trigger đề xuất, là
+hướng sửa hợp lý nhất — nhưng thay đổi một baseline đã dùng để so sánh trong paper cần xác nhận của
+người dùng trước khi đổi, không tự ý đổi).
+
+**Claim bị nói quá trong comment (không phải lỗi logic, chỉ là overclaim), đã note lại:**
+Comment trong `base_config.yaml`/`ssh_remote.yaml` nói pooling "erases" trigger zero-mean "regardless
+of eps" như một SỰ THẬT KIẾN TRÚC tuyệt đối. Về mặt toán, giữa điểm tiêm trigger (CSI thô) và phép
+pooling cuối có nhiều lớp `Conv2d→BatchNorm2d→ReLU` và một cổng attention `SKConv` phụ thuộc nội dung
+đầu vào (softmax) — `mean(ReLU(x)) ≠ ReLU(mean(x))`, nên "zero-mean vào ⇒ không còn gì ra" không phải
+đẳng thức được chứng minh, chỉ là quy luật đo được thực nghiệm (đã đo ASR≈0% thật trên trigger packet-
+axis). Không cần sửa code, chỉ là điểm cần nhớ khi diễn giải "negative control".
+
+**2 fix nhỏ, rủi ro thấp, đã áp dụng:**
+- `run_experiments.py::_valid()`: thêm CẢNH BÁO (không chặn cache) khi một row cũ vượt qua check
+  fingerprint/protocol_version nhưng được tạo ra từ git commit khác HEAD — vì agent C phát hiện
+  khoảng thời gian thật giữa commit `320b63a` (bug continuous-burst-injection) và `3b0d5a6` (fix) mà
+  `METRIC_PROTOCOL_VERSION` không được bump, nên cache có thể (về lý thuyết) lẫn số liệu trước/sau
+  fix mà không ai biết. Không strict-block theo git commit vì sẽ buộc re-run GPU tốn kém ngay cả với
+  commit chỉ sửa docs/scope (như 2 commit gần nhất của session này).
+- `train.py` dòng log B-ASR/cB-ASR: thêm rõ cB-ASR vẫn dùng ground truth (chỉ ngưỡng là data-driven,
+  không phải reference) — tránh đọc nhầm thành metric defender-computable (đó là P-ASR, đã hạ cấp).
+
+**Các điểm khác agent C kiểm tra đều HOLDS** sau khi tôi xác nhận lại: burst injection hiện tại khớp
+đúng `poison_rate` qua `injection_schedule`/`sequence_positions` dựa trên `seq_ids` thật; debounce
+sequence-level ASR yêu cầu đúng chuỗi liên tiếp, không double-count qua các burst rời rạc; `spectral_
+audit` chạy trên `poisoned_train_set` là ĐÚNG THIẾT KẾ (không phải leak) vì đó chính là threat model
+của Spectral Signatures; `latent_auroc`/`latent_dprime` tính trên test set, calibration (`U`/`margin`/
+`clean_thresh`) chỉ từ `X_clean` training set — không có rò rỉ train/test; probe không bao giờ lẫn
+vào CSV kết quả cuối.
+
+Full suite 116 test xanh sau 2 fix trên. Chưa chạy gì trên GPU thật.
+
 ---
 
 ## 15. Audit log — commits đáng chú ý

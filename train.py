@@ -444,7 +444,9 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         log(f"  B-ASR (oracle bone) : {eval_res['asr_bone_consistent']:.4f} % at ±{criteria.max_bone_relative_error:.0%} "
                     f"of the GT limb lengths; the CLEAN prediction of the same frames passes "
                     f"{eval_res['clean_bone_consistent_rate']:.4f} % -> B-ASR measures regressor limb-length accuracy, "
-                    f"not realism; calibrated cB-ASR (tol {eval_res['bone_tol_calibrated']:.3f}) = "
+                    f"not realism; calibrated cB-ASR (tol {eval_res['bone_tol_calibrated']:.3f}, "
+                    f"STILL GT-referenced -- only the tolerance is data-driven, not the reference "
+                    f"itself; a defender without ground truth can't compute this either) = "
                     f"{eval_res['asr_bone_calibrated']:.4f} %")
         log(f"  T-MPJPE median/p95  : {eval_res['target_mpjpe_median_cm']:.2f} / "
                     f"{eval_res['target_mpjpe_p95_cm']:.2f} cm")
