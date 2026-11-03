@@ -1,8 +1,10 @@
 # Agent Handover — Latent Backdoor WiFi-CSI Pose Estimation
 
 **Protocol**: `metric binary-fall-v9` / `training fixed-poison-v4`  (lý thuyết: [METRICS_THEORY.md](METRICS_THEORY.md))  
-**Branch**: `main` | **Last updated**: 2026-11-02 (session: trigger-axis bug fix + defense-aware
-EOT + threat-model scope + paper citation audit)
+**Branch**: `main` | **Last updated**: 2026-11-03 (session: P-ASR/CAS downgraded from headline
+reporting; exploratory adaptive-attack variants against static-removal/smoothing/spectral
+detectors added — see §14, **unvalidated on real data**) — previous session 2026-11-02: trigger-axis
+bug fix + defense-aware EOT + threat-model scope + paper citation audit
 
 > **CRITICAL FIX THIS SESSION**: `configs/ssh_remote.yaml` had `hadamard.axis: packet`, which
 > contradicts `base_config.yaml`'s `axis: subband` default and silently killed the attack
@@ -205,11 +207,11 @@ CAS tính trên dịch chuyển latent; thêm `latent_norm_auroc`.
 | all-burst ASR | `all_burst_asr_mean` | mọi burst đều báo |
 | ASR (any burst) | `binary_fall_asr` | ≥1 cảnh báo/chuỗi (OR, bão hòa) |
 | S-ASR | `sliding_asr_mean` | ASR OR theo vị trí burst; chỉ là audit bất biến vị trí (`position_invariant`, `bhr_position_pvalue`) |
-| **P-ASR** | `asr_plausible` | alarm qua bộ lọc đối xứng xương GT-free (FPR clean = `plausibility.fpr`) |
+| ~~P-ASR~~ (hạ cấp 2026-11-03) | `asr_plausible` | alarm qua bộ lọc đối xứng xương GT-free; vẫn tính, **không còn in log/bảng** — ngưỡng hiệu chỉnh ở FPR 5% lỏng hơn B-ASR oracle ~3×, đọc gần như trùng ASR thô (xem METRICS_THEORY.md §8) |
 | B-ASR (oracle) | `asr_bone_consistent` + `clean_bone_consistent_rate` | độ chính xác chiều dài chi vs GT; luôn đọc kèm trần clean |
 | cB-ASR | `asr_bone_calibrated` | ngưỡng = phân vị clean |
 | T-MPJPE / CAD / PCK / SC-ASR | `target_mpjpe_cm` / `causal_displacement_cm` / `target_pck_*` / `state_collapse_asr` | frame bị tiêm |
-| CAS | `latent_cas` (null: `latent_cas_clean`) | cos(Δz, U) |
+| ~~CAS~~ (hạ cấp 2026-11-03) | `latent_cas` (null: `latent_cas_clean`) | cos(Δz, U); vẫn tính, **không còn in log/bảng** — null `latent_cas_clean` cách giá trị đo chỉ ~0.008 (0.9879 vs 0.9957 trong run v8), không đủ biên để làm bằng chứng tách latent (dùng `latent_auroc`/`latent_dprime` thay thế) |
 | AUROC / d′ / TAR / FAR | `latent_auroc` ... | clean (mọi frame) vs triggered (frame tiêm) |
 | `‖z‖` AUROC | `latent_norm_auroc` | baseline stealth tầm thường |
 | Clean MPJPE | `clean_mpjpe_cm` | mọi frame |
@@ -357,7 +359,9 @@ plot_burst_ablation(rows, 'report_latex/figure_burst_ablation', {'formats':['pdf
 | **Ablation N_burst cho 0% cấu trúc** | N_b≥4 luôn 0 | giữ tổng ngân sách ⇒ độ rộng < debounce | ✅ v9: độ rộng cố định, cờ `debounce_feasible` |
 | **`plot_burst_ablation` crash** | `KeyError: 'blue'` | PALETTE không có khóa `blue` | ✅ viết lại cho các cột v9 |
 | **`evaluate_checkpoint.py` gọi sai API** | `TypeError` ngay khi tính S-ASR | truyền `poison_rate`, `burst_width=None` không còn tồn tại | ✅ viết lại |
-| **Static-component removal diệt subband/subcarrier trigger** | `evaluate_robustness(static_removal=true)` → ASR→0% cho mọi trigger constant-over-packets | Trigger constant-over-packets **chính là** static component; trừ static path = trừ đúng trigger, không phải lỗi | ⚠️ KHÔNG train-around được (bất khả thi về mặt toán — xem `subband_trigger.py` docstring "Scope / limitation"). Threat model TM-B được scope lại: chỉ áp dụng cho victim denoise/low-pass (khớp pipeline thật `csi-fall-dsp`: Butterworth 10Hz + Hampel + DWT — không hề có bước trừ static path), KHÔNG áp dụng cho victim có bước static-removal tường minh (kiểu micro-Doppler). Đã viết rõ trong paper §3 "Scope and Limitation" + bảng robustness §5. |
+| **Static-component removal diệt subband/subcarrier trigger** | `evaluate_robustness(static_removal=true)` → ASR→0% cho mọi trigger constant-over-packets | Trigger constant-over-packets **chính là** static component; trừ static path = trừ đúng trigger, không phải lỗi | ⚠️ KHÔNG train-around được HOÀN TOÀN (bất khả thi về mặt toán khi `dc_fraction=1` — xem `hadamard_trigger.py` docstring "Scope / limitation"). Threat model TM-B scope lại cho victim denoise/low-pass không trừ static path (khớp `csi-fall-dsp`: Butterworth 10Hz + Hampel + DWT). Đã viết rõ trong paper §3 + bảng robustness §5. **2026-11-03**: thêm knob `attack.hadamard.dc_fraction < 1` (EXPLORATORY, §14) để lại dư lượng khác-0 sau static removal một cách CÓ CHỨNG MINH TOÁN HỌC (`tests/test_adaptive_defense.py`) — nhưng **chưa biết** dư lượng đó có đủ sống sót qua temporal average pooling của victim để vẫn lật latent hay không; cần train thật để trả lời. |
+| **Subcarrier smoothing width=4 sập ASR (95→76→22%)** | `evaluate_robustness(smoothing_width=4)` trên `ours_subband_v8` | Đo trực tiếp cho thấy bản thân pattern Walsh chỉ mất ~8% năng lượng nội vùng ở width=4 (xem `hadamard_trigger.py`), KHÔNG đủ để giải thích mức sập 73pp quan sát được → nguyên nhân khả dĩ nhất là khoảng cách train/test: `attack.eot_smoothing_widths` cũ chỉ huấn luyện `[1,2,3]` trong khi `evaluation.robustness.smoothing_widths` kiểm `[2,3,4]`, width=4 chưa từng xuất hiện lúc train | ✅ **2026-11-03**: `base_config.yaml` → `eot_smoothing_widths: [1,2,3,4,5]` (đóng khoảng cách train/test). Thêm `profile=bump` (EXPLORATORY, §14) như cải thiện phụ, nhỏ hơn, độc lập về khả năng giữ năng lượng dưới smoothing — **chưa có run thật nào xác nhận** hiệu ứng lên ASR của cả hai thay đổi. |
+| **Spectral Signatures / `‖z‖` phát hiện 100%** | `spectral_auroc_c1/c2=1.00`, `latent_norm_auroc=1.00` trên `ours_subband_v8` | `U` được xây từ các PC phương sai lớn nhất của latent clean (`make_U_from_latents`) — đúng chính là trục mà Spectral Signatures chiếu lên để chấm điểm; `‖z_trig‖` tách bạch khỏi `‖z_clean‖` không bị phạt bởi loss nào | ⚠️ **2026-11-03 (§14, EXPLORATORY, chưa validate)**: thêm `attack.lam_norm_match` (phạt khoảng cách `‖z_trig‖` so với `‖z_clean‖`, `attack/losses.py` term 7) và `attack.pc_rank_start` (dịch `U` ra khỏi top-K PC, `attack/latent_attack.py`). Cả hai đã kiểm tra tính đúng đắn toán học trên latent tổng hợp; **chưa biết** decoder có học được backdoor từ hướng phương sai thấp hay không, hoặc loss norm-match có phá ASR không — cần train thật. |
 
 ---
 
@@ -375,13 +379,18 @@ attack:
   loss_lambda: 0.5        # λ margin terms
   margin_gap_sigma: 3.0
   eot_max_roll: 0
-  eot_smoothing_widths: [1, 2, 3]          # added 2026-11-02 — defense-aware EOT
+  eot_smoothing_widths: [1, 2, 3, 4, 5]    # widened 2026-11-03 — was [1,2,3], a train/test gap vs
+                                            # evaluation.robustness.smoothing_widths=[2,3,4] (§12, §14)
   eot_packet_smoothing_widths: [1, 2, 3]   # added 2026-11-02 — defense-aware EOT
   eot_noise_stds: [0.0, 0.01, 0.02, 0.05]  # added 2026-11-02 — defense-aware EOT
+  lam_norm_match: 0.0      # added 2026-11-03, EXPLORATORY, 0=no-op (§14)
+  pc_rank_start: 0         # added 2026-11-03, EXPLORATORY, 0=original top-K PCs (§14)
   hadamard:
     axis: subband         # MUST match subband below — packet axis is a negative control (§6)
     subcarrier_start: 20
     subcarrier_end: 52
+    profile: walsh         # added 2026-11-03, EXPLORATORY: walsh | bump (§14)
+    dc_fraction: 1.0       # added 2026-11-03, EXPLORATORY: 1.0 | <1.0 (§14)
   subband:
     subcarrier_start: 20
     subcarrier_end: 52    # W = 32
@@ -401,7 +410,62 @@ evaluation:
 
 ---
 
-## 14. Audit log — commits đáng chú ý
+## 14. Session 2026-11-03 — hạ cấp P-ASR/CAS + đối phó defense (CHƯA validate trên data thật)
+
+Máy dev này **không có dataset MM-Fi** (`../MMFI/Compress/` không tồn tại) và không có GPU CUDA sẵn
+sàng trong venv dùng để kiểm thử — mọi thứ dưới đây chỉ chạy được bằng pytest (CPU, tensor tổng
+hợp). **Không có con số ASR/MPJPE thật nào được tạo ra trong session này**; mọi claim "giúp đối phó
+X" chỉ là giả thuyết có cơ sở toán học/logic, cần một run thật trên server GPU để xác nhận.
+
+### 14.1 Hạ cấp báo cáo (xem METRICS_THEORY.md §8)
+`asr_plausible` (P-ASR) và `latent_cas` (CAS) vẫn được tính và ghi CSV, nhưng không còn in log hay
+vào bảng chính (`train.py`, `evaluate_checkpoint.py`, `scripts/build_paper_artifacts.py`) vì (i)
+P-ASR gần như không lọc gì ở FPR hiệu chỉnh 5% trên run v8, (ii) null của CAS cách giá trị đo chỉ
+~0.008.
+
+### 14.2 Phát hiện quan trọng: nguyên nhân thật của "width=4 sập ASR" không phải cancellation
+Giả thuyết ban đầu (Sylvester row cancel chính xác tại window trùng chu kỳ) **không khớp** với số đo
+trực tiếp: pattern Walsh ở `ours_subband_v8` chỉ mất ~8% năng lượng nội vùng tại width=4 (đo bằng
+`subcarrier_smoothing` trên chính trigger bank, xem `tests/test_adaptive_defense.py`), quá nhỏ để
+giải thích mức sập 95%→22% quan sát được. Nguyên nhân khả dĩ hơn nhiều: `attack.eot_smoothing_widths`
+(train) dừng ở `[1,2,3]` trong khi `evaluation.robustness.smoothing_widths` (test) chạy tới `[2,3,4]`
+— **width=4 chưa từng xuất hiện lúc train**. Đã sửa `eot_smoothing_widths` → `[1,2,3,4,5]`. Đây là
+countermeasure có độ tin cậy cao nhất trong session này vì nó đóng một khoảng cách cấu hình có thật,
+không phải một cơ chế mới cần kiểm chứng.
+
+### 14.3 Các ablation mới (opt-in, mặc định = hành vi cũ hệt, xem docstring từng module)
+Lưu ý quan trọng: pipeline "latent" thật dùng `HadamardTrigger(axis="subband")`
+(`attack/triggers/hadamard_trigger.py`), KHÔNG dùng `SubbandTrigger`
+(`attack/triggers/subband_trigger.py`) — `registry.MODE_TO_TRIGGER` không bao giờ trỏ mode nào tới
+family `"subband"`. Mọi knob dưới đây được cài trên `HadamardTrigger` (code path thật) và lặp lại
+tương đương trên `SubbandTrigger` (gọi được qua `build_trigger("subband", ...)` nhưng không được
+dùng bởi config thường).
+
+| Knob | File | Mục tiêu | Đã kiểm chứng | Chưa biết |
+|---|---|---|---|---|
+| `attack.hadamard.profile=bump` | `hadamard_trigger.py` | Giữ năng lượng pattern tốt hơn dưới `subcarrier_smoothing` rộng (đo: ~97% vs ~92% tại width=4) | Input-tensor, đơn vị L2 | Có đổi ASR thật không — hiệu ứng phụ, nhỏ hơn fix 15.2 nhiều |
+| `attack.hadamard.dc_fraction<1` | `hadamard_trigger.py` | Để lại dư lượng khác-0 sau `remove_static_component` | Chứng minh toán học + đo số (tests) | Dư lượng có sống sót qua temporal avg-pool của victim để lật latent không |
+| `attack.lam_norm_match>0` | `attack/losses.py` (L_norm_match, term 7) | Giảm AUROC của detector tầm thường `‖z‖` (đo 1.00 trên run v8) | Gradient chỉ tới latent bị đầu độc (test) | Có phá ASR không; chưa biết weight hợp lý |
+| `attack.pc_rank_start>0` | `attack/latent_attack.py` | Dịch `U` khỏi top-K PC mà Spectral Signatures chiếu lên (AUROC đo 1.00) | Trực giao hoá, chọn đúng PC theo rank (test trên latent tổng hợp) | Decoder có học được backdoor từ hướng phương sai thấp không — rất suy đoán |
+
+Config sweep: `configs/experiments/adaptive_defense_countermeasures.yaml`, chạy bằng
+`python run_experiments.py --suite adaptive_defense` (suite mới trong `run_experiments.py`, KHÔNG
+nằm trong `--suite all`). Thứ tự ưu tiên đọc trong comment đầu file: `baseline_refit` trước
+(xác nhận 15.2 không làm hỏng gì), rồi `bump_profile`/`dc_fraction_mix_*`, rồi stealth knobs sau
+cùng vì suy đoán nhất.
+
+### 14.4 Việc cần làm tiếp (P1, trước khi đưa bất kỳ con số nào vào paper)
+1. Chạy `baseline_refit` trên server GPU, xác nhận ASR/MPJPE khớp `ours_subband_v8` cũ (không có
+   regressions từ việc đổi `eot_smoothing_widths`).
+2. So `baseline_refit` vs `ours_subband_v8` cũ tại `smoothing_width=4` — nếu khoảng cách thu hẹp
+   đáng kể, §14.2 được xác nhận; nếu không, viết lại giả thuyết.
+3. Chạy từng variant còn lại, so ASR/clean-MPJPE với `baseline_refit`, KHÔNG với số v8 cũ.
+4. Chỉ viết số vào paper sau khi có kết quả thật; cho tới lúc đó mọi khẳng định ở §14.3 giữ nguyên
+   nhãn EXPLORATORY.
+
+---
+
+## 15. Audit log — commits đáng chú ý
 
 | Commit | Nội dung |
 |--------|---------|

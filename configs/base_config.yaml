@@ -69,7 +69,13 @@ attack:
   # attack is actually trained for what evaluate_robustness measures, instead of only being
   # scored against it. width=1 is the identity (no smoothing) and must stay in the pool so a
   # fraction of batches see the raw trigger.
-  eot_smoothing_widths: [1, 2, 3]          # subcarrier-axis moving average widths to train against
+  # subcarrier-axis moving average widths to train against. Fixed 2026-11-03: this used to stop at
+  # 3 while evaluation.robustness.smoothing_widths below tests up to 4, so width=4 was pure
+  # train/test distribution shift -- the most likely explanation of the width=4 ASR cliff measured
+  # on ours_subband_v8 (95%->76%->22% at widths 2/3/4), well before any literal cancellation of the
+  # trigger pattern (see attack/triggers/subband_trigger.py's "Adaptive-defense ablations" note).
+  # Kept one wider than the eval grid so training sees the boundary, not just its edge.
+  eot_smoothing_widths: [1, 2, 3, 4, 5]
   eot_packet_smoothing_widths: [1, 2, 3]   # packet-axis moving average widths to train against
   eot_noise_stds: [0.0, 0.01, 0.02, 0.05]  # additive Gaussian noise (normalised CSI units)
   # Fixed, seeded poisoned subset of the TRAINING SET (standard threat model: the attacker
@@ -91,6 +97,11 @@ attack:
   #   The evaluation metric is unchanged; this only teaches the decoder to preserve
   #   subject-specific skeletal proportions when producing fall poses.
   lam_bone: 0.40
+  # Adaptive-defense ablation (2026-11-03, EXPLORATORY, default 0.0 = exact no-op): weight for
+  # L_norm_match, which pulls mean ||z_trig|| toward the (detached) mean ||z_clean|| to target the
+  # trivial ||z|| detector (latent_norm_auroc measured at 1.00 on the real run). See
+  # attack/losses.py LatentBackdoorLoss docstring term 7 for what is and is not validated.
+  lam_norm_match: 0.0
   # Latent thresholds.  Must satisfy clean_penalty_threshold < gate_threshold < margin: with
   # margin <= clean_penalty_threshold every sample can sit between the two and satisfy both
   # hinge terms with no trigger effect (the cause of s_clean == s_trig and ASR 0 %).
@@ -101,6 +112,11 @@ attack:
   clean_penalty_threshold: 1.0
   gate_threshold: 2.0      # latent activation gate used only for latent diagnostics
   margin_gap_sigma: 3.0    # calibrated gap between clean_thresh and margin, in clean std units
+  # Adaptive-defense ablation (2026-11-03, EXPLORATORY, default 0 = original top-K PCs): offsets
+  # which clean-latent principal components U is built from (PCs [pc_rank_start, pc_rank_start+K)
+  # instead of [0, K)). See attack/latent_attack.py make_U_from_latents docstring for the
+  # Spectral-Signatures trade-off this targets and what is NOT yet validated about it.
+  pc_rank_start: 0
   # Periodic U refresh: re-run PCA on clean training latents every N epochs to keep U aligned
   # with the evolving feature space.  0 = warm-up only (legacy behaviour).
   # Recommended: 10 (every 10 epochs over 50-epoch training = 5 updates total).
@@ -152,9 +168,20 @@ attack:
     axis: subband       # DEFAULT: concentrated sub-band trigger [20, 52), constant over packets
     subcarrier_start: 20
     subcarrier_end: 52
+    # Adaptive-defense ablations (2026-11-03, EXPLORATORY -- defaults reproduce the original
+    # trigger exactly; only meaningful for axis in {subband, subcarrier}; see
+    # attack/triggers/hadamard_trigger.py "Adaptive-defense ablations" for what each knob targets
+    # and what is NOT yet validated about it -- neither has been confirmed on a trained victim).
+    profile: walsh        # walsh (proposed) | bump (subcarrier-smoothing energy-retention ablation)
+    dc_fraction: 1.0       # 1.0 (proposed, fully constant over packets) | <1.0 (static-removal ablation)
   subband:
     subcarrier_start: 20
     subcarrier_end: 52
+    # Adaptive-defense ablations (2026-11-03, EXPLORATORY -- defaults reproduce the original
+    # trigger exactly; see attack/triggers/subband_trigger.py "Adaptive-defense ablations" for
+    # what each knob targets and what is NOT yet validated about it).
+    profile: walsh       # walsh (proposed) | bump (smoothing-energy-retention ablation)
+    dc_fraction: 1.0      # 1.0 (proposed, fully constant over packets) | <1.0 (static-removal ablation)
   ftrojan:
     channel_list: [0, 1, 2]
     pos_list_high: null      # null -> (F-1-3k, T-1)

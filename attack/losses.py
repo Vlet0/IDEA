@@ -55,7 +55,7 @@ def _bone_lengths(poses: torch.Tensor) -> torch.Tensor:
 
 class LatentBackdoorLoss(nn.Module):
     """
-    Latent-subspace backdoor loss (6 terms).
+    Latent-subspace backdoor loss (6 terms, +1 optional stealth term).
 
     ::
 
@@ -65,6 +65,7 @@ class LatentBackdoorLoss(nn.Module):
           + lam    * L_trig_margin
           + L_ortho
           + lam_bone * L_bone
+          + lam_norm_match * L_norm_match   (opt-in, default weight 0 -> exact no-op)
 
     1. ``L_clean_pose``   L1(p, y) on clean samples (utility).
     2. ``L_trig_pose``    L1(p, y_target) on poisoned samples, weight ``beta = lam_trig_pose``.
@@ -80,6 +81,17 @@ class LatentBackdoorLoss(nn.Module):
        metric.  The denominator uses target bone lengths (clamped away from zero), making
        the loss scale-invariant and consistent with the metric's ``max_bone_relative_error``
        threshold.
+    7. ``L_norm_match``   (EXPLORATORY, 2026-11-03, opt-in via ``lam_norm_match > 0``, default 0 is
+       an exact no-op) ``lam_norm_match * (mean ||z_trig|| - mean ||z_clean||.detach())^2`` on a
+       batch that has both clean and poisoned samples. ``defend/detection.py`` / ``evaluate.py``
+       report ``latent_norm_auroc`` -- the AUROC of the trivial detector ``||z||`` -- and the
+       repo's own real run measured it at 1.00 (a plain energy jump, detectable without knowing
+       ``U``). This term pulls the poisoned batch's mean latent norm toward the (detached) clean
+       batch's mean latent norm, directly targeting that trivial detector. It does NOT touch the
+       *direction* of ``z`` (the margin terms above still push ``u_k^T z`` across the gate), so it
+       is a norm-only stealth pressure, independent of attack strength; whether a large weight here
+       can shrink ``latent_norm_auroc`` without destroying ASR is an empirical question a real
+       training run has not yet answered.
 
     Note: the evaluator reports the unsigned statistic ``max_k |u_k^T z|``; training pushes
     the signed projection, so an activation of sign ``-`` is penalised in training but still
@@ -94,6 +106,7 @@ class LatentBackdoorLoss(nn.Module):
         lam_ortho: float,
         lam_trig_pose: float,
         lam_bone: float = 0.0,
+        lam_norm_match: float = 0.0,
     ) -> None:
         super().__init__()
         if not margin > clean_thresh:
@@ -107,6 +120,7 @@ class LatentBackdoorLoss(nn.Module):
         self.lam_ortho = lam_ortho
         self.lam_trig_pose = lam_trig_pose
         self.lam_bone = float(lam_bone)
+        self.lam_norm_match = float(lam_norm_match)
 
     def forward(
         self,
@@ -157,7 +171,18 @@ class LatentBackdoorLoss(nn.Module):
             rel_err = (p_bones - t_bones).abs() / t_bones.clamp_min(1e-6)  # relative error
             loss_bone = self.lam_bone * rel_err.mean()
 
-        total = loss_clean_pose + loss_trig_pose + loss_clean + loss_trig + loss_ortho + loss_bone
+        # ── L_norm_match (EXPLORATORY): pull mean ||z_trig|| toward the detached mean
+        # ||z_clean|| so the trivial ||z|| detector (latent_norm_auroc) has less to key on. The
+        # clean side is detached so this term only moves the poisoned norms, not the clean
+        # representation learned by L_clean_pose / L_clean_margin.
+        loss_norm_match = zero
+        if has_poison and has_clean and self.lam_norm_match > 0.0:
+            norm_trig = torch.linalg.vector_norm(z[poisoned], dim=-1).mean()
+            norm_clean = torch.linalg.vector_norm(z[clean], dim=-1).mean().detach()
+            loss_norm_match = self.lam_norm_match * (norm_trig - norm_clean).pow(2)
+
+        total = (loss_clean_pose + loss_trig_pose + loss_clean + loss_trig + loss_ortho
+                 + loss_bone + loss_norm_match)
         return total, {
             "loss": total.item(),
             "loss_clean_pose": loss_clean_pose.item(),
@@ -166,6 +191,7 @@ class LatentBackdoorLoss(nn.Module):
             "loss_trig": loss_trig.item(),
             "loss_ortho": loss_ortho.item(),
             "loss_bone": loss_bone.item() if has_poison and self.lam_bone > 0.0 else 0.0,
+            "loss_norm_match": loss_norm_match.item() if has_poison and has_clean and self.lam_norm_match > 0.0 else 0.0,
         }
 
 

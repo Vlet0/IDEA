@@ -48,12 +48,26 @@ def make_U_from_latents(
     device: str | torch.device = "cpu",
     *,
     margin_gap_sigma: float = 3.0,
+    pc_rank_start: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Initialize U from top-K principal directions of clean training latents.
+    """Initialize U from K principal directions of clean training latents.
 
     Using directions of maximum variance ensures the decoder already has
     meaningful gradient response along u_k, making L_margin+ effective from
     the first epoch.
+
+    ``pc_rank_start`` (EXPLORATORY, 2026-11-03, default 0 reproduces the original top-K choice
+    exactly) selects PCs ``[pc_rank_start, pc_rank_start + K)`` instead of always ``[0, K)``. The
+    top-K choice is also exactly why Spectral Signatures (Tran et al. 2018) detects this attack at
+    AUROC=1.0 in the repo's own audit: that defense scores samples by projection onto the TOP
+    singular directions of the centred features, which is precisely the subspace ``U`` is built
+    from. Moving ``U`` to a lower-variance PC range is a direct, principled way to probe that
+    trade-off -- ``defend/detection.py``'s default ``spectral_components=(1, 2)`` only inspects the
+    top two components, so ``pc_rank_start >= 2`` moves ``U`` outside what that audit call reports
+    by default -- but it is UNTESTED whether the decoder still gets enough gradient signal from a
+    lower-variance direction to learn the backdoor at all (the module's own rationale for using the
+    top directions is exactly that they are not low-variance). A real training run is required
+    before drawing any conclusion from this knob.
 
     The thresholds are calibrated on ``s = z @ U`` -- the *uncentred* projection that
     :class:`attack.losses.LatentBackdoorLoss` and the evaluator use.  ``z`` is a spatial
@@ -76,12 +90,14 @@ def make_U_from_latents(
         Target device for returned tensors.
     margin_gap_sigma : float
         Gap between ``clean_thresh`` and ``margin`` in clean standard deviations (> 0).
+    pc_rank_start : int
+        PC offset (0 = original top-K behaviour); see the EXPLORATORY note above.
 
     Returns
     -------
     U : (m, K)
-        Orthonormal basis — top-K right singular vectors of mean-centred Z, each oriented so
-        that the clean latents project non-negatively on average.
+        Orthonormal basis — PCs ``[pc_rank_start, pc_rank_start + K)`` of mean-centred Z, each
+        oriented so that the clean latents project non-negatively on average.
     margin : scalar float tensor
         Activation margin for triggered samples, ``clean_thresh + margin_gap_sigma * std``.
     clean_thresh : scalar float tensor
@@ -89,10 +105,16 @@ def make_U_from_latents(
     """
     if not margin_gap_sigma > 0.0:
         raise ValueError(f"margin_gap_sigma must be positive, got {margin_gap_sigma}")
+    if pc_rank_start < 0:
+        raise ValueError(f"pc_rank_start must be >= 0, got {pc_rank_start}")
     Z = Z_clean.float()
     Z_c = Z - Z.mean(dim=0, keepdim=True)
     _, _, Vt = torch.linalg.svd(Z_c, full_matrices=False)   # Vt: (min(N,m), m)
-    U_raw = Vt[:K].T        # (m, K) — top-K right singular vectors
+    n_pc = Vt.shape[0]
+    if pc_rank_start + K > n_pc:
+        raise ValueError(f"pc_rank_start + K ({pc_rank_start + K}) exceeds the available "
+                         f"{n_pc} principal components of this latent batch")
+    U_raw = Vt[pc_rank_start:pc_rank_start + K].T        # (m, K) — the selected right singular vectors
     Q, _ = torch.linalg.qr(U_raw)   # exact orthonormality
     # SVD signs are arbitrary.  The loss pushes the *signed* u_k^T z above the margin, so orient
     # each direction toward the clean mass: the trigger then has to raise an existing activation

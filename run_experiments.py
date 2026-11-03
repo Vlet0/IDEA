@@ -268,7 +268,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/base_config.yaml")
     parser.add_argument("--suite", default="all",
                         choices=["all", "main_benchmark", "leave_one_out", "seeds", "sweeps", "loss_ablation",
-                                 "component_ablation", "attack_variants"])
+                                 "component_ablation", "attack_variants", "adaptive_defense"])
     args = parser.parse_args()
     base = load_config(args.config)
     if args.suite in ("all", "main_benchmark"):
@@ -285,6 +285,11 @@ def main() -> None:
         run_component_ablation(base, "configs/experiments/loss_component_ablation.yaml")
     if args.suite in ("all", "attack_variants"):
         run_attack_variants(base, "configs/experiments/attack_variants.yaml")
+    # EXPLORATORY, not part of "all": adaptive-defense countermeasure ablations (2026-11-03), see
+    # configs/experiments/adaptive_defense_countermeasures.yaml for what each variant targets and
+    # what is NOT yet validated about it. Run explicitly with --suite adaptive_defense.
+    if args.suite == "adaptive_defense":
+        run_attack_variants(base, "configs/experiments/adaptive_defense_countermeasures.yaml")
 
 
 if __name__ == "__main__":
