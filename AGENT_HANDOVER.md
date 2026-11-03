@@ -336,7 +336,10 @@ plot_burst_ablation(rows, 'report_latex/figure_burst_ablation', {'formats':['pdf
 ### P2 — Extension
 8. **Multi-seed** (5 seeds) sau single-seed confirmed
 9. **LORO** — `configs/experiments/leave_one_room_out.yaml`
-10. **Multi-trigger K=2** — `configs/experiments/attack_variants.yaml`
+10. ~~Multi-trigger K=2~~ — **OUT OF SCOPE (quyết định 2026-11-03)**: dự án chỉ chạy `K=1`.
+    `configs/experiments/attack_variants.yaml` không còn nằm trong `--suite all`
+    (`run_experiments.py`), vẫn chạy được thủ công qua `--suite attack_variants` nếu sau này cần
+    xem lại.
 
 ---
 

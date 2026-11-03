@@ -283,7 +283,10 @@ def main() -> None:
         run_loss_ablation(base, "configs/experiments/loss_weight_ablation.yaml")
     if args.suite in ("all", "component_ablation"):
         run_component_ablation(base, "configs/experiments/loss_component_ablation.yaml")
-    if args.suite in ("all", "attack_variants"):
+    # OUT OF SCOPE, not part of "all" (decided 2026-11-03): the multi-trigger K=2 direction
+    # (configs/experiments/attack_variants.yaml) is dropped -- the project now runs K=1 only. The
+    # suite is kept available to run explicitly (--suite attack_variants) in case this is revisited.
+    if args.suite == "attack_variants":
         run_attack_variants(base, "configs/experiments/attack_variants.yaml")
     # EXPLORATORY, not part of "all": adaptive-defense countermeasure ablations (2026-11-03), see
     # configs/experiments/adaptive_defense_countermeasures.yaml for what each variant targets and
