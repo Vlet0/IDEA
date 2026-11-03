@@ -93,6 +93,19 @@ class LatentBackdoorLoss(nn.Module):
        can shrink ``latent_norm_auroc`` without destroying ASR is an empirical question a real
        training run has not yet answered.
 
+       Adversarial-review finding (2026-11-03, before any real run): this term is very likely a
+       lateral move, not a fix. It cannot affect Spectral Signatures or any *direction*-based
+       detector at all (it only touches ``||z||``). Worse, by the identity ``||z||^2 =
+       sum_j (u_j^T z)^2 + ||z_perp||^2``, simultaneously satisfying ``L_trig_margin`` (pushes
+       ``u_k^T z`` up to ``margin``), ``L_ortho`` (pushes every other ``u_j^T z`` toward 0) and this
+       term (holds ``||z_trig||`` near ``||z_clean||``) forces ``||z_perp,trig||^2`` to shrink to
+       roughly ``||z_clean||^2 - margin^2`` -- i.e. poisoned samples end up with systematically
+       *lower* off-trigger-subspace energy than clean ones. That is a new, cheap, ``U``-agnostic
+       second-order statistic (project out the top PC, compare residual variance) a defender could
+       use instead of ``||z||`` or Spectral Signatures. A real run is still needed to know whether
+       this new signature is in practice easier or harder to find than the one it replaces, but the
+       term should not be read as "defeats the trivial detector" without that caveat.
+
     Note: the evaluator reports the unsigned statistic ``max_k |u_k^T z|``; training pushes
     the signed projection, so an activation of sign ``-`` is penalised in training but still
     counted as activated at evaluation.

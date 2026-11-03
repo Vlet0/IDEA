@@ -852,25 +852,6 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 for name, value in loss_info.items():
                     epoch_breakdown[name] = epoch_breakdown.get(name, 0.0) + value * b
 
-            if (ep + 1) % log_interval == 0 or (ep + 1) == epochs:
-                avg = total_loss / max(total_samples, 1)
-                breakdown = " | ".join(
-                    f"{name.replace('loss_', 'L_')}: {value / max(total_samples, 1):.3g}"
-                    for name, value in epoch_breakdown.items() if name != "loss"
-                )
-                logger.info(f"  Epoch [{ep+1:2d}/{epochs:2d}] Loss: {avg:.4f} | {breakdown} | "
-                            f"ep: {time.time()-epoch_t0:.0f}s | total: {time.time()-t0:.0f}s")
-                torch.save({
-                    "epoch": ep, "training_epochs": epochs,
-                    "net_state_dict": net.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "U": U.cpu(),
-                    "calibration": calibration(),
-                    "config_id": config_id,
-                    "training_protocol_version": TRAINING_PROTOCOL_VERSION,
-                }, epoch_ckpt_path)
-
             # ── Periodic U refresh ────────────────────────────────────────────────────
             # Re-run PCA on clean training latents every `u_update_interval` epochs so U
             # stays aligned with the evolving feature space.  Without this U is computed
@@ -878,6 +859,15 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             # latent separation signal (AUROC stays near 0.5, d'≈0.45).
             # Skipped on epoch 0 (warm-up already ran), on the last epoch (post-training
             # evaluation uses the checkpoint's U), and when u_update_interval is 0 (legacy).
+            # Runs BEFORE the checkpoint save below (fix, 2026-11-03): the save must capture
+            # whatever U/calibration should govern training from `epoch + 1` onward on resume
+            # (that is what the resume path a few hundred lines up loads verbatim), so a refresh
+            # that fires on this exact epoch boundary has to be applied first. Saving first used
+            # to persist the PRE-refresh U; a crash between that save and the next one (one full
+            # epoch later, since log_interval=1 saves every epoch) would resume with the stale
+            # U, permanently and silently skip this refresh (the next boundary check compares
+            # against the wrong epoch count), and feed that stale U as `U_prev` into the next
+            # real refresh -- doubling the continuity-tracking gap it was meant to close.
             _u_interval = int(atk_cfg.get("u_update_interval", 0))
             if (latent_active and _u_interval > 0
                     and (ep + 1) % _u_interval == 0
@@ -920,6 +910,25 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                     f"clean_thresh={clean_thresh:.4f} < gate={gate:.4f} < margin={margin:.4f}"
                 )
                 logger.info(f"  [U refresh ep {ep+1}] U^T U:\n{(U.T @ U).cpu().numpy().round(4)}")
+
+            if (ep + 1) % log_interval == 0 or (ep + 1) == epochs:
+                avg = total_loss / max(total_samples, 1)
+                breakdown = " | ".join(
+                    f"{name.replace('loss_', 'L_')}: {value / max(total_samples, 1):.3g}"
+                    for name, value in epoch_breakdown.items() if name != "loss"
+                )
+                logger.info(f"  Epoch [{ep+1:2d}/{epochs:2d}] Loss: {avg:.4f} | {breakdown} | "
+                            f"ep: {time.time()-epoch_t0:.0f}s | total: {time.time()-t0:.0f}s")
+                torch.save({
+                    "epoch": ep, "training_epochs": epochs,
+                    "net_state_dict": net.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "U": U.cpu(),
+                    "calibration": calibration(),
+                    "config_id": config_id,
+                    "training_protocol_version": TRAINING_PROTOCOL_VERSION,
+                }, epoch_ckpt_path)
 
             if probe_interval > 0 and ((ep + 1) % probe_interval == 0 or (ep + 1) == epochs):
                 # Probe evaluation mirrors the final run_evaluation call.  Pass seq_ids so the

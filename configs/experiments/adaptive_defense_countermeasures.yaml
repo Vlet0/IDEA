@@ -11,13 +11,26 @@
 # this file (real GPU + MM-Fi cache) is for. Compare every variant's ASR/clean-MPJPE against the
 # `baseline` arm (which reproduces ours_subband_v8 exactly) before drawing any conclusion.
 #
-# Priority for a first real run: `smoothing_eot_fix` alone (it is also now the base_config.yaml
-# default, so `baseline` already includes it) is the highest-confidence fix for the
-# smoothing_width=4 cliff -- it closes a plain train/test gap (EOT trained widths [1,2,3] while
-# evaluation tests [2,3,4]), not a new mechanism. `bump_profile` and `dc_fraction_mix` are
-# separate, smaller, more speculative trigger-geometry changes. `midrank_stealth` is the most
-# speculative (an open question whether the decoder can still learn the backdoor at all from a
-# lower-variance direction) and should be evaluated last.
+# Priority for a first real run: `baseline_refit` first (it already includes the eot_smoothing_widths
+# fix -- the highest-confidence item here, since it closes a plain train/test gap, not a new
+# mechanism). Then `bump_profile` / `dc_fraction_mix_*` -- smaller, more speculative trigger-geometry
+# changes. Run `norm_match_stealth` / `midrank_stealth*` / `combined_stealth` LAST and read them with
+# extra skepticism: a 2026-11-03 adversarial review (two independent reviewer passes, see
+# AGENT_HANDOVER.md §14.6) found a structural reason to doubt each, not just "untested":
+#   - lam_norm_match only touches ||z||, never direction, so it cannot affect Spectral Signatures at
+#     all, and the geometric identity ||z||^2 = sum_j(u_j^Tz)^2 + ||z_perp||^2 means satisfying it
+#     together with the margin/ortho losses likely creates a NEW signature (shrunk off-trigger-
+#     subspace variance on poisoned samples) instead of removing one. See attack/losses.py's
+#     L_norm_match docstring.
+#   - pc_rank_start's escape depends on evaluate.py's spectral_audit running on the CLEAN feature
+#     distribution, but it actually runs on poisoned_train_set -- the attack's own success at
+#     injecting a several-sigma margin along U plausibly re-promotes that direction's eigenvalue back
+#     into the top-2 the default audit inspects, regardless of pc_rank_start. See
+#     attack/latent_attack.py's make_U_from_latents docstring. A real run must check
+#     spectral_auroc_c1/c2 is low AND ASR is high at the SAME checkpoint, not either alone.
+# These are reasons to expect a smaller (or negative) effect than originally hoped, not reasons to
+# skip the run -- only a real checkpoint can settle whether the tension is fatal or just a smaller
+# margin than the single-knob arms above.
 experiment_type: attack_variants
 
 default_params:

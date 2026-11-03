@@ -238,6 +238,24 @@ class UContinuityTrackingTests(unittest.TestCase):
         gram = U.T @ U
         self.assertTrue(torch.allclose(gram, torch.eye(2), atol=1e-5))
 
+    def test_matching_is_optimal_not_greedy_by_column_order(self):
+        # Adversarial review finding (2026-11-03): a greedy, column-order pick can strand column 1
+        # on a poor match when columns 0 and 1's best candidates overlap, even though a swap would
+        # have been better for both. a = Q[:,0], b = Q[:,1] (the two best-separated true PCs).
+        # U_prev[:,0] is a near-equal mix of a and b (cos ~0.73 with each); U_prev[:,1] = a exactly
+        # (cos 1.0 with a, 0.0 with b). Greedy-in-order processes column 0 first, (wrongly) grabs
+        # `a` (its single highest score), leaving column 1 forced onto `b` with cos 0.0 -- total
+        # matched similarity 0.73. The optimal assignment instead gives column 0 -> b, column 1 ->
+        # a, total ~1.73: strictly better, and the only assignment a real attacker tracking two
+        # directions would want.
+        Z, Q = self._synthetic_latents()
+        a, b = Q[:, 0], Q[:, 1]
+        col0 = torch.nn.functional.normalize(0.9 * a + 0.85 * b, dim=0)
+        U_prev = torch.stack([col0, a], dim=1)
+        U, _, _ = make_U_from_latents(Z, K=2, margin_gap_sigma=3.0, U_prev=U_prev)
+        self.assertGreater(float((U[:, 0] @ b).abs()), 0.99)   # column 0 ends up tracking b, not a
+        self.assertGreater(float((U[:, 1] @ a).abs()), 0.99)   # column 1 keeps tracking a
+
     def test_continuity_tracking_only_needs_k_available_pcs_not_pc_rank_start_plus_k(self):
         # min(n, m) = 5 available PCs; pc_rank_start=4 alone would be rejected (as the by-rank
         # path requires), but continuity tracking only needs K <= 5 to match every U_prev column.

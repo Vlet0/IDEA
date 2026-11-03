@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 
 from utils.skeleton import BONES, NECK, PELVIS, facing_direction, horizontal_axes
 
@@ -70,6 +71,20 @@ def make_U_from_latents(
     top directions is exactly that they are not low-variance). A real training run is required
     before drawing any conclusion from this knob.
 
+    Adversarial-review finding (2026-11-03, before any real run), and likely the more serious
+    problem: ``evaluate.py::spectral_audit`` computes the audited features from
+    ``poisoned_train_set`` -- the ALREADY-POISONED training set, not a clean-only reference. The
+    attack's own success at separating poisoned latents along ``U`` (a margin of roughly
+    ``margin_gap_sigma`` clean standard deviations above ``clean_thresh``, i.e. several-sigma) raises
+    that direction's own eigenvalue in the audited covariance by injecting a high-variance cluster
+    along it into a ``poison_rate``-sized subset -- plausibly enough, for a large enough margin, to
+    re-promote a low-rank ``U`` back into the top-2 eigenvectors the default audit inspects,
+    regardless of where ``pc_rank_start`` initially placed it. If so, the escape this knob buys is
+    real only in a narrow regime where the injected separation is too small for the ASR objective to
+    actually need -- i.e. the knob may be in direct tension with the attack's own success criterion,
+    not merely "untested". A real run should check ``spectral_auroc_c1``/``c2`` is actually low AND
+    ASR is still high at the same checkpoint, not either alone.
+
     ``U_prev`` (fix, 2026-11-03) makes a periodic re-calibration (``train.py``'s ``u_update_interval``)
     track the SAME physical direction instead of blindly re-selecting ``[pc_rank_start,
     pc_rank_start + K)`` by rank every time. Without it, a refresh call is only safe when the
@@ -82,11 +97,16 @@ def make_U_from_latents(
     real attacker optimizing this attack would obviously track the one direction they already spent
     epochs poisoning toward, not re-derive "whichever direction is currently rank k", so by-rank
     refresh was never the realistic choice to begin with. When ``U_prev`` (shape ``(m, K)``, the
-    basis from the previous calibration) is given, each of its columns is greedily matched (without
-    reuse) to the available PC of this call's covariance with the highest absolute cosine similarity
-    to it, searched over the *entire* spectrum (``pc_rank_start`` is then unused for selection; the
-    full SVD already computes every component, so widening the search costs nothing). ``U_prev=None``
-    (the default, used at the initial PCA warm-up) keeps the original by-rank behaviour exactly.
+    basis from the previous calibration) is given, its columns are matched to the available PCs of
+    this call's covariance by the Hungarian algorithm (``scipy.optimize.linear_sum_assignment``),
+    maximising the *total* absolute cosine similarity across all K columns at once -- not a greedy,
+    column-order pick, which can strand one column on a poor match that a swap would have avoided
+    when two columns' best candidates overlap (this matters in practice: several non-exploratory
+    configs in this repo, e.g. ``configs/experiments/attack_variants.yaml``, use ``K=2`` with the
+    default ``u_update_interval``, so every refresh there also goes through this path). The search
+    covers the *entire* spectrum (``pc_rank_start`` is then unused for selection; the full SVD
+    already computes every component, so widening the search costs nothing). ``U_prev=None`` (the
+    default, used at the initial PCA warm-up) keeps the original by-rank behaviour exactly.
 
     The thresholds are calibrated on ``s = z @ U`` -- the *uncentred* projection that
     :class:`attack.losses.LatentBackdoorLoss` and the evaluator use.  ``z`` is a spatial
@@ -149,14 +169,14 @@ def make_U_from_latents(
             raise ValueError(f"U_prev must have shape {(Z.shape[1], K)}, got {tuple(U_prev.shape)}")
         all_pcs = Vt.T  # (m, n_pc), already orthonormal columns
         sim = (U_prev.T @ all_pcs).abs()  # (K, n_pc) cosine similarity (both sides unit-norm)
-        used = torch.zeros(n_pc, dtype=torch.bool, device=sim.device)
-        cols = []
-        for j in range(K):
-            row = sim[j].masked_fill(used, -1.0)
-            idx = int(row.argmax())
-            used[idx] = True
-            cols.append(all_pcs[:, idx])
-        U_raw = torch.stack(cols, dim=1)
+        # Optimal (not greedy) assignment: maximise total matched similarity over all K columns
+        # at once via the Hungarian algorithm. A greedy, column-order pick can strand a later
+        # column on a poor match that a swap would have avoided -- e.g. column 0's best candidate
+        # (0.90) is also column 1's only good one (0.95), while column 0's second-best (0.85) is
+        # almost as good for it; greedy-in-order takes 0.90 for column 0 and forces column 1 onto
+        # a near-orthogonal leftover, whereas the optimal assignment swaps them for 0.85 + 0.95.
+        _, col_idx = linear_sum_assignment(-sim.cpu().numpy())  # row_ind == 0..K-1, already sorted
+        U_raw = all_pcs[:, torch.as_tensor(col_idx, dtype=torch.long, device=all_pcs.device)]
     Q, _ = torch.linalg.qr(U_raw)   # exact orthonormality
     # SVD signs are arbitrary.  The loss pushes the *signed* u_k^T z above the margin, so orient
     # each direction toward the clean mass: the trigger then has to raise an existing activation

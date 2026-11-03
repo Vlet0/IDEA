@@ -476,26 +476,75 @@ từ đầu theo hướng mới mỗi 10 epoch. Bộ test cũ không bắt đư�
 một lần trên `Z` tĩnh, không mô phỏng chuỗi refresh với covariance trôi dần.
 
 **Đã sửa** (`attack/latent_attack.py::make_U_from_latents`, tham số mới `U_prev`): khi refresh
-(`train.py` dòng ~903) giờ truyền `U_prev=U` (basis hiện tại trước khi thay) — hàm sẽ khớp từng cột
-của `U_prev` với PC có cosine similarity tuyệt đối cao nhất trong TOÀN BỘ phổ (không giới hạn quanh
-`pc_rank_start` — SVD đã tính hết mọi thành phần nên không tốn thêm chi phí), theo kiểu greedy không
-dùng lại một PC hai lần. Lúc PCA warm-up đầu tiên (`U_prev=None`) hành vi giữ nguyên y hệt bản cũ
-(chọn theo rank). `train.py` cũng log thêm `min |cos(prev, tracked)|` mỗi lần refresh để theo dõi mức
-trôi của hướng U qua các epoch — một con số gần 0 là dấu hiệu `U` vừa nhảy hướng, cần xem lại.
+(`train.py` dòng ~898) giờ truyền `U_prev=U` (basis hiện tại trước khi thay) — hàm sẽ khớp các cột
+của `U_prev` với PC trong TOÀN BỘ phổ (không giới hạn quanh `pc_rank_start` — SVD đã tính hết mọi
+thành phần nên không tốn thêm chi phí) bằng thuật toán Hungarian (`scipy.optimize.linear_sum_assignment`,
+tối ưu tổng cosine similarity trên tất cả K cột cùng lúc — xem §14.6 lý do không dùng greedy). Lúc PCA
+warm-up đầu tiên (`U_prev=None`) hành vi giữ nguyên y hệt bản cũ (chọn theo rank). `train.py` cũng log
+thêm `min |cos(prev, tracked)|` mỗi lần refresh để theo dõi mức trôi của hướng U qua các epoch — một
+con số gần 0 là dấu hiệu `U` vừa nhảy hướng, cần xem lại.
 
 Đây là lựa chọn đúng cả về mặt threat-model: một attacker thực sự tối ưu attack này sẽ luôn bám theo
 đúng hướng mà họ đã đầu độc label hướng tới, không có lý do gì để "chọn lại bất kỳ hướng nào đang xếp
 hạng k hôm nay" — nên continuity-tracking mới là lựa chọn khả thi mà attacker thực tế sẽ dùng, không
 phải một cải tiến tùy chọn. Áp dụng cho MỌI refresh (kể cả `pc_rank_start=0`) vì khi eigengap lớn, hai
 cách cho kết quả gần như giống hệt nhau — nên đây gần như chắc chắn là an toàn cho các run đã validate
-trước đó (v8/v9), đồng thời sửa đúng lỗ hổng cho 2 variant midrank. Thêm 4 test mới trong
-`tests/test_adaptive_defense.py` (`UContinuityTrackingTests`): bám hướng cũ qua một lần hoán đổi
-eigenvalue mô phỏng, validate shape `U_prev`, không dùng lại một PC hai lần khi K>1, và không còn bị
-chặn bởi check `pc_rank_start+K<=n_pc` khi đã có `U_prev` (continuity chỉ cần `K<=n_pc`). Review bắt
-thêm 1 bug thật trước khi commit: `used` mask ban đầu luôn tạo trên CPU trong khi `sim` có thể ở CUDA
-— sẽ crash ngay lần refresh đầu tiên trên GPU thật; đã sửa (`device=sim.device`). Toàn bộ 115 test
-(CPU, tensor tổng hợp) xanh; như mọi thứ khác trong §14, đây vẫn CHƯA được xác nhận trên GPU/dataset
-thật.
+trước đó (v8/v9), đồng thời sửa đúng lỗ hổng cho 2 variant midrank.
+
+### 14.6 Phản biện bằng 2 agent độc lập (2026-11-03) — 4 lỗ hổng/bug thật được xác nhận
+Trước khi chạy v10, dùng 2 agent độc lập (không chia sẻ context với nhau) để phản biện toàn bộ lý
+thuyết của §14.3 và §14.5. Cả hai được yêu cầu mặc định hoài nghi, đọc code thật, và cho verdict
+HOLDS/FLAWED/UNVALIDATED-BUT-PLAUSIBLE/UNTESTED-GAP. Tổng hợp những gì còn lại sau khi tôi tự verify
+lại bằng cách đọc code:
+
+**Lỗ hổng thiết kế thật (không chỉ "chưa kiểm chứng" — có cơ chế cụ thể làm nó không hoạt động như kỳ vọng):**
+- `lam_norm_match` (xem `attack/losses.py` docstring term 7 đã cập nhật): chỉ sửa *norm*, không đụng
+  *hướng* → không có tác dụng với Spectral Signatures. Tệ hơn: đẳng thức `||z||²=Σ(u_j^Tz)²+||z⊥||²`
+  nghĩa là ép buộc đồng thời margin-loss + ortho-loss + norm-match sẽ làm `||z⊥||` của mẫu nhiễm co lại
+  thấp hơn mẫu sạch một cách có hệ thống — một detector mới, rẻ hơn, không cần biết U.
+- `pc_rank_start` (xem `attack/latent_attack.py::make_U_from_latents` docstring đã cập nhật):
+  `evaluate.py::spectral_audit` tính feature trên `poisoned_train_set` (đã nhiễm), không phải tập sạch
+  — chính việc attack thành công (tiêm margin vài-sigma vào ~10% mẫu) có thể tự đẩy eigenvalue hướng đó
+  quay lại top-2 bị audit mặc định, bất kể `pc_rank_start` ban đầu. Mâu thuẫn cấu trúc với chính mục
+  tiêu ASR (cần margin đủ lớn).
+- Cả hai đã được hạ thêm 1 bậc nghi ngờ trong docstring + comment đầu `adaptive_defense_countermeasures.yaml`
+  (chạy sau cùng, đọc kết quả với sự hoài nghi cao hơn các arm khác).
+
+**3 bug thật trong chính fix U-refresh (§14.5), đã sửa trước khi commit lần này:**
+1. Greedy-theo-thứ-tự-cột (K>1) có thể cho kết quả tệ hơn tối ưu toàn cục (ví dụ cụ thể: 2 cột cùng
+   thích 1 ứng viên, greedy "cướp" mất của cột kia) — ảnh hưởng thật tới các config K=2 ĐANG DÙNG
+   (`configs/experiments/attack_variants.yaml`, không phải chỉ các variant EXPLORATORY), vì refresh
+   áp dụng cho mọi `K`. **Đã sửa**: thay bằng thuật toán Hungarian (tối ưu toàn cục), thêm test
+   `test_matching_is_optimal_not_greedy_by_column_order`.
+2. Checkpoint save (mỗi epoch, `log_interval=1`) chạy TRƯỚC block refresh trong cùng vòng lặp epoch —
+   nên nếu tiến trình dừng/crash giữa lúc refresh đã áp dụng trong bộ nhớ và lần save kế tiếp, resume
+   sẽ nạp lại `U` CŨ (trước refresh) và lần refresh đó bị bỏ qua vĩnh viễn + im lặng (boundary check
+   epoch không khớp lại lần nữa), đồng thời `U_prev` của lần refresh thật tiếp theo cũng sai theo.
+   **Đã sửa**: đổi thứ tự — refresh chạy trước, save chạy sau, để checkpoint luôn phản ánh đúng `U` sẽ
+   dùng cho epoch tiếp theo nếu resume.
+3. (Tự tìm trước khi commit §14.5, nhắc lại ở đây cho đủ): mask `used` tạo cứng trên CPU trong khi
+   `sim` theo device của Z → crash ngay lần refresh đầu trên GPU thật. Đã sửa (`device=sim.device`).
+
+**Các điểm còn lại (rủi ro thật nhưng chấp nhận được / cần dữ liệu thật mới biết):**
+- `profile=bump`: đúng về chống `subcarrier_smoothing` nhưng chưa xét 2 mặt trái — lobe không âm có DC
+  cục bộ không bị `remove_static_component` đụng tới (lộ cho check biên độ trung bình theo subcarrier),
+  và đỉnh L∞ cao hơn Walsh ~63% ở cùng năng lượng L2 (dễ bị clip/magnitude check hơn).
+- `dc_fraction<1`: đúng về toán, nhưng SNR của phần dư so với nhiễu CSI thực tế ở biên độ tiêm nhỏ
+  (stealthy) vẫn chưa rõ có đủ lớn để temporal pooling của HP-ELI "nhìn thấy" không.
+- `eot_smoothing_widths` fix: hợp lý nhưng mỗi batch chỉ nhận 1/10 điều kiện EOT ngẫu nhiên đều —
+  không có cơ chế đảm bảo tần suất tối thiểu cho width=4 (điều kiện từng sập nặng nhất); một thiết kế
+  round-robin/trọng số sẽ chắc chắn hơn nhưng chưa cần thiết để thử trước.
+- Feedback-loop giữa backbone đang train và chính covariance dùng để refresh U: không thể loại trừ
+  bằng code, chỉ dữ liệu thật mới trả lời được.
+- Multi-refresh "random walk" khi các eigenvalue lân cận gần bằng nhau (`pc_rank_start=8`): continuity-
+  tracking không bị sập đột ngột như bug cũ, nhưng có thể trôi dần qua nhiều lần refresh mà không có
+  cảnh báo nào ngoài `min|cos(prev,tracked)|` giữa 2 lần refresh liên tiếp (không so với hướng gốc
+  epoch 0).
+- Resume mid-training cắt ngang 1 lần refresh, test K>1 đối kháng, drift nhiều bước, và feedback-loop
+  đều KHÔNG được test đơn vị bao phủ (chỉ test được 1 lần hoán đổi eigenvalue đơn, tĩnh).
+
+Toàn bộ 116 test (CPU, tensor tổng hợp) xanh sau các fix trên. Như mọi thứ khác trong §14, các claim
+còn lại vẫn CHƯA được xác nhận trên GPU/dataset thật.
 
 ---
 
