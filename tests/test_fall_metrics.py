@@ -221,6 +221,8 @@ class FallMetricTests(unittest.TestCase):
                                    criteria, collapse, [1.0], target_cfg, U=None)
         self.assertEqual(no_latent["latent_applicable"], 0)
         self.assertTrue(math.isnan(no_latent["latent_auroc"]))  # never a number from an arbitrary projection
+        self.assertIn("target_pck_10cm", result)
+        self.assertIn("clean_pck_10cm", result)
 
         for row in evaluate_per_trigger(Model(), loader, trigger, targets, PS, "cpu", 0.15,
                                         criteria, collapse, target_cfg):

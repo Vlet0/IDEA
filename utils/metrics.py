@@ -697,18 +697,29 @@ def compute_target_pck(
     target_poses: Any,
     ps: float,
     thresholds_cm: tuple[float, ...] = (10.0, 15.0, 20.0),
+    prefix: str = "target_pck",
 ) -> dict[str, float]:
-    """Percentage of Correct Keypoints (PCK) relative to target fall pose."""
+    """Percentage of Correct Keypoints (PCK) relative to target (or ground-truth) pose."""
     p, t = _tensor(pred_poses), _tensor(target_poses)
     if p.shape != t.shape or p.ndim != 3:
         raise ValueError(f"pred_poses and target_poses must have shape (N, J, 3), got {p.shape} vs {t.shape}")
     joint_dists_cm = torch.linalg.vector_norm(p - t, dim=-1) * float(ps) * 100.0  # (N, J)
     res = {}
     for d in thresholds_cm:
-        key = f"target_pck_{int(d) if d.is_integer() else d}cm"
+        key = f"{prefix}_{int(d) if d.is_integer() else d}cm"
         frac = (joint_dists_cm <= float(d)).float().mean().item() * 100.0
         res[key] = float(frac)
     return res
+
+
+def compute_clean_pck(
+    pred_poses: Any,
+    gt_poses: Any,
+    ps: float,
+    thresholds_cm: tuple[float, ...] = (10.0, 15.0, 20.0),
+) -> dict[str, float]:
+    """Percentage of Correct Keypoints (PCK) for clean predictions relative to ground truth."""
+    return compute_target_pck(pred_poses, gt_poses, ps, thresholds_cm=thresholds_cm, prefix="clean_pck")
 
 
 def compute_latent_cosine_alignment(z_trig: Any, U: Any) -> float:

@@ -86,6 +86,7 @@ from utils.metrics import (
     cluster_ratio_ci,
     fall_threshold_sensitivity,
     compute_target_pck,
+    compute_clean_pck,
     compute_latent_cosine_alignment,
     compute_latent_norm_auroc,
     compute_latent_shift_alignment,
@@ -364,6 +365,7 @@ def evaluate_model(
         ground_truth_poses=gt[inj],
     )
 
+    clean_pck = compute_clean_pck(clean_preds, gt, PS, (10.0, 15.0, 20.0))
     target_pck = compute_target_pck(trig_preds[inj], target_poses[inj], PS, (10.0, 15.0, 20.0))
 
     if U is not None:
@@ -394,6 +396,7 @@ def evaluate_model(
         "target_mpjpe_p95_cm": float(torch.quantile(target_error[inj].double(), 0.95)),
         "clean_target_mpjpe_cm": float(compute_mpjpe(clean_preds, target_poses, PS)[inj].mean()),
         "causal_displacement_cm": float(displacement[inj].mean()),
+        **clean_pck,
         **target_pck,
         "latent_cas": latent_cas,
         "latent_cas_raw": latent_cas_raw,

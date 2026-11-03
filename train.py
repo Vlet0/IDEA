@@ -425,7 +425,13 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
             log("  WARNING             : no subject ids (cache layout check failed) -> subject-level CIs are nan and "
                 "the Wilson CIs below treat sequences as independent (anti-conservative)")
         log(f"  Clean MPJPE (cm)    : {eval_res['clean_mpjpe_cm']:6.2f} ± {eval_res['clean_mpjpe_std']:.2f} (all frames)")
+        clean_pck_str = " | ".join(f"@{k.removeprefix('clean_pck_')}: {eval_res[k]:.1f}%" for k in sorted(eval_res) if k.startswith("clean_pck_"))
+        if clean_pck_str:
+            log(f"  Clean PCK           : {clean_pck_str} (all frames)")
         log(f"  T-MPJPE (cm)        : {eval_res['target_mpjpe_cm']:6.2f} ± {eval_res['target_mpjpe_std_cm']:.2f} (injected)")
+        target_pck_str = " | ".join(f"@{k.removeprefix('target_pck_')}: {eval_res[k]:.1f}%" for k in sorted(eval_res) if k.startswith("target_pck_"))
+        if target_pck_str:
+            log(f"  Target PCK          : {target_pck_str} (injected frames)")
         log(f"  CAD (causal displ.) : {eval_res['causal_displacement_cm']:6.2f} cm (injected)")
         if mixed_targets:
             log("  NOTE: targets mix alarm and conceal intents; the aggregate fall-alarm ASR below "

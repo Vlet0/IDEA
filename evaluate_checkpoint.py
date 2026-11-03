@@ -184,7 +184,13 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     print(f"Test injection         : {res['n_injected']} frames ({res['injected_fraction_pct']:.2f}% of the stream); "
           "attack estimands are over injected frames")
     print(f"Clean MPJPE            : {res['clean_mpjpe_cm']:6.2f} ± {res['clean_mpjpe_std']:.2f} cm")
+    clean_pck_str = " | ".join(f"@{k.removeprefix('clean_pck_')}: {res[k]:.1f}%" for k in sorted(res) if k.startswith("clean_pck_"))
+    if clean_pck_str:
+        print(f"Clean PCK              : {clean_pck_str}")
     print(f"T-MPJPE (injected)     : {res['target_mpjpe_cm']:6.4f} ± {res['target_mpjpe_std_cm']:.4f} cm")
+    target_pck_str = " | ".join(f"@{k.removeprefix('target_pck_')}: {res[k]:.1f}%" for k in sorted(res) if k.startswith("target_pck_"))
+    if target_pck_str:
+        print(f"Target PCK             : {target_pck_str}")
     print(f"ASR (any burst)        : {res['binary_fall_asr']:.4f} % (95% CI [{res['asr_ci95_low']:.4f}, {res['asr_ci95_high']:.4f}])")
     print(f"ASR subject-level CI   : [{res['asr_ci95_low_cluster']:.4f}, {res['asr_ci95_high_cluster']:.4f}]")
     # asr_plausible (P-ASR) is not printed here: at this clean-calibrated FPR the bone-symmetry
