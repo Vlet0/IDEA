@@ -111,6 +111,7 @@ def _build_criterion(mode: str, atk_cfg: dict, margin: float, clean_thresh: floa
             lam_ortho=atk_cfg["lam_ortho"],
             lam_trig_pose=atk_cfg["lam_trig_pose"],
             lam_bone=float(atk_cfg.get("lam_bone", 0.0)),
+            lam_norm_match=float(atk_cfg.get("lam_norm_match", 0.0)),
         )
     if mode == "ftrojan":
         return FTrojanLoss()
@@ -382,10 +383,14 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     subcarrier_num = config["data"]["input_shape"][1]
     net = build_backbone(backbone_name, m=latent_dim, num_joints=num_joints, subcarrier_num=subcarrier_num).to(device)
     lr, wd, epochs = train_cfg["learning_rate"], train_cfg["weight_decay"], train_cfg["epochs"]
+    _lam_nm = float(atk_cfg.get("lam_norm_match", 0.0))
+    _pc_rs = int(atk_cfg.get("pc_rank_start", 0))
     logger.info(
         f"Model {backbone_name.upper()} (latent m={latent_dim}) | epochs={epochs} | lr={lr} | wd={wd} | "
         f"batch_size={train_loader.batch_size} | loss_lambda={atk_cfg['loss_lambda']} | "
         f"lam_trig_pose={atk_cfg['lam_trig_pose']} | lam_bone={float(atk_cfg.get('lam_bone', 0.0)):.3g}"
+        + (f" | lam_norm_match={_lam_nm:.3g} (EXPLORATORY stealth ablation)" if _lam_nm > 0.0 else "")
+        + (f" | pc_rank_start={_pc_rs} (EXPLORATORY stealth ablation)" if _pc_rs > 0 else "")
     )
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=epochs * len(train_loader))
@@ -431,9 +436,11 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                     f"(95% CI {eval_res['asr_ci95_low']:.4f}–{eval_res['asr_ci95_high']:.4f}; {_seq_note})")
         log(f"  ASR subject-level CI: {eval_res['asr_ci95_low_cluster']:.4f}–"
                     f"{eval_res['asr_ci95_high_cluster']:.4f} % (cluster-robust over test subjects)")
-        log(f"  P-ASR (plausible)   : {eval_res['asr_plausible']:.4f} % -- alarms that also pass a GT-free "
-                    f"bone-symmetry filter calibrated at {plausibility_fpr:.0%} clean FPR "
-                    f"(tolerance {eval_res['sym_tol_calibrated']:.3f})")
+        # P-ASR (asr_plausible) is NOT a headline claim: at the clean-calibrated FPR used here the
+        # bone-symmetry tolerance is loose enough (see sym_tol_calibrated in the CSV) that it filters
+        # almost nothing, so it reads near-identical to raw ASR without adding deployable-realism
+        # evidence. The field is still computed and written to the per-run CSV for anyone who wants
+        # to re-derive it at a stricter FPR; it is just not printed or tabulated as a result here.
         log(f"  B-ASR (oracle bone) : {eval_res['asr_bone_consistent']:.4f} % at ±{criteria.max_bone_relative_error:.0%} "
                     f"of the GT limb lengths; the CLEAN prediction of the same frames passes "
                     f"{eval_res['clean_bone_consistent_rate']:.4f} % -> B-ASR measures regressor limb-length accuracy, "
@@ -455,8 +462,13 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         log(f"  SC-ASR (state-coll.): {eval_res['state_collapse_asr']:.4f} % (injected frames)")
         log(f"  Fall criteria       : {criteria}")
         if latent_active:
-            log(f"  CAS (shift cos.)    : {eval_res['latent_cas']:.4f} (null: raw cos(z_clean,U)="
-                        f"{eval_res['latent_cas_clean']:.4f}) | AUROC={eval_res['latent_auroc']:.4f} | "
+            # CAS (latent_cas) is NOT reported as headline evidence: its null reference
+            # (latent_cas_clean, raw cos(z_clean, U)) already sits near the same value (the latents
+            # are post-ReLU + mean-pooled, so the mean has a large positive component along almost
+            # any direction), so the margin CAS adds over the null is too small to support a stealth
+            # or separation claim on its own. AUROC/d' (the actual clean-vs-triggered separation,
+            # not the shift-cosine) and the activation-rate pair remain the informative diagnostics.
+            log(f"  Latent separation   : AUROC={eval_res['latent_auroc']:.4f} | "
                         f"d'={eval_res['latent_dprime']:.2f} | false/true activ.="
                         f"{eval_res['latent_false_activation_pct']:.2f}/{eval_res['latent_true_activation_pct']:.2f} % "
                         f"(mean s: clean={eval_res['s_clean_mean']:.3f}, trig={eval_res['s_trig_mean']:.3f})")
@@ -497,8 +509,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 f"Wilson 95% {s_res['burst_hit_rate_ci95_low']:.2f}–{s_res['burst_hit_rate_ci95_high']:.2f} "
                 f"(anti-conservative: pools correlated placements/subjects as independent); "
                 f"{s_res['n_bursts_eligible']} eligible bursts/placement, {s_res['n_slide_positions']} placements]")
-            log(f"  BHR plausible       : {s_res['burst_hit_rate_plausible']:.2f} % | all-burst ASR: "
-                f"{s_res['all_burst_asr_mean']:.2f} % | any-burst ASR (OR, saturates): "
+            log(f"  All-burst ASR       : {s_res['all_burst_asr_mean']:.2f} % | any-burst ASR (OR, saturates): "
                 f"{s_res['sliding_asr_mean']:.2f} ± {s_res['sliding_asr_std']:.2f} %")
             log(f"  Position audit      : BHR range {s_res['bhr_position_range']:.2f} pp, homogeneity "
                 f"p={s_res['bhr_position_pvalue']:.3f} -> position_invariant="
@@ -568,7 +579,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
         )
         for row in robustness:
             log(f"  Robustness {row['condition']}={row['value']:g}: ASR {row['asr']:.2f} % | "
-                        f"P-ASR {row['asr_plausible']:.2f} % | B-ASR(oracle) {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
+                        f"B-ASR(oracle) {row['asr_bone_consistent']:.2f} % | T-MPJPE {row['target_mpjpe_cm']:.2f} cm | "
                         f"clean MPJPE {row['clean_mpjpe_cm']:.2f} cm | clean fall rate {row['clean_fall_rate']:.2f} %")
         robustness_path = os.path.join(out_dir, f"robustness_{METRIC_PROTOCOL_VERSION}.csv")
         save_dict_to_csv([{"experiment_name": exp_name, "config_id": config_id,
@@ -721,7 +732,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 m.momentum = mom
             Z_probe = torch.cat(z_list, dim=0)   # (N, m) — clean-distribution latents
             U, margin_t, clean_thresh_t = make_U_from_latents(
-                Z_probe, K=K, device=device, margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]))
+                Z_probe, K=K, device=device, margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]),
+                pc_rank_start=int(atk_cfg.get("pc_rank_start", 0)))
             margin, clean_thresh = float(margin_t), float(clean_thresh_t)
             gate = 0.5 * (margin + clean_thresh)
             criterion = _build_criterion(mode, atk_cfg, margin, clean_thresh)
@@ -890,7 +902,8 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 Z_ref = torch.cat(z_list_ref, dim=0)
                 U_new, margin_t, clean_thresh_t = make_U_from_latents(
                     Z_ref, K=K, device=device,
-                    margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]))
+                    margin_gap_sigma=float(atk_cfg["margin_gap_sigma"]),
+                    pc_rank_start=int(atk_cfg.get("pc_rank_start", 0)))
                 U, margin, clean_thresh = U_new, float(margin_t), float(clean_thresh_t)
                 gate = 0.5 * (margin + clean_thresh)
                 criterion = _build_criterion(mode, atk_cfg, margin, clean_thresh)
@@ -920,14 +933,13 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
                 _seq_note = (f"seq>={_probe_smf}f" if probe_seq_ids is not None
                              else "frame-level")
                 latent_msg = (f" | s clean/trig {pr['s_clean_mean']:.3f}/{pr['s_trig_mean']:.3f} "
-                              f"(thresh {clean_thresh:.3f}, margin {margin:.3f}), AUROC {pr['latent_auroc']:.3f}, "
-                              f"LCA {pr['latent_cas']:.3f}"
+                              f"(thresh {clean_thresh:.3f}, margin {margin:.3f}), AUROC {pr['latent_auroc']:.3f}"
                               if latent_active else "")
                 logger.info(f"  [probe ep {ep+1}] clean MPJPE {pr['clean_mpjpe_cm']:.2f} cm | "
                             f"T-MPJPE {pr['target_mpjpe_cm']:.2f} cm | CAD "
                             f"{pr['causal_displacement_cm']:.2f} cm | "
                             f"ASR({_seq_note}) {pr['binary_fall_asr']:.2f} % | "
-                            f"P-ASR {pr['asr_plausible']:.2f} % | B-ASR(oracle) {pr['asr_bone_consistent']:.2f} % | "
+                            f"B-ASR(oracle) {pr['asr_bone_consistent']:.2f} % | "
                             f"SC-ASR {pr['state_collapse_asr']:.2f} % | "
                             f"frame-ASR {pr.get('frame_asr', pr['binary_fall_asr']):.2f} %" + latent_msg)
 
@@ -953,7 +965,7 @@ def train(config, *, evaluate_only: bool = False, checkpoint_path: str | None = 
     logger.info(f"\n===== NATIVE EVALUATION: {mode.upper()} ({trigger_type}) =====")
     logger.info("  Metric legend: ASR=seq-level fall-alarm rate | B-ASR=bone-consistent ASR | "
                 "S-ASR=sliding-window ASR | BHR=burst hit rate | SC-ASR=state-collapse ASR | "
-                "CAS=cosine alignment with subspace | T-MPJPE=triggered vs target")
+                "T-MPJPE=triggered vs target")
     eval_res, per_trig, sel, defense = run_evaluation(test_loader, meta.get("te_subject"), te_seq_id,
                                                       output_dir)
 

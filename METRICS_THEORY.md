@@ -71,3 +71,23 @@ Nếu `te_subject` là `None` (kiểm tra bố cục cache thất bại) CI clus
 * ASR vẫn là hàm bậc thang của detector hình học mà template thỏa theo cấu trúc: xếp hạng attack bằng BHR + P-ASR + quét `eps_scale`, không bằng ASR.
 * Chưa có metric ε₅₀ (eps tối thiểu cho BHR 50%): có thể suy ra từ `evaluate_robustness` (`eps_scales`) nhưng chưa tự động.
 * Trigger hằng-theo-packet bị `static_removal` xóa (đã ghi trong scope threat model).
+
+## 8. Cập nhật 2026-11-03: hạ cấp P-ASR và CAS khỏi log/bảng headline
+
+Trường `asr_plausible` (P-ASR) và `latent_cas` (CAS) **vẫn được tính** (không xoá khỏi `utils/metrics.py` /
+`evaluate.py`, vẫn có trong CSV per-run) nhưng **không còn được in ra log hay đưa vào bảng chính**
+(`train.py`, `evaluate_checkpoint.py`, `scripts/build_paper_artifacts.py`), vì hai lý do quan sát được trên
+kết quả thật (`ours_subband_v8`, xem `AGENT_HANDOVER.md`):
+
+* **P-ASR gần như không lọc gì.** Ngưỡng đối xứng xương được hiệu chỉnh ở FPR=5% trên chính dự đoán clean của
+  mỗi điều kiện (`sym_tol_calibrated`), nhưng ngưỡng đó lỏng hơn gấp ~3 lần so với dung sai oracle 30% dùng cho
+  B-ASR, nên P-ASR đọc ra gần như giống hệt ASR thô (100.0% so với 100.0% trong run v8) — không thêm bằng chứng
+  "realism có thể triển khai" nào so với ASR.
+* **CAS có null gần sát giá trị đo được.** `latent_cas` (cos(Δz, U)) = 0.9957 trong khi tham chiếu null
+  `latent_cas_clean` (cos thô của latent clean với U) đã là 0.9879 — biên chỉ ~0.008. Vì z là trung bình không
+  gian sau ReLU nên hầu như mọi hướng đều có cos gần 1 với latent clean; CAS không tách bạch được trigger khỏi
+  nền, nên không dùng làm bằng chứng tách latent. Bằng chứng tách latent nên dùng `latent_auroc`/`latent_dprime`
+  (so sánh clean vs triggered trực tiếp, không qua null cosine).
+
+Ba phép can thiệp nhân quả (necessity / sufficiency / specificity) và `latent_auroc` vẫn là bằng chứng chính
+cho việc model học đúng hướng trigger; chúng không bị ảnh hưởng bởi thay đổi này.

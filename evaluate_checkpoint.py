@@ -187,8 +187,9 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
     print(f"T-MPJPE (injected)     : {res['target_mpjpe_cm']:6.4f} ± {res['target_mpjpe_std_cm']:.4f} cm")
     print(f"ASR (any burst)        : {res['binary_fall_asr']:.4f} % (95% CI [{res['asr_ci95_low']:.4f}, {res['asr_ci95_high']:.4f}])")
     print(f"ASR subject-level CI   : [{res['asr_ci95_low_cluster']:.4f}, {res['asr_ci95_high_cluster']:.4f}]")
-    print(f"P-ASR (plausible)      : {res['asr_plausible']:.4f} % (GT-free bone-symmetry filter, "
-          f"{plausibility_fpr:.0%} clean FPR)")
+    # asr_plausible (P-ASR) is not printed here: at this clean-calibrated FPR the bone-symmetry
+    # tolerance filters almost nothing, so it is not reported as a deployable-realism number (see
+    # train.py's run_evaluation). It is still written to the result row below.
     print(f"B-ASR (oracle bone)    : {res['asr_bone_consistent']:.4f} % "
           f"(clean predictions of the same frames pass the same check: {res['clean_bone_consistent_rate']:.4f} %); "
           f"calibrated cB-ASR {res['asr_bone_calibrated']:.4f} %")
@@ -206,13 +207,15 @@ def evaluate_single_checkpoint(ckpt_path: str, device: torch.device, output_csv:
         nb_str = "  ".join(f"N_b={ab['num_bursts']}:{ab['burst_hit_rate']:.1f}%" for ab in burst_ablation)
         print(f"N_burst ablation (BHR) : {nb_str}")
     if latent_active:
+        # CAS (latent_cas) is omitted: its null reference (latent_cas_clean) sits too close to the
+        # reported value to support a stealth/separation claim (see train.py's run_evaluation).
         print(f"Latent AUROC / d'      : {res['latent_auroc']:.4f} / {res['latent_dprime']:.2f} "
-              f"(CAS shift {res['latent_cas']:.4f}; ||z|| AUROC {res['latent_norm_auroc']:.4f})")
+              f"(||z|| AUROC {res['latent_norm_auroc']:.4f})")
     else:
         print("Latent statistics      : n/a (not a latent-objective model)")
     for r in robustness:
         print(f"Robustness {r['condition']}={r['value']:g}: ASR {r['asr']:.2f} % | "
-              f"P-ASR {r['asr_plausible']:.2f} % | T-MPJPE {r['target_mpjpe_cm']:.2f} cm | clean MPJPE {r['clean_mpjpe_cm']:.2f} cm")
+              f"T-MPJPE {r['target_mpjpe_cm']:.2f} cm | clean MPJPE {r['clean_mpjpe_cm']:.2f} cm")
     print("Spectral Signatures    : " + ", ".join(f"{k}={v:.2f}" for k, v in defense.items()))
     if intervention is not None:
         for r in intervention["necessity"]:
